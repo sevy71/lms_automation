@@ -1764,3 +1764,36 @@
 2025/08/17-19:56:18.624 18ea1a Delete type=2 #661
 2025/08/17-19:56:18.624 18ea1a Delete type=2 #660
 2025/08/17-19:56:18.624 18ea1a Delete type=2 #668
+2025/08/17-20:43:44.192 18ea24 Level-0 table #690: started
+2025/08/17-20:43:44.210 18ea24 Level-0 table #690: 1090698 bytes OK
+2025/08/17-20:43:44.213 18ea24 Delete type=0 #669
+2025/08/17-20:51:38.789 18ea1a Compacting 1@0 + 0@1 files
+2025/08/17-20:51:38.800 18ea1a Generated table #691@0: 23210 keys, 319010 bytes
+2025/08/17-20:51:38.805 18ea1a Generated table #692@0: 9453 keys, 262376 bytes
+2025/08/17-20:51:38.806 18ea1a Compacted 1@0 + 0@1 files => 581386 bytes
+2025/08/17-20:51:38.809 18ea1a compacted to: files[ 0 2 21 0 0 0 0 ]
+2025/08/17-20:51:38.810 18ea1a Delete type=2 #690
+2025/08/17-20:52:02.750 18ea1a Compacting 1@1 + 10@2 files
+2025/08/17-20:52:02.793 18ea1a Generated table #693@1: 56650 keys, 2221587 bytes
+2025/08/17-20:52:02.810 18ea1a Generated table #694@1: 13659 keys, 2168352 bytes
+2025/08/17-20:52:02.823 18ea1a Generated table #695@1: 2314 keys, 2158200 bytes
+2025/08/17-20:52:02.838 18ea1a Generated table #696@1: 3371 keys, 2165176 bytes
+2025/08/17-20:52:02.851 18ea1a Generated table #697@1: 2521 keys, 2157844 bytes
+2025/08/17-20:52:02.866 18ea1a Generated table #698@1: 2493 keys, 2155439 bytes
+2025/08/17-20:52:02.892 18ea1a Generated table #699@1: 25087 keys, 2234317 bytes
+2025/08/17-20:52:02.933 18ea1a Generated table #700@1: 25535 keys, 2273795 bytes
+2025/08/17-20:52:02.967 18ea1a Generated table #701@1: 25075 keys, 2244264 bytes
+2025/08/17-20:52:02.993 18ea1a Generated table #702@1: 18309 keys, 2178123 bytes
+2025/08/17-20:52:02.993 18ea1a Compacted 1@1 + 10@2 files => 21957097 bytes
+2025/08/17-20:52:02.995 18ea1a compacted to: files[ 0 1 21 0 0 0 0 ]
+2025/08/17-20:52:02.995 18ea1a Delete type=2 #688
+2025/08/17-20:52:02.995 18ea1a Delete type=2 #686
+2025/08/17-20:52:02.995 18ea1a Delete type=2 #679
+2025/08/17-20:52:02.995 18ea1a Delete type=2 #687
+2025/08/17-20:52:02.995 18ea1a Delete type=2 #691
+2025/08/17-20:52:02.995 18ea1a Delete type=2 #685
+2025/08/17-20:52:02.995 18ea1a Delete type=2 #684
+2025/08/17-20:52:02.995 18ea1a Delete type=2 #680
+2025/08/17-20:52:02.995 18ea1a Delete type=2 #681
+2025/08/17-20:52:02.996 18ea1a Delete type=2 #683
+2025/08/17-20:52:02.996 18ea1a Delete type=2 #682
