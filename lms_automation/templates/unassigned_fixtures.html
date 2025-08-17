@@ -1,0 +1,37 @@
+{% extends "base.html" %}
+
+{% block title %}All Fixtures{% endblock %}
+
+{% block content %}
+<div class="container">
+    <h1 class="my-4 text-center">All Fixtures</h1>
+
+    <div class="card mb-4">
+        <div class="card-header bg-primary text-white">
+            <h2 class="h5 mb-0">All Fixtures in the Database</h2>
+        </div>
+        <div class="card-body">
+            {% if fixtures %}
+                <ul class="list-group">
+                    {% for fixture in fixtures %}
+                        <li class="list-group-item d-flex justify-content-between align-items-center">
+                            <span>{{ fixture.home_team }}</span>
+                            <span>vs</span>
+                            <span>{{ fixture.away_team }}</span>
+                            <span class="text-muted">{{ fixture.date.strftime('%Y-%m-%d') }} {{ fixture.time }}</span>
+                            {% if show_round_id %}
+                                <span class="text-muted">Round ID: {{ fixture.round_id }}</span>
+                            {% endif %}
+                        </li>
+                    {% endfor %}
+                </ul>
+            {% else %}
+                <p class="card-text">No fixtures found in the database. Please load fixtures first.</p>
+            {% endif %}
+        </div>
+    </div>
+    <div class="container text-center mt-4">
+        <a href="{{ url_for('admin_dashboard') }}" class="btn btn-secondary">Back to Admin Dashboard</a>
+    </div>
+</div>
+{% endblock %}

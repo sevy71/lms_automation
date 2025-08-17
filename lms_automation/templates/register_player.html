@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+
+{% block title %}Register Player{% endblock %}
+
+{% block content %}
+<div class="container">
+    <h1 class="my-4 text-center">Register New Player</h1>
+
+    <div class="card">
+        <div class="card-body">
+            <form method="POST">
+                <div class="mb-3">
+                    <label for="player_name" class="form-label">Player Name:</label>
+                    <input type="text" id="player_name" name="player_name" class="form-control" required>
+                </div>
+
+                <div class="mb-3">
+                    <label for="whatsapp_number" class="form-label">WhatsApp Number (Optional):</label>
+                    <input type="text" id="whatsapp_number" name="whatsapp_number" class="form-control">
+                </div>
+
+                <button type="submit" class="btn btn-success w-100 mb-2">Register</button>
+                <a href="{{ url_for('admin_bulk_register_players') }}" class="btn btn-info w-100">Bulk Register Players</a>
+            </form>
+        </div>
+    </div>
+    <p class="text-center mt-3">
+        <a href="{{ url_for('admin_dashboard') }}" class="btn btn-secondary">Back to Admin Dashboard</a>
+    </p>
+</div>
+{% endblock %}

@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+
+{% block title %}Bulk Register Players{% endblock %}
+
+{% block content %}
+<div class="container">
+    <h1 class="my-4 text-center">Bulk Register Players</h1>
+
+    <div class="card mb-4">
+        <div class="card-header bg-primary text-white">
+            <h2 class="h5 mb-0">Add Multiple Players</h2>
+        </div>
+        <div class="card-body">
+            <form method="post" action="{{ url_for('admin_bulk_register_players') }}">
+                <div class="mb-3">
+                    <label for="player_names" class="form-label">Player Names (one per line)</label>
+                    <textarea class="form-control" id="player_names" name="player_names" rows="10"></textarea>
+                </div>
+                <button type="submit" class="btn btn-primary">Register Players</button>
+            </form>
+        </div>
+    </div>
+    <div class="container text-center mt-4">
+        <a href="{{ url_for('admin_dashboard') }}" class="btn btn-secondary">Back to Admin Dashboard</a>
+    </div>
+</div>
+{% endblock %}

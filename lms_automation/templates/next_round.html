@@ -1,0 +1,58 @@
+{% extends "base.html" %}
+{% block title %}Setup Next Round{% endblock %}
+{% block content %}
+<div class="container">
+    <h2 class="text-center mt-4">Setup Next Round</h2>
+
+    <div class="card mt-4">
+        <div class="card-header">
+            <h4>Proposed Game Round {{ game_round_number }} (League Round {{ league_round_number }})</h4>
+        </div>
+        <div class="card-body">
+            <form action="{{ url_for('admin_create_next_round') }}" method="post">
+                <input type="hidden" name="game_id" value="{{ game_id }}">
+                <input type="hidden" name="game_round_number" value="{{ game_round_number }}">
+                <input type="hidden" name="league_round_number" value="{{ league_round_number }}">
+                <div class="mb-3">
+                    <label for="start_date" class="form-label">Start Date</label>
+                    <input type="text" class="form-control" id="start_date" name="start_date" value="{{ start_date }}" readonly>
+                </div>
+                <div class="mb-3">
+                    <label for="end_date" class="form-label">End Date</label>
+                    <input type="text" class="form-control" id="end_date" name="end_date" value="{{ end_date }}" readonly>
+                </div>
+                <button type="submit" class="btn btn-primary">Create Round</button>
+                <a href="{{ url_for('admin_dashboard') }}" class="btn btn-secondary">Cancel</a>
+            </form>
+        </div>
+    </div>
+
+    <div class="card mt-4">
+        <div class="card-header">
+            <h5>Fixtures for League Round {{ league_round_number }}</h5>
+        </div>
+        <div class="card-body">
+            <table class="table">
+                <thead>
+                    <tr>
+                        <th>Home Team</th>
+                        <th>Away Team</th>
+                        <th>Date</th>
+                        <th>Time</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for fixture in fixtures %}
+                    <tr>
+                        <td>{{ fixture.home_team }}</td>
+                        <td>{{ fixture.away_team }}</td>
+                        <td>{{ fixture.date.strftime('%Y-%m-%d') }}</td>
+                        <td>{{ fixture.time }}</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+{% endblock %}

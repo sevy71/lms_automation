@@ -1,0 +1,48 @@
+{% extends "base.html" %}
+
+{% block title %}Manage Round {{ round.round_number }}{% endblock %}
+
+{% block content %}
+<div class="container mt-4">
+    <div class="d-flex justify-content-between align-items-center mb-3">
+        <h1>Manage Round {{ round.round_number }}</h1>
+        <span class="badge bg-primary fs-6">{{ round.status.capitalize() }}</span>
+    </div>
+
+    <div class="card mb-4">
+        <div class="card-header">
+            <h2 class="h5 mb-0">Fixtures</h2>
+        </div>
+        <div class="card-body">
+            {% if fixtures %}
+                <ul class="list-group">
+                    {% for fixture in fixtures %}
+                        <li class="list-group-item d-flex justify-content-between align-items-center">
+                            <span>{{ fixture.home_team }} vs {{ fixture.away_team }}</span>
+                            <span class="text-muted">{{ fixture.date.strftime('%a, %d %b %Y %H:%M') }}</span>
+                        </li>
+                    {% endfor %}
+                </ul>
+            {% else %}
+                <p>No fixtures assigned to this round.</p>
+            {% endif %}
+        </div>
+    </div>
+
+    <div class="card">
+        <div class="card-header">
+            <h2 class="h5 mb-0">Actions</h2>
+        </div>
+        <div class="card-body">
+            <p>Click the button below to send a unique pick link directly to each active player via WhatsApp.</p>
+            <form action="{{ url_for('admin_send_whatsapp_links') }}" method="POST">
+                <button type="submit" class="btn btn-success btn-lg">
+                    Send Pick Links to All Active Players
+                </button>
+            </form>
+        </div>
+    </div>
+
+    <p class="mt-4"><a href="{{ url_for('admin_dashboard') }}" class="btn btn-secondary">Back to Main Dashboard</a></p>
+</div>
+{% endblock %}

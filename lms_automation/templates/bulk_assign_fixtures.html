@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+
+{% block title %}Bulk Assign Fixtures to Round {{ round.round_number }}{% endblock %}
+
+{% block content %}
+<div class="container mt-4">
+    <h1>Bulk Assign Fixtures to Round {{ round.round_number }}</h1>
+    <form method="POST">
+      {% if fixtures %}
+        {% for fixture in fixtures %}
+        <div class="form-check my-2">
+          <input class="form-check-input" type="checkbox" name="fixture_ids" value="{{ fixture.id }}" id="fixture-{{ fixture.id }}">
+          <label class="form-check-label" for="fixture-{{ fixture.id }}">
+            {{ fixture.home_team }} vs {{ fixture.away_team }} ({{ fixture.date.strftime('%Y-%m-%d %H:%M') if fixture.date else 'TBD' }})
+          </label>
+        </div>
+        {% endfor %}
+        <p class="mt-3"><button type="submit" class="btn btn-primary">Assign Selected Fixtures</button></p>
+      {% else %}
+        <p>No unassigned fixtures available. Load season fixtures first.</p>
+      {% endif %}
+    </form>
+    <p class="mt-3"><a href="{{ url_for('admin_dashboard') }}" class="btn btn-secondary">Back to Dashboard</a></p>
+</div>
+{% endblock %}

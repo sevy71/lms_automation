@@ -1,0 +1,48 @@
+{% extends "base.html" %}
+
+{% block title %}Manually Add Fixture{% endblock %}
+
+{% block content %}
+<div class="container">
+    <h1 class="my-4 text-center">Manually Add Fixture</h1>
+
+    <div class="card">
+        <div class="card-body">
+            <form method="POST">
+                <div class="mb-3">
+                    <label for="round_id" class="form-label">Select Round:</label>
+                    <select id="round_id" name="round_id" class="form-select" required>
+                        <option value="">-- Select Round --</option>
+                        {% for round in rounds %}
+                            <option value="{{ round.id }}">Round {{ round.round_number }}</option>
+                        {% endfor %}
+                    </select>
+                </div>
+
+                <div class="mb-3">
+                    <label for="home_team" class="form-label">Home Team:</label>
+                    <input type="text" id="home_team" name="home_team" class="form-control" required>
+                </div>
+
+                <div class="mb-3">
+                    <label for="away_team" class="form-label">Away Team:</label>
+                    <input type="text" id="away_team" name="away_team" class="form-control" required>
+                </div>
+
+                <div class="mb-3">
+                    <label for="fixture_date" class="form-label">Date:</label>
+                    <input type="date" id="fixture_date" name="fixture_date" class="form-control" required>
+                </div>
+
+                <div class="mb-3">
+                    <label for="fixture_time" class="form-label">Time (HH:MM):</label>
+                    <input type="time" id="fixture_time" name="fixture_time" class="form-control" required>
+                </div>
+
+                <button type="submit" class="btn btn-primary w-100">Add Fixture</button>
+            </form>
+        </div>
+    </div>
+    <p class="text-center mt-3"><a href="{{ url_for('admin_dashboard') }}" class="btn btn-secondary">Back to Admin Dashboard</a></p>
+</div>
+{% endblock %}

@@ -1,0 +1,45 @@
+{% extends "base.html" %}
+
+{% block title %}LMS Standings{% endblock %}
+
+{% block content %}
+<div class="container">
+  <h1 class="my-4 text-center">Standings</h1>
+
+  <div class="card mb-4">
+    <div class="card-header bg-success text-white">
+      <h2 class="h5 mb-0">Still Alive ({{ active|length }})</h2>
+    </div>
+    <div class="card-body">
+      {% if active %}
+        <ul class="list-group">
+          {% for p in active %}
+            <li class="list-group-item">{{ p.name }}</li>
+          {% endfor %}
+        </ul>
+      {% else %}
+        <p class="card-text">No active players.</p>
+      {% endif %}
+    </div>
+  </div>
+
+  <div class="card mb-4">
+    <div class="card-header bg-danger text-white">
+      <h2 class="h5 mb-0">Eliminated ({{ eliminated|length }})</h2>
+    </div>
+    <div class="card-body">
+      {% if eliminated %}
+        <ul class="list-group">
+          {% for p in eliminated %}
+            <li class="list-group-item text-muted">{{ p.name }}</li>
+          {% endfor %}
+        </ul>
+      {% else %}
+        <p class="card-text">No eliminated players.</p>
+      {% endif %}
+    </div>
+  </div>
+
+  <p class="text-center"><a href="{{ url_for('admin_dashboard') }}" class="btn btn-secondary">Back to Admin</a></p>
+</div>
+{% endblock %}

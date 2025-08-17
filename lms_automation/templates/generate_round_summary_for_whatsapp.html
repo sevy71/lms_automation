@@ -1,0 +1,37 @@
+{% extends "base.html" %}
+
+{% block title %}WhatsApp Summary for Round {{ round.round_number }}{% endblock %}
+
+{% block content %}
+<div class="container mt-4">
+    <h1 class="mb-3">Round {{ round.round_number }} Picks Summary for WhatsApp</h1>
+    <div class="card">
+        <div class="card-body">
+            <textarea id="whatsappSummary" class="form-control" rows="10" readonly>{{ whatsapp_message }}</textarea>
+            <button id="copyBtn" class="btn btn-primary mt-3" onclick="copyToClipboard()">Copy to Clipboard</button>
+        </div>
+    </div>
+    <p class="mt-3"><a href="{{ url_for('admin_dashboard') }}" class="btn btn-secondary">Back to Admin Dashboard</a></p>
+</div>
+{% endblock %}
+
+{% block scripts_extra %}
+<script>
+    function copyToClipboard() {
+        const copyText = document.getElementById("whatsappSummary");
+        copyText.select();
+        copyText.setSelectionRange(0, 99999); // For mobile devices
+        document.execCommand("copy");
+        
+        const btn = document.getElementById("copyBtn");
+        const originalText = btn.textContent;
+        btn.disabled = true;
+        btn.textContent = 'Copied!';
+        
+        setTimeout(() => {
+            btn.textContent = originalText;
+            btn.disabled = false;
+        }, 2000);
+    }
+</script>
+{% endblock %}

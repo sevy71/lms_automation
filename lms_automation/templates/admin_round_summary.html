@@ -1,0 +1,41 @@
+{% extends "base.html" %}
+
+{% block title %}Round {{ round.round_number }} Summary{% endblock %}
+
+{% block content %}
+<div class="container">
+  <h1 class="my-4 text-center">Round {{ round.round_number }} – Summary ({{ round.status }})</h1>
+
+  <div class="card mb-4">
+    <div class="card-body">
+      <div class="table-responsive">
+        <table class="table table-striped table-hover">
+          <thead>
+            <tr>
+              <th>Player</th>
+              <th>Pick</th>
+              <th>Outcome</th>
+              <th>Still Active?</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for r in rows %}
+            <tr>
+              <td>{{ r.player }}</td>
+              <td>{{ r.team }}</td>
+              <td>{{ r.outcome }}</td>
+              <td>{{ 'Yes' if r.active else 'No' }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <p class="text-center">
+    <a href="{{ url_for('standings') }}" class="btn btn-info me-2">Standings</a>
+    <a href="{{ url_for('admin_dashboard') }}" class="btn btn-secondary">Back to Admin</a>
+  </p>
+</div>
+{% endblock %}

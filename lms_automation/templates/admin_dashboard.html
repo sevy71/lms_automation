@@ -1,0 +1,127 @@
+{% extends "base.html" %}
+{% block title %}LMS Admin Dashboard{% endblock %}
+{% block content %}
+<style>
+  .section {border:1px solid #1e90ff;margin:14px auto;max-width:980px}
+  .section h3 {background:#1e90ff;color:#fff;font-size:14px;margin:0;padding:6px 10px}
+  .section .body {padding:10px;background:#f8fbff}
+  .btnbar .btn {margin:2px 4px}
+  .table {width:100%;border-collapse:collapse}
+  .table th,.table td{border:1px solid #e1e1e1;padding:6px 8px;font-size:13px}
+  .muted{color:#666}
+</style>
+
+<div class="container" style="max-width:1000px">
+  
+
+  <h2 class="text-center mt-3 mb-3">LMS Admin Dashboard</h2>
+
+  <!-- Game Setup -->
+  <div class="section">
+    <h3>Game Setup</h3>
+    <div class="body">
+      <p class="muted">Use these buttons to set up the game, load fixtures, and create new rounds.</p>
+      <div class="btnbar">
+        <form action="{{ url_for('admin_new_game') }}" method="post" style="display:inline">
+            <button class="btn btn-sm btn-danger" type="submit">Start New Game</button>
+        </form>
+        <a class="btn btn-sm btn-primary" href="{{ url_for('admin_load_fixtures') }}">Load {{ season_year }}/{{ season_year + 1 }} PL Fixtures</a>
+        <a class="btn btn-sm btn-secondary" href="{{ url_for('admin_unassigned_fixtures') }}">View Unassigned Fixtures</a>
+        <a class="btn btn-sm btn-success" href="{{ url_for('admin_next_round') }}">Setup Next Round</a>
+      </div>
+    </div>
+  </div>
+
+  <!-- Current Round -->
+  <div class="section">
+    <h3>
+      Current Round
+      {% if current_round %}: {{ current_round.round_number }}
+      {% else %}: <span class="muted">None</span>
+      {% endif %}
+    </h3>
+    <div class="body">
+      <p class="muted">Status: {{ current_round.status if current_round else 'N/A' }}</p>
+      <div class="btnbar">
+        {% if current_round %}
+          <a class="btn btn-lg btn-success" href="{{ url_for('admin_round_links', round_id=current_round.id) }}">Get Round {{ current_round.round_number }} Links</a>
+          <form action="{{ url_for('admin_send_whatsapp') }}" method="post" style="display:inline">
+            <button class="btn btn-lg btn-info" type="submit">Send Links via WhatsApp</button>
+          </form>
+          <hr>
+          <h4 class="mt-4">Other Round Actions</h4>
+          <a class="btn btn-sm btn-primary" href="{{ url_for('admin_update_results', round_id=current_round.id) }}">Update Results</a>
+          <a class="btn btn-sm btn-warning" href="{{ url_for('admin_process_round', round_id=current_round.id) }}">Process Eliminations</a>
+          <a class="btn btn-sm btn-info" href="{{ url_for('admin_round_summary', round_id=current_round.id) }}">Round Summary</a>
+          <a class="btn btn-sm btn-outline-secondary" href="{{ url_for('bulk_assign_fixtures', round_id=current_round.id) }}">Bulk Assign Fixtures</a>
+        {% endif %}
+      </div>
+      <hr>
+      <h4 class="mt-4">Global Actions</h4>
+      <div class="btnbar">
+        <a class="btn btn-sm btn-outline-info" href="{{ url_for('standings') }}">View Standings</a>
+        <a class="btn btn-sm btn-outline-dark" href="{{ url_for('download_fixtures') }}">Download All Fixtures (CSV)</a>
+        <form action="{{ url_for('admin_reset_game') }}" method="post" style="display:inline"
+              onsubmit="return confirm('Reset the entire game? This will delete rounds, fixtures and picks.');">
+          <button class="btn btn-sm btn-danger" type="submit">Reset Game</button>
+        </form>
+      </div>
+    </div>
+  </div>
+
+  <!-- Players -->
+  <div class="section">
+    <h3>All Players</h3>
+    <div class="body">
+      <table class="table">
+        <thead>
+          <tr><th>Name</th><th>Status</th><th>WhatsApp</th><th style="width:260px">Actions</th></tr>
+        </thead>
+        <tbody>
+          {% for p in players %}
+            <tr>
+              <td>{{ p.name }}</td>
+              <td>{{ p.status|capitalize }}</td>
+              <td class="muted">{{ p.whatsapp_number or '' }}</td>
+              <td>
+                <a class="btn btn-sm btn-outline-secondary" href="{{ url_for('edit_player', player_id=p.id) }}">Edit</a>
+                <a class="btn btn-sm btn-outline-info" href="{{ url_for('player_picks', player_id=p.id) }}">View Picks</a>
+                <a class="btn btn-sm btn-outline-danger" href="{{ url_for('delete_player', player_id=p.id) }}"
+                   onclick="return confirm('Delete {{ p.name }}?')">Delete</a>
+              </td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- Fixtures -->
+  <div class="section">
+    <h3>Fixtures for Current Round</h3>
+    <div class="body">
+      {% if fixtures %}
+        <table class="table">
+          <thead><tr><th>Home</th><th style="width:40px;text-align:center">vs</th><th>Away</th><th style="width:160px">Date/Time</th></tr></thead>
+          <tbody>
+            {% for f in fixtures %}
+              <tr>
+                <td>{{ f.home_team }}</td>
+                <td style="text-align:center">vs</td>
+                <td>{{ f.away_team }}</td>
+                <td>{{ f.date.strftime('%Y-%m-%d %H:%M') if f.date else 'TBD' }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      {% else %}
+        <p class="muted">No fixtures found for this round.</p>
+      {% endif %}
+    </div>
+  </div>
+
+  <p class="text-center mb-4">
+    <a href="{{ url_for('index') }}" class="btn btn-secondary">Back to Homepage</a>
+  </p>
+</div>
+{% endblock %}

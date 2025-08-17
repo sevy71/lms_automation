@@ -1,0 +1,45 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="container mt-4">
+    <h1 class="mb-4">LMS Round {{ round.round_number }} Links</h1>
+
+    <div class="card mb-4">
+        <div class="card-header">
+            <h2>Fixtures</h2>
+        </div>
+        <div class="card-body">
+            <ul class="list-group">
+                {% for fixture in fixtures %}
+                    <li class="list-group-item">{{ fixture.home_team }} vs {{ fixture.away_team }}</li>
+                {% else %}
+                    <li class="list-group-item">No fixtures found for this round.</li>
+                {% endfor %}
+            </ul>
+        </div>
+    </div>
+
+    <div class="card">
+        <div class="card-header">
+            <h2>Player Pick Links</h2>
+        </div>
+        <div class="card-body">
+            <p>Share these links with each player individually.</p>
+            <ul class="list-group">
+                {% for player in players %}
+                    {% if player.status == 'active' %}
+                        <li class="list-group-item">
+                            <strong>{{ player.name }}</strong>: 
+                            <a href="{{ player_pick_links[player.id] }}" target="_blank">{{ player_pick_links[player.id] }}</a>
+                        </li>
+                    {% endif %}
+                {% endfor %}
+            </ul>
+        </div>
+    </div>
+
+    <div class="mt-4">
+        <a href="{{ url_for('admin_dashboard') }}" class="btn btn-secondary">Back to Admin Dashboard</a>
+    </div>
+</div>
+{% endblock %}
