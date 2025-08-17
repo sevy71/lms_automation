@@ -31,3 +31,4 @@ instance/
 *.egg-info/
 dist/
 build/
+whatsapp_session/
