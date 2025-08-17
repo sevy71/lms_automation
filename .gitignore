@@ -31,4 +31,6 @@ instance/
 *.egg-info/
 dist/
 build/
-whatsapp_session/
+
+# WhatsApp session files (browser profile, cache, etc.)
+lms_automation/whatsapp_session/

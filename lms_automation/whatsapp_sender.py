@@ -78,28 +78,4 @@ class WhatsAppSender:
         """
         self.driver.quit()
 
-if __name__ == '__main__':
-    # Example usage:
-    # 1. First run: python whatsapp_sender.py
-    #    - This will open Chrome. Scan the QR code to log in to WhatsApp Web.
-    #    - Close the browser manually after logging in.
-    #    - Your session is now saved in the "whatsapp_session" directory.
-    # 2. Subsequent runs:
-    #    - The browser will open and use the saved session, no QR scan needed.
 
-    # IMPORTANT: Replace with your actual path for storing session data
-    user_data_path = os.path.join(os.path.expanduser("~"), "whatsapp_session")
-    if not os.path.exists(user_data_path):
-        os.makedirs(user_data_path)
-
-    sender = WhatsAppSender(user_data_dir=user_data_path)
-
-    # IMPORTANT: Replace with a real number for testing
-    test_phone_number = "+1234567890"  # e.g., "+15551234567"
-    test_message = "Hello from Selenium! This is a test."
-
-    print(f"Attempting to send message to {test_phone_number}...")
-    success, status = sender.send_message(test_phone_number, test_message)
-    print(f"Result: {status}")
-
-    sender.close()
