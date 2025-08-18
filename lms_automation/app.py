@@ -19,7 +19,10 @@ try:
     from .database import db  # when imported as a package
 except ImportError:
     from database import db   # when loaded as a top-level module
-from .models import Player, Round, Fixture, Pick, SendQueue, WhatsAppSend
+try:
+    from .models import Player, Round, Fixture, Pick, SendQueue, WhatsAppSend  # package import
+except ImportError:
+    from models import Player, Round, Fixture, Pick, SendQueue, WhatsAppSend    # top-level import
 
 # Import our API module
 from .football_data_api import get_upcoming_premier_league_fixtures, get_premier_league_fixtures_by_season, get_fixture_by_id, get_fixtures_by_ids
@@ -941,7 +944,7 @@ def admin_send_whatsapp_link(player_id):
             template_params=params
         )
     else:
-        body = build_pick_message(p.name, current_round.round_number, pick_link)
+        body = build_pick_message(player.name, current_round.round_number, pick_link)
         ok, data, err = whatsapp_send_message(to_digits, body_text=body)
 
     # Persist the send attempt
@@ -954,7 +957,7 @@ def admin_send_whatsapp_link(player_id):
     db.session.commit()
 
     if not ok:
-        fails = _consecutive_whatsapp_failures(p.id, window=10)
+        fails = _consecutive_whatsapp_failures(player.id, window=10)
         if fails >= 5:
             player.unreachable = True
             db.session.commit()
