@@ -4,55 +4,103 @@
 <div class="container">
     <h2 class="text-center mt-4">Setup Next Round</h2>
 
+    {% if not fixtures %}
+    <div class="alert alert-warning">
+        <strong>No unassigned fixtures found!</strong> 
+        Please <a href="{{ url_for('admin_load_fixtures') }}">load fixtures</a> first.
+    </div>
+    {% else %}
+    
     <div class="card mt-4">
         <div class="card-header">
-            <h4>Proposed Game Round {{ game_round_number }} (League Round {{ league_round_number }})</h4>
+            <h4>Create Game Round {{ game_round_number }} from League Round {{ league_round_number }}</h4>
         </div>
         <div class="card-body">
+            <p class="text-muted">
+                <strong>Game Round:</strong> Your internal round counter ({{ game_round_number }})<br>
+                <strong>League Round:</strong> Premier League matchday ({{ league_round_number }})<br>
+                <strong>Dates:</strong> Auto-calculated from fixture times
+            </p>
+            
             <form action="{{ url_for('admin_create_next_round') }}" method="post">
-                <input type="hidden" name="game_id" value="{{ game_id }}">
                 <input type="hidden" name="game_round_number" value="{{ game_round_number }}">
                 <input type="hidden" name="league_round_number" value="{{ league_round_number }}">
-                <div class="mb-3">
-                    <label for="start_date" class="form-label">Start Date</label>
-                    <input type="text" class="form-control" id="start_date" name="start_date" value="{{ start_date }}" readonly>
+                
+                <div class="row">
+                    <div class="col-md-6">
+                        <div class="mb-3">
+                            <label for="start_date" class="form-label">Round Start Date</label>
+                            <input type="date" class="form-control" id="start_date" name="start_date" 
+                                   value="{{ start_date.strftime('%Y-%m-%d') if start_date else '' }}" required>
+                        </div>
+                    </div>
+                    <div class="col-md-6">
+                        <div class="mb-3">
+                            <label for="end_date" class="form-label">Round End Date</label>
+                            <input type="date" class="form-control" id="end_date" name="end_date" 
+                                   value="{{ end_date.strftime('%Y-%m-%d') if end_date else '' }}" required>
+                        </div>
+                    </div>
                 </div>
+                
                 <div class="mb-3">
-                    <label for="end_date" class="form-label">End Date</label>
-                    <input type="text" class="form-control" id="end_date" name="end_date" value="{{ end_date }}" readonly>
+                    <label class="form-label">Select Fixtures for this Round</label>
+                    <div class="alert alert-info">
+                        <small>All fixtures from League Round {{ league_round_number }} are pre-selected. Uncheck any you don't want to include.</small>
+                    </div>
+                    {% for fixture in fixtures %}
+                    <div class="form-check">
+                        <input class="form-check-input" type="checkbox" name="selected_fixtures" 
+                               value="{{ fixture.id }}" id="fixture_{{ fixture.id }}" checked>
+                        <label class="form-check-label" for="fixture_{{ fixture.id }}">
+                            <strong>{{ fixture.home_team }} vs {{ fixture.away_team }}</strong>
+                            <br><small class="text-muted">
+                                {{ fixture.date.strftime('%a %d %b %Y at %H:%M') if fixture.date else 'No date' }}
+                            </small>
+                        </label>
+                    </div>
+                    {% endfor %}
                 </div>
-                <button type="submit" class="btn btn-primary">Create Round</button>
+                
+                <button type="submit" class="btn btn-primary btn-lg">Create Game Round {{ game_round_number }}</button>
                 <a href="{{ url_for('admin_dashboard') }}" class="btn btn-secondary">Cancel</a>
             </form>
         </div>
     </div>
 
+    {% if all_unassigned and all_unassigned|length > fixtures|length %}
     <div class="card mt-4">
         <div class="card-header">
-            <h5>Fixtures for League Round {{ league_round_number }}</h5>
+            <h5>Other Unassigned Fixtures</h5>
         </div>
         <div class="card-body">
-            <table class="table">
+            <p class="text-muted">These fixtures are from other league rounds and won't be included in this game round.</p>
+            <table class="table table-sm">
                 <thead>
                     <tr>
                         <th>Home Team</th>
                         <th>Away Team</th>
                         <th>Date</th>
-                        <th>Time</th>
+                        <th>League Round</th>
                     </tr>
                 </thead>
                 <tbody>
-                    {% for fixture in fixtures %}
+                    {% for fixture in all_unassigned %}
+                    {% if fixture not in fixtures %}
                     <tr>
                         <td>{{ fixture.home_team }}</td>
                         <td>{{ fixture.away_team }}</td>
-                        <td>{{ fixture.date.strftime('%Y-%m-%d') }}</td>
-                        <td>{{ fixture.time }}</td>
+                        <td>{{ fixture.date.strftime('%d %b %Y') if fixture.date else 'No date' }}</td>
+                        <td>{{ fixture.round_number or 'Unknown' }}</td>
                     </tr>
+                    {% endif %}
                     {% endfor %}
                 </tbody>
             </table>
         </div>
     </div>
+    {% endif %}
+    
+    {% endif %}
 </div>
 {% endblock %}

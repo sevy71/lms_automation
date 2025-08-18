@@ -1159,35 +1159,81 @@ def admin_load_fixtures():
 @app.route('/admin/next_round')
 def admin_next_round():
     """Setup next round page"""
-    # Get the highest round number
+    # Get the highest game round number
     last_round = Round.query.order_by(Round.round_number.desc()).first()
-    next_round_number = (last_round.round_number + 1) if last_round else 1
+    next_game_round = (last_round.round_number + 1) if last_round else 1
     
-    # Get unassigned fixtures
+    # Get unassigned fixtures grouped by their league round
     unassigned_fixtures = Fixture.query.filter(Fixture.round_id.is_(None)).order_by(Fixture.date.asc()).all()
     
+    # Group fixtures by league round and find the next available league round
+    league_rounds = {}
+    for fixture in unassigned_fixtures:
+        # Try to extract league round from fixture data or use round_number field
+        league_round = getattr(fixture, 'round_number', None)
+        if not league_round:
+            # If no round_number, try to infer from date or set to 1
+            league_round = 1
+            
+        if league_round not in league_rounds:
+            league_rounds[league_round] = []
+        league_rounds[league_round].append(fixture)
+    
+    # Find the next available league round (smallest unassigned round)
+    next_league_round = min(league_rounds.keys()) if league_rounds else 1
+    next_round_fixtures = league_rounds.get(next_league_round, [])
+    
+    # Calculate start and end dates from fixtures
+    start_date = None
+    end_date = None
+    
+    if next_round_fixtures:
+        fixture_dates = [f.date.date() if hasattr(f.date, 'date') else f.date for f in next_round_fixtures]
+        start_date = min(fixture_dates)
+        end_date = max(fixture_dates)
+    else:
+        # Default to today if no fixtures
+        from datetime import date
+        start_date = date.today()
+        end_date = date.today()
+    
     return render_template('next_round.html', 
-                         game_round_number=next_round_number,
-                         league_round_number=next_round_number,
-                         unassigned_fixtures=unassigned_fixtures)
+                         game_round_number=next_game_round,
+                         league_round_number=next_league_round,
+                         fixtures=next_round_fixtures,
+                         all_unassigned=unassigned_fixtures,
+                         start_date=start_date,
+                         end_date=end_date)
 
 @app.route('/admin/create_next_round', methods=['POST'])
 def admin_create_next_round():
     """Create the next round"""
-    game_round_number = int(request.form['game_round_number'])
-    league_round_number = int(request.form['league_round_number'])
-    selected_fixtures = request.form.getlist('selected_fixtures')
-    
-    if not selected_fixtures:
-        flash('Please select at least one fixture for the round.', 'error')
-        return redirect(url_for('admin_next_round'))
-    
     try:
+        game_round_number = int(request.form['game_round_number'])
+        league_round_number = int(request.form['league_round_number'])
+        start_date_str = request.form.get('start_date')
+        end_date_str = request.form.get('end_date')
+        selected_fixtures = request.form.getlist('selected_fixtures')
+        
+        if not selected_fixtures:
+            flash('Please select at least one fixture for the round.', 'error')
+            return redirect(url_for('admin_next_round'))
+        
+        # Parse dates
+        from datetime import datetime
+        start_date = datetime.strptime(start_date_str, '%Y-%m-%d').date()
+        end_date = datetime.strptime(end_date_str, '%Y-%m-%d').date()
+        
+        # Validate dates
+        if start_date > end_date:
+            flash('Start date cannot be after end date.', 'error')
+            return redirect(url_for('admin_next_round'))
+        
         # Create new round
         new_round = Round(
             round_number=game_round_number,
-            start_date=datetime.now().date(),
-            end_date=datetime.now().date(),
+            start_date=start_date,
+            end_date=end_date,
             status='open'
         )
         db.session.add(new_round)
@@ -1202,11 +1248,15 @@ def admin_create_next_round():
                 count += 1
         
         db.session.commit()
-        flash(f'Round {game_round_number} created successfully with {count} fixtures!', 'success')
+        flash(f'Game Round {game_round_number} created successfully with {count} fixtures from League Round {league_round_number}!', 'success')
         
+    except ValueError as e:
+        flash('Invalid date format. Please use the date picker.', 'error')
+        return redirect(url_for('admin_next_round'))
     except Exception as e:
         db.session.rollback()
         flash(f'Error creating round: {e}', 'error')
+        return redirect(url_for('admin_next_round'))
     
     return redirect(url_for('admin_dashboard'))
 
