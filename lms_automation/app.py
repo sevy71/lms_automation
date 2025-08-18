@@ -1,58 +1,36 @@
 # lms_automation/app.py
-from flask import Flask, render_template, render_template_string, request, redirect, url_for, flash, Response, jsonify
+from flask import Flask, render_template, render_template_string, request, redirect, url_for, flash, Response
 import os
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta  # Import date, timedelta for deadlines
 from itsdangerous import URLSafeSerializer, BadSignature
 import csv
+import requests
 import pytz
 import io
 from dotenv import load_dotenv
 from sqlalchemy import text
-import time
-import random
-from functools import wraps
+import json
 
 # Load environment variables
 load_dotenv()
 
 # Import database and models
-from database import db
-from models import Player, Game, Round, Fixture, Pick, SendQueue
+from .database import db
+from .models import Player, Round, Fixture, Pick, SendQueue, WhatsAppSend
 
 # Import our API module
-from football_data_api import get_upcoming_premier_league_fixtures, get_premier_league_fixtures_by_season
+from .football_data_api import get_upcoming_premier_league_fixtures, get_premier_league_fixtures_by_season, get_fixture_by_id, get_fixtures_by_ids
 
 # --- App Initialization ---
 basedir = os.path.abspath(os.path.dirname(__file__))
 app = Flask(__name__)
-# When deploying, you'll want to set DATABASE_URL from your hosting provider (e.g. Neon, Supabase)
-app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('DATABASE_URL') or \
-    'sqlite:///' + os.path.join(basedir, 'lms.db')
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///' + os.path.join(basedir, 'lms.db')
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'please_change_me')
 
 # Connect database to the app
 db.init_app(app)
 
-# --- Worker API Authentication ---
-def require_worker_token(f):
-    @wraps(f)
-    def decorated_function(*args, **kwargs):
-        worker_token = os.environ.get('WORKER_API_TOKEN')
-        if not worker_token:
-            app.logger.error("WORKER_API_TOKEN is not set on the server.")
-            return jsonify({"error": "Authentication misconfigured"}), 500
-        
-        auth_header = request.headers.get('Authorization')
-        if not auth_header or not auth_header.startswith('Bearer '):
-            return jsonify({"error": "Authorization header is missing or invalid"}), 401
-        
-        provided_token = auth_header.split('Bearer ')[1]
-        if provided_token != worker_token:
-            return jsonify({"error": "Invalid worker token"}), 403
-        
-        return f(*args, **kwargs)
-    return decorated_function
 
 # --- Token generator for per-round pick links ---
 pick_link_serializer = URLSafeSerializer(app.config['SECRET_KEY'], salt='pick-link')
@@ -111,32 +89,110 @@ def compute_round_deadline(round_obj):
         app.logger.warning("Could not compute round deadline: %s", e)
     return "1 hour before first kick-off"
 
+# --- WhatsApp Cloud API configuration (set via environment variables) ---
+WA_ACCESS_TOKEN = os.environ.get('WA_ACCESS_TOKEN')  # Permanent system-user token recommended
+WA_PHONE_NUMBER_ID = os.environ.get('WA_PHONE_NUMBER_ID')  # Numeric Phone Number ID for the sending number
+WA_API_VERSION = os.environ.get('WA_API_VERSION', 'v23.0')
+WA_TEMPLATE_NAME = os.environ.get('WA_TEMPLATE_NAME')  # Optional approved template name (e.g., 'lms_team_pick')
+WA_TEMPLATE_LANG = os.environ.get('WA_TEMPLATE_LANG', 'en_GB')
+try:
+    WA_TEMPLATE_PARAM_COUNT = int(os.environ.get('WA_TEMPLATE_PARAM_COUNT', '4'))
+except Exception:
+    WA_TEMPLATE_PARAM_COUNT = 4
+
+def _digits_only(s: str) -> str:
+    return ''.join(ch for ch in (s or '') if ch.isdigit())
+
+def to_e164_digits(whatsapp_number: str) -> str:
+    """
+    Returns a digits-only E.164-like string without '+'.
+    If the number starts with '0' (UK local), we do NOT guess country code here to avoid mistakes.
+    Expect callers to store numbers with country code, e.g., '447...'.
+    """
+    d = _digits_only(whatsapp_number)
+    # Warn in server logs if it looks like a local UK number (starts with 0 and length 11)
+    if d.startswith('0') and len(d) == 11:
+        app.logger.warning("WhatsApp number looks local (starts with 0). Store as E.164 without '+', e.g., '447...': %s", d)
+    return d
+
+def whatsapp_send_message(to_digits: str, body_text: str = None, template_name: str = None, template_params: list = None):
+    """
+    Send a WhatsApp message using Cloud API.
+    - If template_name is provided, sends a template with optional body parameters.
+    - Else sends a simple text message (requires the 24h customer window).
+    Returns (ok: bool, response_json: dict|None, error_msg: str|None)
+    """
+    if not (WA_ACCESS_TOKEN and WA_PHONE_NUMBER_ID):
+        return False, None, "WhatsApp API not configured (missing WA_ACCESS_TOKEN or WA_PHONE_NUMBER_ID)."
+
+    url = f"https://graph.facebook.com/{WA_API_VERSION}/{WA_PHONE_NUMBER_ID}/messages"
+    headers = {
+        "Authorization": f"Bearer {WA_ACCESS_TOKEN}",
+        "Content-Type": "application/json"
+    }
+    if template_name:
+        payload = {
+            "messaging_product": "whatsapp",
+            "to": to_digits,
+            "type": "template",
+            "template": {
+                "name": template_name,
+                "language": {"code": WA_TEMPLATE_LANG},
+            }
+        }
+        if template_params:
+            payload["template"]["components"] = [{
+                "type": "body",
+                "parameters": [{"type": "text", "text": str(p)} for p in template_params]
+            }]
+    else:
+        if not body_text:
+            return False, None, "No body_text provided for text message and no template_name specified."
+        payload = {
+            "messaging_product": "whatsapp",
+            "to": to_digits,
+            "type": "text",
+            "text": {"body": body_text}
+        }
+
+    try:
+        resp = requests.post(url, json=payload, headers=headers, timeout=30)
+    except Exception as e:
+        return False, None, f"Network error: {e}"
+
+    try:
+        data = resp.json()
+    except Exception:
+        data = None
+
+    if resp.status_code == 200 or resp.status_code == 201:
+        return True, data, None
+    else:
+        # Extract helpful error message
+        err = None
+        if isinstance(data, dict):
+            err = (data.get('error') or {}).get('message') or str(data)
+            app.logger.error("WhatsApp API Error Response: %s", json.dumps(data, indent=2)) # Log full error response
+        else:
+            err = f"HTTP {resp.status_code}"
+        app.logger.error("WhatsApp API Call Failed: Status %s, Error: %s", resp.status_code, err) # Log the failure
+        return False, data, err
+
+def _consecutive_whatsapp_failures(player_id: int, window: int = 10) -> int:
+    """Return number of consecutive failed sends for the given player, looking back up to `window` attempts."""
+    sends = WhatsAppSend.query.filter_by(player_id=player_id).order_by(WhatsAppSend.timestamp.desc()).limit(window).all()
+    count = 0
+    for s in sends:
+        if s.ok:
+            break
+        count += 1
+    return count
+
 def build_pick_message(player_name: str, round_number: int, pick_link: str) -> str:
-    return f"Hello {player_name}! It’s time to make your pick for LMS Round {round_number}.\nClick here to make your pick: {pick_link}\n(Deadline: 1 hour before first kick-off)"
-
-def normalize_phone_to_e164(phone_number: str) -> str | None:
-    """Strips non-digits and ensures it starts with a '+'.."""
-    if not phone_number:
-        return None
-    
-    # Remove all characters that are not digits
-    digits = ''.join(filter(str.isdigit, phone_number))
-    
-    if not digits:
-        return None
-        
-    # If it already has a country code, assume it's correct
-    if phone_number.startswith('+'):
-        return f"+{digits}"
-    
-    # This is a simple case; for a real app you might need a library
-    # to handle local numbers vs international ones. Assuming all numbers are UK for now.
-    # A more robust solution would be needed for a global audience.
-    # For now, we just ensure it's digits with a plus prefix.
-    return f"+{digits}"
-
+    return f"Hello {player_name}! It’s time to make your pick for LMS Round {round_number}.\n{pick_link}\n(Deadline: 1 hour before first kick-off)"
 
 # ----------------- Helpers for results & pick outcomes -----------------
+
 def normalize_team(name: str):
     return (name or '').strip().lower()
 
@@ -181,50 +237,65 @@ def index():
 def test_page():
     return render_template('test.html')
 
-
+# Route to fetch and display upcoming fixtures
+@app.route('/admin/fetch_fixtures')
+def admin_fetch_fixtures():
+    upcoming_fixtures = get_upcoming_premier_league_fixtures(next_n_fixtures=20) # Fetch more for testing
+    if upcoming_fixtures:
+        output = "<h2>Upcoming Premier League Fixtures:</h2><ul>"
+        for fixture in upcoming_fixtures:
+            home_team = fixture['home_team_name'] # Use cleaned data
+            away_team = fixture['away_team_name'] # Use cleaned data
+            fixture_date = datetime.fromisoformat(fixture['date'].replace('Z', '+00:00')) # Convert ISO format to datetime
+            output += f"<li>{home_team} vs {away_team} on {fixture_date.strftime('%Y-%m-%d %H:%M')}</li>"
+        output += "</ul>"
+    else:
+        output = "<p>No upcoming Premier League fixtures found.</p>"
+    return output
 
 # Route to load fixtures for a specific season into the database
-@app.route('/admin/load_fixtures')
-def admin_load_fixtures():
-    today = date.today()
-    season_year = today.year if today.month >= 8 else today.year - 1
+@app.route('/admin/load_fixtures/<int:season_year>')
+def admin_load_fixtures(season_year):
     fixtures_data = get_premier_league_fixtures_by_season(season_year)
     if not fixtures_data:
         return f"<p>No fixtures found for season {season_year} from API-Football.</p>"
 
-    # Group fixtures by round number
-    fixtures_by_round = {}
-    for fixture_api in fixtures_data:
-        round_name = fixture_api['league']['round']
-        try:
-            round_number = int(round_name.split(' - ')[1])
-        except (IndexError, ValueError):
-            round_number = 0  # Default or handle error
-
-        if round_number not in fixtures_by_round:
-            fixtures_by_round[round_number] = []
-        fixtures_by_round[round_number].append(fixture_api)
-
-    # Add fixtures
     fixtures_added_count = 0
     for fixture_api in fixtures_data:
-        event_id = str(fixture_api['fixture']['id'])
+        event_id = str(fixture_api['fixture']['id']) # Ensure event_id is string
         home_team = fixture_api['teams']['home']['name']
         away_team = fixture_api['teams']['away']['name']
         fixture_date_str = fixture_api['fixture']['date']
         fixture_date = datetime.fromisoformat(fixture_date_str.replace('Z', '+00:00'))
         fixture_time = fixture_date.strftime('%H:%M')
         
+        # Extract round number (assuming 'round' field exists and is consistent)
+        # API-Football's 'round' field is like "Regular Season - 1", "Regular Season - 2"
         round_name = fixture_api['league']['round']
         try:
             round_number = int(round_name.split(' - ')[1])
         except (IndexError, ValueError):
-            round_number = 0
+            round_number = 0 # Default or handle error if round name is not as expected
 
+        # Check if round exists, create if not
+        round_obj = Round.query.filter_by(round_number=round_number).first()
+        if not round_obj:
+            # For simplicity, setting start/end dates to fixture date for now.
+            # In a real scenario, you'd define round start/end more broadly.
+            round_obj = Round(
+                round_number=round_number,
+                start_date=fixture_date.date(), # Store date only for round
+                end_date=fixture_date.date(),   # Store date only for round
+                status='open'
+            )
+            db.session.add(round_obj)
+            db.session.commit() # Commit to get round_obj.id
+
+        # Check if fixture already exists to avoid duplicates
         existing_fixture = Fixture.query.filter_by(event_id=event_id).first()
         if not existing_fixture:
             new_fixture = Fixture(
-                round_number=round_number,
+                round_id=round_obj.id,
                 event_id=event_id,
                 home_team=home_team,
                 away_team=away_team,
@@ -232,16 +303,15 @@ def admin_load_fixtures():
                 time=fixture_time,
                 home_score=fixture_api['goals']['home'],
                 away_score=fixture_api['goals']['away'],
-                status=fixture_api['fixture']['status']['short']
+                status=fixture_api['fixture']['status']['short'] # e.g., 'FT', 'NS'
             )
             db.session.add(new_fixture)
             fixtures_added_count += 1
         else:
+            # Update existing fixture if status or scores have changed
             existing_fixture.home_score = fixture_api['goals']['home']
             existing_fixture.away_score = fixture_api['goals']['away']
             existing_fixture.status = fixture_api['fixture']['status']['short']
-            if not existing_fixture.round_number:
-                existing_fixture.round_number = round_number
 
     db.session.commit()
     return f"<p>Loaded {fixtures_added_count} new fixtures for season {season_year} into the database. Existing fixtures updated.</p>"
@@ -281,130 +351,39 @@ def edit_player(player_id):
 @app.route('/admin/create_round', methods=['GET', 'POST'])
 def admin_create_round():
     if request.method == 'POST':
-        game_id = request.form['game_id']
-        game_round_number = request.form['game_round_number']
-        league_round_number = request.form['league_round_number']
+        round_number = request.form['round_number']
         start_date_str = request.form['start_date']
         end_date_str = request.form['end_date']
 
         try:
-            game_id = int(game_id)
-            game_round_number = int(game_round_number)
-            league_round_number = int(league_round_number)
+            round_number = int(round_number)
             start_date = datetime.strptime(start_date_str, '%Y-%m-%d').date()
             end_date = datetime.strptime(end_date_str, '%Y-%m-%d').date()
         except ValueError:
             flash('Invalid input for round number or dates.', 'error')
             return redirect(url_for('admin_create_round'))
 
-        existing_round = Round.query.filter_by(game_id=game_id, game_round_number=game_round_number).first()
+        existing_round = Round.query.filter_by(round_number=round_number).first()
         if existing_round:
-            flash(f'Round {game_round_number} already exists for this game.', 'error')
+            flash(f'Round {round_number} already exists.', 'error')
         else:
             new_round = Round(
-                game_id=game_id,
-                game_round_number=game_round_number,
-                league_round_number=league_round_number,
+                round_number=round_number,
                 start_date=start_date,
                 end_date=end_date,
                 status='open' # New rounds are open for picks by default
             )
             db.session.add(new_round)
             db.session.commit()
-            flash(f'Round {game_round_number} created successfully!', 'success')
-            return redirect(url_for('admin_dashboard')) # Redirect to home or a success page
-    games = Game.query.all()
-    return render_template('create_round.html', games=games)
-
-@app.route('/admin/next_round')
-def admin_next_round():
-    active_game = Game.query.filter_by(status='active').first()
-    if not active_game:
-        flash('No active game found. Please start a new game.', 'warning')
-        return redirect(url_for('admin_dashboard'))
-
-    # Determine the next league round number
-    last_round = Round.query.filter_by(game_id=active_game.id).order_by(Round.league_round_number.desc()).first()
-    next_league_round_number = (last_round.league_round_number + 1) if last_round else 1
-
-    if next_league_round_number > 38:
-        flash('All 38 league rounds have been completed.', 'info')
-        return redirect(url_for('admin_dashboard'))
-
-    # Find fixtures for the next league round that are not yet assigned to a round
-    fixtures = Fixture.query.filter(Fixture.round_id.is_(None), Fixture.round_number == next_league_round_number).all()
-
-    if not fixtures:
-        flash(f'No unassigned fixtures found for League Round {next_league_round_number}.', 'warning')
-        return redirect(url_for('admin_dashboard'))
-
-    # Determine start and end dates
-    start_date = min(f.date for f in fixtures).date()
-    end_date = max(f.date for f in fixtures).date()
-
-    last_game_round = Round.query.filter_by(game_id=active_game.id).order_by(Round.game_round_number.desc()).first()
-    next_game_round_number = (last_game_round.game_round_number + 1) if last_game_round else 1
-
-    return render_template('next_round.html',
-                           game_id=active_game.id,
-                           game_round_number=next_game_round_number,
-                           league_round_number=next_league_round_number,
-                           start_date=start_date.strftime('%Y-%m-%d'),
-                           end_date=end_date.strftime('%Y-%m-%d'),
-                           fixtures=fixtures)
-
-
-@app.route('/admin/create_next_round', methods=['POST'])
-def admin_create_next_round():
-    game_id = request.form['game_id']
-    game_round_number = request.form['game_round_number']
-    league_round_number = request.form['league_round_number']
-    start_date_str = request.form['start_date']
-    end_date_str = request.form['end_date']
-
-    try:
-        game_id = int(game_id)
-        game_round_number = int(game_round_number)
-        league_round_number = int(league_round_number)
-        start_date = datetime.strptime(start_date_str, '%Y-%m-%d').date()
-        end_date = datetime.strptime(end_date_str, '%Y-%m-%d').date()
-    except ValueError:
-        flash('Invalid input for round number or dates.', 'error')
-        return redirect(url_for('admin_next_round'))
-
-    existing_round = Round.query.filter_by(game_id=game_id, game_round_number=game_round_number).first()
-    if existing_round:
-        flash(f'Round {game_round_number} already exists for this game.', 'error')
-    else:
-        new_round = Round(
-            game_id=game_id,
-            game_round_number=game_round_number,
-            league_round_number=league_round_number,
-            start_date=start_date,
-            end_date=end_date,
-            status='open'
-        )
-        db.session.add(new_round)
-        db.session.commit()
-
-        # Assign fixtures to the new round
-        fixtures_to_assign = Fixture.query.filter_by(round_number=league_round_number, round_id=None).all()
-        for fixture in fixtures_to_assign:
-            fixture.round_id = new_round.id
-
-        db.session.commit()
-        flash(f'Round {game_round_number} created successfully!', 'success')
-    return redirect(url_for('admin_dashboard'))
+            flash(f'Round {round_number} created successfully!', 'success')
+            return redirect(url_for('index')) # Redirect to home or a success page
+    return render_template('create_round.html')
 
 # Admin Dashboard (formerly player_dashboard)
 @app.route('/admin_dashboard')
 def admin_dashboard():
     players = Player.query.all()
-    active_game = Game.query.filter_by(status='active').first()
-    current_round = None
-    if active_game:
-        current_round = Round.query.filter_by(game_id=active_game.id, status='open').first()
-    
+    current_round = Round.query.filter_by(status='open').first()
     fixtures = []
     if current_round:
         fixtures = Fixture.query.filter_by(round_id=current_round.id).order_by(Fixture.date).all()
@@ -421,32 +400,10 @@ def admin_dashboard():
                     # Clean the number by removing all non-digit characters
                     cleaned_number = ''.join(filter(str.isdigit, player.whatsapp_number))
                     cleaned_whatsapp_numbers[player.id] = cleaned_number
+    has_wa_config = bool(WA_ACCESS_TOKEN and WA_PHONE_NUMBER_ID)
 
-    today = date.today()
-    season_year = today.year if today.month >= 8 else today.year - 1
+    return render_template('admin_dashboard.html', players=players, current_round=current_round, fixtures=fixtures, player_pick_links=player_pick_links, cleaned_whatsapp_numbers=cleaned_whatsapp_numbers, has_wa_config=has_wa_config)
 
-    return render_template('admin_dashboard.html', players=players, active_game=active_game, current_round=current_round, fixtures=fixtures, player_pick_links=player_pick_links, cleaned_whatsapp_numbers=cleaned_whatsapp_numbers, season_year=season_year)
-
-
-@app.route('/admin/new_game', methods=['POST'])
-def admin_new_game():
-    # Complete any active games
-    active_games = Game.query.filter_by(status='active').all()
-    for game in active_games:
-        game.status = 'completed'
-    db.session.commit()
-
-    # Create a new game
-    new_game = Game(status='active')
-    db.session.add(new_game)
-    db.session.commit()
-
-    # Reset all players to active
-    Player.query.update({Player.status: 'active'})
-    db.session.commit()
-
-    flash('New game started!', 'success')
-    return redirect(url_for('admin_dashboard'))
 
 # Tokenised pick submission route: /l/<token>
 @app.route('/l/<token>', methods=['GET', 'POST'])
@@ -459,7 +416,7 @@ def pick_with_token(token):
     player = Player.query.get_or_404(player_id)
     this_round = Round.query.get_or_404(round_id)
     if this_round.status != 'open':
-        flash(f'Round {this_round.game_round_number} is not open for picks.', 'error')
+        flash(f'Round {this_round.round_number} is not open for picks.', 'error')
         return redirect(url_for('index'))
 
     fixtures = Fixture.query.filter_by(round_id=this_round.id).order_by(Fixture.date).all()
@@ -476,7 +433,7 @@ def pick_with_token(token):
 
         existing_pick = Pick.query.filter_by(player_id=player.id, round_id=this_round.id).first()
         if existing_pick:
-            flash(f'{player.name}, you have already made a pick for Round {this_round.game_round_number}. Your current pick is {existing_pick.team_picked}.', 'error')
+            flash(f'{player.name}, you have already made a pick for Round {this_round.round_number}. Your current pick is {existing_pick.team_picked}.', 'error')
         else:
             # Enforce global no-repeat rule: player cannot pick any team they have picked in any previous round
             prior_picks = Pick.query.filter(Pick.player_id == player.id, Pick.round_id != this_round.id).all()
@@ -486,7 +443,7 @@ def pick_with_token(token):
                 return redirect(url_for('pick_with_token', token=token))
             db.session.add(Pick(player_id=player.id, round_id=this_round.id, team_picked=team_picked, timestamp=datetime.utcnow()))
             db.session.commit()
-            flash(f'{player.name}, your pick of {team_picked} for Round {this_round.game_round_number} has been submitted!', 'success')
+            flash(f'{player.name}, your pick of {team_picked} for Round {this_round.round_number} has been submitted!', 'success')
         return redirect(url_for('pick_with_token', token=token))
 
     # Get all teams the player has picked in previous rounds (strict: no repeats ever)
@@ -508,11 +465,7 @@ def pick_with_token(token):
 @app.route('/submit_pick/<int:player_id>', methods=['GET', 'POST'])
 def submit_pick(player_id):
     player = Player.query.get_or_404(player_id)
-    active_game = Game.query.filter_by(status='active').first()
-    current_round = None
-    if active_game:
-        current_round = Round.query.filter_by(game_id=active_game.id, status='open').first()
-    
+    current_round = Round.query.filter_by(status='open').first()
     fixtures = []
     if current_round:
         fixtures = Fixture.query.filter_by(round_id=current_round.id).order_by(Fixture.date).all()
@@ -535,7 +488,7 @@ def submit_pick(player_id):
         # Check if player has already made a pick for this round
         existing_pick = Pick.query.filter_by(player_id=player.id, round_id=current_round.id).first()
         if existing_pick:
-            flash(f'{player.name}, you have already made a pick for Round {current_round.game_round_number}. Your current pick is {existing_pick.team_picked}.', 'error')
+            flash(f'{player.name}, you have already made a pick for Round {current_round.round_number}. Your current pick is {existing_pick.team_picked}.', 'error')
         else:
             new_pick = Pick(
                 player_id=player.id,
@@ -545,7 +498,7 @@ def submit_pick(player_id):
             )
             db.session.add(new_pick)
             db.session.commit()
-            flash(f'{player.name}, your pick of {team_picked} for Round {current_round.game_round_number} has been submitted!', 'success')
+            flash(f'{player.name}, your pick of {team_picked} for Round {current_round.round_number} has been submitted!', 'success')
         return redirect(url_for('submit_pick', player_id=player.id)) # Redirect to GET route
 
     return render_template('submit_pick.html', player=player, current_round=current_round, fixtures=fixtures)
@@ -576,7 +529,7 @@ def admin_bulk_register_players():
 # Admin Route to Manually Add a Fixture
 @app.route('/admin/manual_add_fixture', methods=['GET', 'POST'])
 def admin_manual_add_fixture():
-    rounds = Round.query.order_by(Round.game_round_number).all() # Get all rounds for dropdown
+    rounds = Round.query.order_by(Round.round_number).all() # Get all rounds for dropdown
     if request.method == 'POST':
         round_id = request.form['round_id']
         home_team = request.form['home_team']
@@ -596,7 +549,7 @@ def admin_manual_add_fixture():
             full_datetime = datetime.strptime(full_datetime_str, '%Y-%m-%d %H:%M')
 
             # Generate a unique event_id for manual fixtures (e.g., 'MANUAL_ROUND_FIXTURE_TIMESTAMP')
-            event_id = f"MANUAL_{round_obj.game_round_number}_{home_team.replace(' ', '')}_{away_team.replace(' ', '')}_{full_datetime.strftime('%Y%m%d%H%M')}"
+            event_id = f"MANUAL_{round_obj.round_number}_{home_team.replace(' ', '')}_{away_team.replace(' ', '')}_{full_datetime.strftime('%Y%m%d%H%M')}"
 
             existing_fixture = Fixture.query.filter_by(event_id=event_id).first()
             if existing_fixture:
@@ -613,7 +566,7 @@ def admin_manual_add_fixture():
                 )
                 db.session.add(new_fixture)
                 db.session.commit()
-                flash(f'Fixture {home_team} vs {away_team} added to Round {round_obj.game_round_number}!', 'success')
+                flash(f'Fixture {home_team} vs {away_team} added to Round {round_obj.round_number}!', 'success')
                 return redirect(url_for('admin_manual_add_fixture'))
         except ValueError:
             flash('Invalid date or time format.', 'error')
@@ -638,7 +591,7 @@ def bulk_assign_fixtures(round_id):
                 fx.round_id = round_id
                 count += 1
         db.session.commit()
-        flash(f"Assigned {count} fixtures to Round {round_obj.game_round_number}.", "success")
+        flash(f"Assigned {count} fixtures to Round {round_obj.round_number}.", "success")
         return redirect(url_for('admin_dashboard'))
     return render_template('bulk_assign_fixtures.html', round=round_obj, fixtures=fixtures)
 
@@ -749,7 +702,7 @@ def admin_process_round(round_id):
     rnd.status = 'completed'
     db.session.commit()
 
-    flash(f'Processed Round {rnd.game_round_number}: {survived} win, {eliminated} eliminated.', 'success')
+    flash(f'Processed Round {rnd.round_number}: {survived} win, {eliminated} eliminated.', 'success')
     return redirect(url_for('admin_round_summary', round_id=round_id))
 
 
@@ -766,7 +719,12 @@ def admin_round_summary(round_id):
             return 'LOSE'
         return 'PENDING'
 
-    rows = [{'player': p.player.name, 'team': p.team_picked, 'outcome': outcome_label(p), 'active': (p.player.status == 'active')} for p in picks]
+    rows = [{
+        'player': p.player.name,
+        'team': p.team_picked,
+        'outcome': outcome_label(p),
+        'active': (p.player.status == 'active')
+    } for p in picks]
 
     return render_template('admin_round_summary.html', round=rnd, rows=rows)
 
@@ -782,7 +740,7 @@ def generate_round_summary_for_whatsapp(round_id):
     rnd = Round.query.get_or_404(round_id)
     picks = Pick.query.filter_by(round_id=round_id).all()
 
-    summary_lines = [f"*LMS Round {rnd.game_round_number} Picks:*"]
+    summary_lines = [f"*LMS Round {rnd.round_number} Picks:*"]
     for pick in picks:
         summary_lines.append(f"{pick.player.name}: {pick.team_picked}")
     
@@ -795,15 +753,14 @@ def download_fixtures():
     si = io.StringIO()
     cw = csv.writer(si)
 
-    headers = ["Game Round Number", "League Round Number", "Home Team", "Away Team", "Date", "Time", "Status", "Home Score", "Away Score"]
+    headers = ["Round Number", "Home Team", "Away Team", "Date", "Time", "Status", "Home Score", "Away Score"]
     cw.writerow(headers)
 
-    fixtures = Fixture.query.join(Round).order_by(Round.game_round_number, Fixture.date).all()
+    fixtures = Fixture.query.join(Round).order_by(Round.round_number, Fixture.date).all()
 
     for fixture in fixtures:
         row = [
-            fixture.round.game_round_number if fixture.round else "N/A",
-            fixture.round.league_round_number if fixture.round else "N/A",
+            fixture.round.round_number if fixture.round else "N/A",
             fixture.home_team,
             fixture.away_team,
             fixture.date.strftime('%Y-%m-%d'),
@@ -846,7 +803,6 @@ def admin_reset_game():
         db.session.query(Pick).delete()
         db.session.query(Fixture).delete()
         db.session.query(Round).delete()
-        db.session.query(Game).delete()
         # Reset all players to active status
         Player.query.update({Player.status: 'active'})
         db.session.commit()
@@ -856,14 +812,14 @@ def admin_reset_game():
         flash(f'An error occurred while resetting the game: {e}', 'error')
     return redirect(url_for('admin_dashboard'))
 
-# ----------------- Admin: Enqueue WhatsApp Sending -----------------
-@app.route('/admin/send_whatsapp', methods=['POST'])
-def admin_send_whatsapp():
-    active_game = Game.query.filter_by(status='active').first()
-    current_round = None
-    if active_game:
-        current_round = Round.query.filter_by(game_id=active_game.id, status='open').first()
+# ----------------- Admin: Send WhatsApp links via Cloud API (batch) -----------------
+@app.route('/admin/send_whatsapp_links', methods=['POST'])
+def admin_send_whatsapp_links():
+    if not (WA_ACCESS_TOKEN and WA_PHONE_NUMBER_ID):
+        flash('WhatsApp API not configured. Set WA_ACCESS_TOKEN and WA_PHONE_NUMBER_ID env vars.', 'error')
+        return redirect(url_for('admin_dashboard'))
 
+    current_round = Round.query.filter_by(status='open').first()
     if not current_round:
         flash('No open round available.', 'error')
         return redirect(url_for('admin_dashboard'))
@@ -873,51 +829,144 @@ def admin_send_whatsapp():
         flash('No active players to message.', 'warning')
         return redirect(url_for('admin_dashboard'))
 
-    enqueued_count = 0
-    skipped_count = 0
+    sent = 0
+    failed = 0
+    details = []
     for p in players:
+        # Skip players marked unreachable
+        if getattr(p, 'unreachable', False):
+            details.append(f"{p.name}: unreachable")
+            failed += 1
+            continue
         if not p.whatsapp_number:
-            skipped_count += 1
+            details.append(f"{p.name}: no number")
+            failed += 1
             continue
-
-        normalized_number = normalize_phone_to_e164(p.whatsapp_number)
-        if not normalized_number:
-            skipped_count += 1
-            continue
-
-        # Check if a message for this player and round is already pending
-        existing_job = SendQueue.query.filter_by(
-            player_id=p.id, 
-            status='pending'
-        ).join(Round, Round.id == current_round.id).first()
-
-        if existing_job:
-            skipped_count += 1
+        to_digits = to_e164_digits(p.whatsapp_number)
+        if not to_digits or not to_digits.isdigit():
+            details.append(f"{p.name}: invalid number")
+            failed += 1
             continue
 
         token = make_pick_token(p.id, current_round.id)
-        # Use BASE_URL from .env for public-facing links
-        base_url = os.environ.get('BASE_URL', 'http://127.0.0.1:5001')
-        pick_link = f"{base_url}{url_for('pick_with_token', token=token)}"
-        message = build_pick_message(p.name, current_round.game_round_number, pick_link)
-        
-        job = SendQueue(
-            player_id=p.id,
-            number=normalized_number,
-            message=message,
-            status='pending'
-        )
-        db.session.add(job)
-        enqueued_count += 1
+        pick_link = url_for('pick_with_token', token=token, _external=True)
 
-    db.session.commit()
-    flash(f"Enqueued {enqueued_count} WhatsApp messages. Skipped {skipped_count} players (no number or already pending).", 'success')
+        # Prefer template if provided via env; else send text
+        if WA_TEMPLATE_NAME:
+            deadline_str = compute_round_deadline(current_round)
+            params = [p.name, current_round.round_number, pick_link, deadline_str]
+            # Trim or pad to match expected template param count
+            if len(params) > WA_TEMPLATE_PARAM_COUNT:
+                params = params[:WA_TEMPLATE_PARAM_COUNT]
+            elif len(params) < WA_TEMPLATE_PARAM_COUNT:
+                params += [""] * (WA_TEMPLATE_PARAM_COUNT - len(params))
+            ok, data, err = whatsapp_send_message(
+                to_digits,
+                template_name=WA_TEMPLATE_NAME,
+                template_params=params
+            )
+        else:
+            body = build_pick_message(p.name, current_round.round_number, pick_link)
+            ok, data, err = whatsapp_send_message(to_digits, body_text=body)
+
+        # Persist the send attempt
+        try:
+            payload_text = json.dumps({'template': WA_TEMPLATE_NAME, 'params': params}) if WA_TEMPLATE_NAME else (body if 'body' in locals() else '')
+        except Exception:
+            payload_text = ''
+        wa_send = WhatsAppSend(player_id=p.id, ok=bool(ok), error_text=(err or None), payload=payload_text)
+        db.session.add(wa_send)
+        db.session.commit()
+
+        # If failed, check consecutive failures and mark unreachable when >= 5
+        if not ok:
+            fails = _consecutive_whatsapp_failures(p.id, window=10)
+            if fails >= 5:
+                p.unreachable = True
+                db.session.commit()
+        if ok:
+            sent += 1
+            details.append(f"{p.name}: sent")
+        else:
+            failed += 1
+            details.append(f"{p.name}: failed ({err})")
+            app.logger.error(f"Failed to send WhatsApp to {p.name}: {err}") # Log the specific player failure
+
+    flash(f"WhatsApp send complete: {sent} sent, {failed} failed.", 'success' if sent and not failed else 'warning')
+    # Also surface a few detail lines for quick debug
+    preview = "; ".join(details[:5])
+    if preview:
+        flash(f"Examples: {preview}", 'info')
     return redirect(url_for('admin_dashboard'))
+
+# ----------------- Admin: Send WhatsApp link to a single player (API) -----------------
+@app.route('/admin/send_whatsapp_link/<int:player_id>', methods=['POST'])
+def admin_send_whatsapp_link(player_id):
+    if not (WA_ACCESS_TOKEN and WA_PHONE_NUMBER_ID):
+        flash('WhatsApp API not configured. Set WA_ACCESS_TOKEN and WA_PHONE_NUMBER_ID env vars.', 'error')
+        return redirect(url_for('admin_dashboard'))
+
+    player = Player.query.get_or_404(player_id)
+    if not player.whatsapp_number:
+        flash(f"{player.name} has no WhatsApp number.", "error")
+        return redirect(url_for('admin_dashboard'))
+
+    current_round = Round.query.filter_by(status='open').first()
+    if not current_round:
+        flash('No open round available.', 'error')
+        return redirect(url_for('admin_dashboard'))
+
+    # Skip if player marked unreachable
+    if getattr(player, 'unreachable', False):
+        flash(f"{player.name} is marked unreachable; not sending.", "warning")
+        return redirect(url_for('admin_dashboard'))
+
+    to_digits = to_e164_digits(player.whatsapp_number)
+    token = make_pick_token(player.id, current_round.id)
+    pick_link = url_for('pick_with_token', token=token, _external=True)
+
+    if WA_TEMPLATE_NAME:
+        deadline_str = compute_round_deadline(current_round)
+        params = [player.name, current_round.round_number, pick_link, deadline_str]
+        if len(params) > WA_TEMPLATE_PARAM_COUNT:
+            params = params[:WA_TEMPLATE_PARAM_COUNT]
+        elif len(params) < WA_TEMPLATE_PARAM_COUNT:
+            params += [""] * (WA_TEMPLATE_PARAM_COUNT - len(params))
+        ok, data, err = whatsapp_send_message(
+            to_digits,
+            template_name=WA_TEMPLATE_NAME,
+            template_params=params
+        )
+    else:
+        body = build_pick_message(p.name, current_round.round_number, pick_link)
+        ok, data, err = whatsapp_send_message(to_digits, body_text=body)
+
+    # Persist the send attempt
+    try:
+        payload_text = json.dumps({'template': WA_TEMPLATE_NAME, 'params': params}) if WA_TEMPLATE_NAME else (body if 'body' in locals() else '')
+    except Exception:
+        payload_text = ''
+    wa_send = WhatsAppSend(player_id=player.id, ok=bool(ok), error_text=(err or None), payload=payload_text)
+    db.session.add(wa_send)
+    db.session.commit()
+
+    if not ok:
+        fails = _consecutive_whatsapp_failures(p.id, window=10)
+        if fails >= 5:
+            player.unreachable = True
+            db.session.commit()
+
+    if ok:
+        flash(f"Sent pick link to {player.name}.", "success")
+    else:
+        flash(f"Failed to send to {player.name}: {err}", "error")
+    return redirect(url_for('admin_dashboard'))
+
 
 @app.route('/player_picks/<int:player_id>')
 def player_picks(player_id):
     player = Player.query.get_or_404(player_id)
-    picks = Pick.query.filter_by(player_id=player.id).join(Round).order_by(Round.game_round_number).all()
+    picks = Pick.query.filter_by(player_id=player.id).join(Round).order_by(Round.round_number).all()
     return render_template('player_picks.html', player=player, picks=picks)
 
 
@@ -943,78 +992,32 @@ def admin_round_links(round_id):
 
     return render_template('round_links.html', round=round_obj, fixtures=fixtures, players=players, player_pick_links=player_pick_links)
 
-# ----------------- Worker API Endpoints -----------------
-
-@app.route('/api/queue/next', methods=['GET'])
-@require_worker_token
-def api_get_next_jobs():
-    limit = request.args.get('limit', 10, type=int)
-    
-    # This is a simplified atomic operation for SQLite and single-worker setups.
-    # For PostgreSQL with multiple workers, you'd use SELECT ... FOR UPDATE SKIP LOCKED.
-    try:
-        pending_jobs = SendQueue.query.filter_by(status='pending').limit(limit).all()
-        if not pending_jobs:
-            return jsonify([])
-
-        job_ids_to_update = [job.id for job in pending_jobs]
-        
-        # Mark jobs as in_progress
-        SendQueue.query.filter(SendQueue.id.in_(job_ids_to_update)).update({
-            'status': 'in_progress',
-            'attempts': SendQueue.attempts + 1
-        }, synchronize_session=False)
-        
-        db.session.commit()
-
-        # Fetch the updated jobs again to return them
-        jobs_to_return = SendQueue.query.filter(SendQueue.id.in_(job_ids_to_update)).all()
-        
-        return jsonify([{ 
-            "id": job.id,
-            "number": job.number,
-            "message": job.message
-        } for job in jobs_to_return])
-
-    except Exception as e:
-        db.session.rollback()
-        app.logger.error(f"Error getting next queue jobs: {e}")
-        return jsonify({"error": "Internal server error"}), 500
-
-
-@app.route('/api/queue/mark', methods=['POST'])
-@require_worker_token
-def api_mark_job():
-    data = request.get_json()
-    if not data or 'id' not in data or 'status' not in data:
-        return jsonify({"error": "Invalid request body"}), 400
-
-    job_id = data.get('id')
-    new_status = data.get('status')
-    error_message = data.get('error')
-
-    if new_status not in ['sent', 'failed']:
-        return jsonify({"error": "Invalid status"}), 400
-
-    try:
-        job = SendQueue.query.get(job_id)
-        if not job:
-            return jsonify({"error": "Job not found"}), 404
-
-        job.status = new_status
-        if new_status == 'failed' and error_message:
-            job.last_error = str(error_message)
-        
-        db.session.commit()
-        return jsonify({"status": "success"}), 200
-
-    except Exception as e:
-        db.session.rollback()
-        app.logger.error(f"Error marking job {job_id}: {e}")
-        return jsonify({"error": "Internal server error"}), 500
-
 
 if __name__ == '__main__':
+    with app.app_context():
+        db.create_all() # Create database tables (will not add columns to existing tables)
+
+        # Ensure small runtime migration: add `unreachable` column to `player` if missing.
+        try:
+            # Use PRAGMA to inspect existing columns in sqlite
+            with db.engine.connect() as conn:
+                res = conn.execute(text("PRAGMA table_info('player')")).all()
+                cols = [r[1] for r in res]
+                if 'unreachable' not in cols:
+                    app.logger.info('Adding missing player.unreachable column to database')
+                    conn.execute(text("ALTER TABLE player ADD COLUMN unreachable BOOLEAN DEFAULT 0"))
+                    conn.commit()
+                # Check for WhatsAppSend table
+                res = conn.execute(text("PRAGMA table_info('whatsapp_send')")).all()
+                if not res: # Table does not exist
+                    app.logger.info('Creating missing whatsapp_send table')
+                    # This will create the table if it doesn't exist
+                    # For simplicity, relying on SQLAlchemy's create_all() to handle the actual table creation
+                    # after the initial check. If create_all() is not sufficient for new tables,
+                    # a more robust migration strategy (e.g., Alembic) would be needed.
+                    pass # create_all() will handle this on next run if not already created
+                    WhatsAppSend.__table__.create(db.engine) # Explicitly create the table
+        except Exception as e:
+            app.logger.exception('Failed to ensure DB schema: %s', e)
     # Start the Flask dev server
     app.run(debug=True, port=5001)
-
