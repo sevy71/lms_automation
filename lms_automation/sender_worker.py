@@ -6,7 +6,7 @@ import requests
 from dotenv import load_dotenv, find_dotenv
 
 # It's crucial that this worker can import the existing WhatsAppSender
-from whatsapp_sender import WhatsAppSender
+from .whatsapp_sender import WhatsAppSender
 
 # Load environment variables from .env file
 # Explicitly load from the project root's .env file
@@ -21,6 +21,13 @@ WORKER_API_TOKEN = os.environ.get("WORKER_API_TOKEN")
 CHROME_USER_DATA_DIR = os.environ.get("CHROME_USER_DATA_DIR")
 
 # --- Validation ---
+# --- Validation & Debugging -- -
+print("--- Environment Variables ---")
+print(f"BASE_URL: {BASE_URL}")
+print(f"WORKER_API_TOKEN: {WORKER_API_TOKEN}")
+print(f"CHROME_USER_DATA_DIR: {CHROME_USER_DATA_DIR}")
+print("-----------------------------")
+
 if not all([BASE_URL, WORKER_API_TOKEN, CHROME_USER_DATA_DIR]):
     print("FATAL: Missing one or more required environment variables:")
     print(" - BASE_URL (e.g., https://your-app-name.onrender.com)")

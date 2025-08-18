@@ -10,6 +10,7 @@ import io
 from dotenv import load_dotenv
 from sqlalchemy import text
 import json
+import subprocess
 
 # Load environment variables
 load_dotenv()
@@ -920,6 +921,17 @@ def admin_send_whatsapp_links():
     preview = "; ".join(details[:5])
     if preview:
         flash(f"Examples: {preview}", 'info')
+    
+    # Start the sender worker
+    if queued > 0:
+        try:
+            # Using python -m to ensure it runs within the correct environment
+            subprocess.Popen(['python', '-m', 'lms_automation.sender_worker'])
+            flash('WhatsApp sender worker started.', 'info')
+        except Exception as e:
+            app.logger.error(f"Failed to start sender worker: {e}")
+            flash(f'Failed to start sender worker: {e}', 'error')
+
     return redirect(url_for('admin_dashboard'))
 
 # ----------------- Admin: Queue WhatsApp link to a single player -----------------
