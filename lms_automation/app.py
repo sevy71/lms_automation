@@ -15,7 +15,10 @@ import json
 load_dotenv()
 
 # Import database and models
-from .database import db
+try:
+    from .database import db  # when imported as a package
+except ImportError:
+    from database import db   # when loaded as a top-level module
 from .models import Player, Round, Fixture, Pick, SendQueue, WhatsAppSend
 
 # Import our API module
