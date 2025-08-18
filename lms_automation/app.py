@@ -392,7 +392,8 @@ def admin_dashboard():
                          cleaned_whatsapp_numbers=cleaned_whatsapp_numbers, 
                          has_wa_config=has_wa_config,
                          queue_stats=queue_stats,
-                         recent_queue_items=recent_queue_items)
+                         recent_queue_items=recent_queue_items,
+                         season_year=2025)
 
 
 # Tokenised pick submission route: /l/<token>
@@ -1012,6 +1013,92 @@ def api_queue_mark():
     
     db.session.commit()
     return {'success': True}
+
+
+# ----------------- Missing Admin Routes -----------------
+
+@app.route('/admin/new_game', methods=['POST'])
+def admin_new_game():
+    """Start a new game - reset all data"""
+    try:
+        # Delete all records from the tables except for players
+        db.session.query(Pick).delete()
+        db.session.query(Fixture).delete()
+        db.session.query(Round).delete()
+        db.session.query(SendQueue).delete()
+        # Reset all players to active status
+        Player.query.update({Player.status: 'active', Player.unreachable: False})
+        db.session.commit()
+        flash('New game started successfully! All data reset except players.', 'success')
+    except Exception as e:
+        db.session.rollback()
+        flash(f'An error occurred while starting new game: {e}', 'error')
+    return redirect(url_for('admin_dashboard'))
+
+@app.route('/admin/load_fixtures')
+def admin_load_fixtures_default():
+    """Load fixtures for current season (2025)"""
+    return admin_load_fixtures(2025)
+
+@app.route('/admin/next_round')
+def admin_next_round():
+    """Setup next round page"""
+    # Get the highest round number
+    last_round = Round.query.order_by(Round.round_number.desc()).first()
+    next_round_number = (last_round.round_number + 1) if last_round else 1
+    
+    # Get unassigned fixtures
+    unassigned_fixtures = Fixture.query.filter(Fixture.round_id.is_(None)).order_by(Fixture.date.asc()).all()
+    
+    return render_template('next_round.html', 
+                         game_round_number=next_round_number,
+                         league_round_number=next_round_number,
+                         unassigned_fixtures=unassigned_fixtures)
+
+@app.route('/admin/create_next_round', methods=['POST'])
+def admin_create_next_round():
+    """Create the next round"""
+    game_round_number = int(request.form['game_round_number'])
+    league_round_number = int(request.form['league_round_number'])
+    selected_fixtures = request.form.getlist('selected_fixtures')
+    
+    if not selected_fixtures:
+        flash('Please select at least one fixture for the round.', 'error')
+        return redirect(url_for('admin_next_round'))
+    
+    try:
+        # Create new round
+        new_round = Round(
+            round_number=game_round_number,
+            start_date=datetime.now().date(),
+            end_date=datetime.now().date(),
+            status='open'
+        )
+        db.session.add(new_round)
+        db.session.commit()
+        
+        # Assign selected fixtures to the round
+        count = 0
+        for fixture_id in selected_fixtures:
+            fixture = Fixture.query.get(int(fixture_id))
+            if fixture and fixture.round_id is None:
+                fixture.round_id = new_round.id
+                count += 1
+        
+        db.session.commit()
+        flash(f'Round {game_round_number} created successfully with {count} fixtures!', 'success')
+        
+    except Exception as e:
+        db.session.rollback()
+        flash(f'Error creating round: {e}', 'error')
+    
+    return redirect(url_for('admin_dashboard'))
+
+# Fix the admin_send_whatsapp route name
+@app.route('/admin/send_whatsapp', methods=['POST'])
+def admin_send_whatsapp():
+    """Alias for admin_send_whatsapp_links to match template expectations"""
+    return admin_send_whatsapp_links()
 
 
 
