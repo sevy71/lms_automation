@@ -1,0 +1,49 @@
+{% extends "base.html" %}
+
+{% block title %}My Picks - {{ player.name }}{% endblock %}
+
+{% block content %}
+<div class="container">
+    <h1 class="my-4">My Picks: {{ player.name }}</h1>
+
+    <div class="card">
+        <div class="card-header">
+            <h2 class="h5 mb-0">Pick History</h2>
+        </div>
+        <div class="card-body">
+            {% if picks %}
+                <table class="table table-striped">
+                    <thead>
+                        <tr>
+                            <th>Round</th>
+                            <th>Team Picked</th>
+                            <th>Outcome</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for pick in picks %}
+                            <tr>
+                                <td>{{ pick.round.round_number }}</td>
+                                <td>{{ pick.team_picked }}</td>
+                                <td>
+                                    {% if pick.is_winner is sameas true %}
+                                        <span class="badge bg-success">Win</span>
+                                    {% elif pick.is_winner is sameas false %}
+                                        <span class="badge bg-danger">Loss</span>
+                                    {% else %}
+                                        <span class="badge bg-secondary">Pending</span>
+                                    {% endif %}
+                                </td>
+                            </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            {% else %}
+                <p>You have not made any picks yet.</p>
+            {% endif %}
+        </div>
+    </div>
+
+    <a href="{{ url_for('index') }}" class="btn btn-primary mt-3">Back to Home</a>
+</div>
+{% endblock %}

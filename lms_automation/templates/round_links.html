@@ -38,6 +38,25 @@
         </div>
     </div>
 
+    <div class="card mt-4">
+        <div class="card-header">
+            <h2>My Picks Links</h2>
+        </div>
+        <div class="card-body">
+            <p>Share these links with each player individually for them to view their pick history.</p>
+            <ul class="list-group">
+                {% for player in players %}
+                    {% if player.status == 'active' %}
+                        <li class="list-group-item">
+                            <strong>{{ player.name }}</strong>: 
+                            <a href="{{ my_picks_links[player.id] }}" target="_blank">{{ my_picks_links[player.id] }}</a>
+                        </li>
+                    {% endif %}
+                {% endfor %}
+            </ul>
+        </div>
+    </div>
+
     <div class="mt-4">
         <a href="{{ url_for('admin_dashboard') }}" class="btn btn-secondary">Back to Admin Dashboard</a>
     </div>

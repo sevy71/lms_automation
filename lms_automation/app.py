@@ -25,21 +25,27 @@ except ImportError:
     from models import Player, Round, Fixture, Pick, SendQueue, WhatsAppSend    # top-level import
 
 # Import our API module
-from .football_data_api import get_upcoming_premier_league_fixtures, get_premier_league_fixtures_by_season, get_fixture_by_id, get_fixtures_by_ids
+try:
+    from .football_data_api import get_upcoming_premier_league_fixtures, get_premier_league_fixtures_by_season, get_fixture_by_id, get_fixtures_by_ids
+except ImportError:
+    from football_data_api import get_upcoming_premier_league_fixtures, get_premier_league_fixtures_by_season, get_fixture_by_id, get_fixtures_by_ids
+from flask_migrate import Migrate
 
 # --- App Initialization ---
 basedir = os.path.abspath(os.path.dirname(__file__))
 app = Flask(__name__)
-app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///' + os.path.join(basedir, 'lms.db')
+app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('DATABASE_URL') or 'sqlite:///' + os.path.join(basedir, 'lms.db')
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'please_change_me')
 
 # Connect database to the app
 db.init_app(app)
+migrate = Migrate(app, db)
 
 
 # --- Token generator for per-round pick links ---
 pick_link_serializer = URLSafeSerializer(app.config['SECRET_KEY'], salt='pick-link')
+my_picks_link_serializer = URLSafeSerializer(app.config['SECRET_KEY'], salt='my-picks-link')
 
 def make_pick_token(player_id: int, round_id: int) -> str:
     return pick_link_serializer.dumps({'p': int(player_id), 'r': int(round_id)})
@@ -50,6 +56,16 @@ def parse_pick_token(token: str):
         return int(data.get('p')), int(data.get('r'))
     except BadSignature:
         return None, None
+
+def make_my_picks_token(player_id: int) -> str:
+    return my_picks_link_serializer.dumps({'p': int(player_id)})
+
+def parse_my_picks_token(token: str):
+    try:
+        data = my_picks_link_serializer.loads(token)
+        return int(data.get('p'))
+    except BadSignature:
+        return None
 
 def compute_round_deadline(round_obj):
     """
@@ -95,104 +111,53 @@ def compute_round_deadline(round_obj):
         app.logger.warning("Could not compute round deadline: %s", e)
     return "1 hour before first kick-off"
 
-# --- WhatsApp Cloud API configuration (set via environment variables) ---
-WA_ACCESS_TOKEN = os.environ.get('WA_ACCESS_TOKEN')  # Permanent system-user token recommended
-WA_PHONE_NUMBER_ID = os.environ.get('WA_PHONE_NUMBER_ID')  # Numeric Phone Number ID for the sending number
-WA_API_VERSION = os.environ.get('WA_API_VERSION', 'v23.0')
-WA_TEMPLATE_NAME = os.environ.get('WA_TEMPLATE_NAME')  # Optional approved template name (e.g., 'lms_team_pick')
-WA_TEMPLATE_LANG = os.environ.get('WA_TEMPLATE_LANG', 'en_GB')
-try:
-    WA_TEMPLATE_PARAM_COUNT = int(os.environ.get('WA_TEMPLATE_PARAM_COUNT', '4'))
-except Exception:
-    WA_TEMPLATE_PARAM_COUNT = 4
+# --- Queue-based WhatsApp Configuration ---
+WORKER_API_TOKEN = os.environ.get('WORKER_API_TOKEN')  # Token for worker authentication
 
 def _digits_only(s: str) -> str:
     return ''.join(ch for ch in (s or '') if ch.isdigit())
 
 def to_e164_digits(whatsapp_number: str) -> str:
     """
-    Returns a digits-only E.164-like string without '+'.
-    If the number starts with '0' (UK local), we do NOT guess country code here to avoid mistakes.
-    Expect callers to store numbers with country code, e.g., '447...'.
+    Returns a properly formatted phone number with '+' prefix for WhatsApp Web.
+    Converts UK local numbers (starting with 0) to international format.
     """
     d = _digits_only(whatsapp_number)
-    # Warn in server logs if it looks like a local UK number (starts with 0 and length 11)
+    
+    # Convert UK local numbers (07... -> +447...)
     if d.startswith('0') and len(d) == 11:
-        app.logger.warning("WhatsApp number looks local (starts with 0). Store as E.164 without '+', e.g., '447...': %s", d)
+        d = '44' + d[1:]  # Remove 0 and add 44 country code
+    
+    # Ensure it starts with + for WhatsApp Web
+    if not d.startswith('+'):
+        d = '+' + d
+        
     return d
 
-def whatsapp_send_message(to_digits: str, body_text: str = None, template_name: str = None, template_params: list = None):
+def queue_whatsapp_message(to_digits: str, body_text: str, player_id: int = None):
     """
-    Send a WhatsApp message using Cloud API.
-    - If template_name is provided, sends a template with optional body parameters.
-    - Else sends a simple text message (requires the 24h customer window).
-    Returns (ok: bool, response_json: dict|None, error_msg: str|None)
+    Queue a WhatsApp message for sending via the local worker.
+    Returns (ok: bool, error_msg: str|None)
     """
-    if not (WA_ACCESS_TOKEN and WA_PHONE_NUMBER_ID):
-        return False, None, "WhatsApp API not configured (missing WA_ACCESS_TOKEN or WA_PHONE_NUMBER_ID)."
-
-    url = f"https://graph.facebook.com/{WA_API_VERSION}/{WA_PHONE_NUMBER_ID}/messages"
-    headers = {
-        "Authorization": f"Bearer {WA_ACCESS_TOKEN}",
-        "Content-Type": "application/json"
-    }
-    if template_name:
-        payload = {
-            "messaging_product": "whatsapp",
-            "to": to_digits,
-            "type": "template",
-            "template": {
-                "name": template_name,
-                "language": {"code": WA_TEMPLATE_LANG},
-            }
-        }
-        if template_params:
-            payload["template"]["components"] = [{
-                "type": "body",
-                "parameters": [{"type": "text", "text": str(p)} for p in template_params]
-            }]
-    else:
-        if not body_text:
-            return False, None, "No body_text provided for text message and no template_name specified."
-        payload = {
-            "messaging_product": "whatsapp",
-            "to": to_digits,
-            "type": "text",
-            "text": {"body": body_text}
-        }
-
     try:
-        resp = requests.post(url, json=payload, headers=headers, timeout=30)
+        # Add message to the send queue
+        send_item = SendQueue(
+            player_id=player_id,
+            number=to_digits,
+            message=body_text,
+            status='pending'
+        )
+        db.session.add(send_item)
+        db.session.commit()
+        return True, None
     except Exception as e:
-        return False, None, f"Network error: {e}"
-
-    try:
-        data = resp.json()
-    except Exception:
-        data = None
-
-    if resp.status_code == 200 or resp.status_code == 201:
-        return True, data, None
-    else:
-        # Extract helpful error message
-        err = None
-        if isinstance(data, dict):
-            err = (data.get('error') or {}).get('message') or str(data)
-            app.logger.error("WhatsApp API Error Response: %s", json.dumps(data, indent=2)) # Log full error response
-        else:
-            err = f"HTTP {resp.status_code}"
-        app.logger.error("WhatsApp API Call Failed: Status %s, Error: %s", resp.status_code, err) # Log the failure
-        return False, data, err
+        app.logger.error(f"Failed to queue WhatsApp message: {e}")
+        return False, str(e)
 
 def _consecutive_whatsapp_failures(player_id: int, window: int = 10) -> int:
     """Return number of consecutive failed sends for the given player, looking back up to `window` attempts."""
-    sends = WhatsAppSend.query.filter_by(player_id=player_id).order_by(WhatsAppSend.timestamp.desc()).limit(window).all()
-    count = 0
-    for s in sends:
-        if s.ok:
-            break
-        count += 1
-    return count
+    sends = SendQueue.query.filter_by(player_id=player_id, status='failed').order_by(SendQueue.updated_at.desc()).limit(window).all()
+    return len(sends)
 
 def build_pick_message(player_name: str, round_number: int, pick_link: str) -> str:
     return f"Hello {player_name}! It’s time to make your pick for LMS Round {round_number}.\n{pick_link}\n(Deadline: 1 hour before first kick-off)"
@@ -406,9 +371,28 @@ def admin_dashboard():
                     # Clean the number by removing all non-digit characters
                     cleaned_number = ''.join(filter(str.isdigit, player.whatsapp_number))
                     cleaned_whatsapp_numbers[player.id] = cleaned_number
-    has_wa_config = bool(WA_ACCESS_TOKEN and WA_PHONE_NUMBER_ID)
+    has_wa_config = True  # Always true for queue-based system
 
-    return render_template('admin_dashboard.html', players=players, current_round=current_round, fixtures=fixtures, player_pick_links=player_pick_links, cleaned_whatsapp_numbers=cleaned_whatsapp_numbers, has_wa_config=has_wa_config)
+    # Get queue statistics
+    queue_stats = {
+        'pending': SendQueue.query.filter_by(status='pending').count(),
+        'in_progress': SendQueue.query.filter_by(status='in_progress').count(),
+        'sent': SendQueue.query.filter_by(status='sent').count(),
+        'failed': SendQueue.query.filter_by(status='failed').count(),
+    }
+    
+    # Get recent queue items for monitoring
+    recent_queue_items = SendQueue.query.order_by(SendQueue.updated_at.desc()).limit(10).all()
+
+    return render_template('admin_dashboard.html', 
+                         players=players, 
+                         current_round=current_round, 
+                         fixtures=fixtures, 
+                         player_pick_links=player_pick_links, 
+                         cleaned_whatsapp_numbers=cleaned_whatsapp_numbers, 
+                         has_wa_config=has_wa_config,
+                         queue_stats=queue_stats,
+                         recent_queue_items=recent_queue_items)
 
 
 # Tokenised pick submission route: /l/<token>
@@ -796,6 +780,19 @@ def delete_player(player_id):
     return redirect(url_for('admin_dashboard'))
 
 
+@app.route('/eliminate_player/<int:player_id>', methods=['GET'])
+def eliminate_player(player_id):
+    player = Player.query.get_or_404(player_id)
+    try:
+        player.status = 'eliminated'
+        db.session.commit()
+        flash(f'Player {player.name} has been eliminated successfully!', 'success')
+    except Exception as e:
+        db.session.rollback()
+        flash(f'An error occurred while eliminating the player: {e}', 'error')
+    return redirect(url_for('admin_dashboard'))
+
+
 @app.route('/admin/unassigned_fixtures')
 def admin_unassigned_fixtures():
     fixtures = Fixture.query.order_by(Fixture.date.asc()).all()
@@ -818,13 +815,9 @@ def admin_reset_game():
         flash(f'An error occurred while resetting the game: {e}', 'error')
     return redirect(url_for('admin_dashboard'))
 
-# ----------------- Admin: Send WhatsApp links via Cloud API (batch) -----------------
+# ----------------- Admin: Queue WhatsApp links for sending -----------------
 @app.route('/admin/send_whatsapp_links', methods=['POST'])
 def admin_send_whatsapp_links():
-    if not (WA_ACCESS_TOKEN and WA_PHONE_NUMBER_ID):
-        flash('WhatsApp API not configured. Set WA_ACCESS_TOKEN and WA_PHONE_NUMBER_ID env vars.', 'error')
-        return redirect(url_for('admin_dashboard'))
-
     current_round = Round.query.filter_by(status='open').first()
     if not current_round:
         flash('No open round available.', 'error')
@@ -835,9 +828,10 @@ def admin_send_whatsapp_links():
         flash('No active players to message.', 'warning')
         return redirect(url_for('admin_dashboard'))
 
-    sent = 0
+    queued = 0
     failed = 0
     details = []
+    
     for p in players:
         # Skip players marked unreachable
         if getattr(p, 'unreachable', False):
@@ -848,6 +842,7 @@ def admin_send_whatsapp_links():
             details.append(f"{p.name}: no number")
             failed += 1
             continue
+        
         to_digits = to_e164_digits(p.whatsapp_number)
         if not to_digits or not to_digits.isdigit():
             details.append(f"{p.name}: invalid number")
@@ -856,62 +851,29 @@ def admin_send_whatsapp_links():
 
         token = make_pick_token(p.id, current_round.id)
         pick_link = url_for('pick_with_token', token=token, _external=True)
-
-        # Prefer template if provided via env; else send text
-        if WA_TEMPLATE_NAME:
-            deadline_str = compute_round_deadline(current_round)
-            params = [p.name, current_round.round_number, pick_link, deadline_str]
-            # Trim or pad to match expected template param count
-            if len(params) > WA_TEMPLATE_PARAM_COUNT:
-                params = params[:WA_TEMPLATE_PARAM_COUNT]
-            elif len(params) < WA_TEMPLATE_PARAM_COUNT:
-                params += [""] * (WA_TEMPLATE_PARAM_COUNT - len(params))
-            ok, data, err = whatsapp_send_message(
-                to_digits,
-                template_name=WA_TEMPLATE_NAME,
-                template_params=params
-            )
-        else:
-            body = build_pick_message(p.name, current_round.round_number, pick_link)
-            ok, data, err = whatsapp_send_message(to_digits, body_text=body)
-
-        # Persist the send attempt
-        try:
-            payload_text = json.dumps({'template': WA_TEMPLATE_NAME, 'params': params}) if WA_TEMPLATE_NAME else (body if 'body' in locals() else '')
-        except Exception:
-            payload_text = ''
-        wa_send = WhatsAppSend(player_id=p.id, ok=bool(ok), error_text=(err or None), payload=payload_text)
-        db.session.add(wa_send)
-        db.session.commit()
-
-        # If failed, check consecutive failures and mark unreachable when >= 5
-        if not ok:
-            fails = _consecutive_whatsapp_failures(p.id, window=10)
-            if fails >= 5:
-                p.unreachable = True
-                db.session.commit()
+        body = build_pick_message(p.name, current_round.round_number, pick_link)
+        
+        # Queue the message
+        ok, err = queue_whatsapp_message(to_digits, body, p.id)
+        
         if ok:
-            sent += 1
-            details.append(f"{p.name}: sent")
+            queued += 1
+            details.append(f"{p.name}: queued")
         else:
             failed += 1
             details.append(f"{p.name}: failed ({err})")
-            app.logger.error(f"Failed to send WhatsApp to {p.name}: {err}") # Log the specific player failure
+            app.logger.error(f"Failed to queue WhatsApp to {p.name}: {err}")
 
-    flash(f"WhatsApp send complete: {sent} sent, {failed} failed.", 'success' if sent and not failed else 'warning')
+    flash(f"WhatsApp messages queued: {queued} queued, {failed} failed.", 'success' if queued and not failed else 'warning')
     # Also surface a few detail lines for quick debug
     preview = "; ".join(details[:5])
     if preview:
         flash(f"Examples: {preview}", 'info')
     return redirect(url_for('admin_dashboard'))
 
-# ----------------- Admin: Send WhatsApp link to a single player (API) -----------------
+# ----------------- Admin: Queue WhatsApp link to a single player -----------------
 @app.route('/admin/send_whatsapp_link/<int:player_id>', methods=['POST'])
 def admin_send_whatsapp_link(player_id):
-    if not (WA_ACCESS_TOKEN and WA_PHONE_NUMBER_ID):
-        flash('WhatsApp API not configured. Set WA_ACCESS_TOKEN and WA_PHONE_NUMBER_ID env vars.', 'error')
-        return redirect(url_for('admin_dashboard'))
-
     player = Player.query.get_or_404(player_id)
     if not player.whatsapp_number:
         flash(f"{player.name} has no WhatsApp number.", "error")
@@ -930,42 +892,15 @@ def admin_send_whatsapp_link(player_id):
     to_digits = to_e164_digits(player.whatsapp_number)
     token = make_pick_token(player.id, current_round.id)
     pick_link = url_for('pick_with_token', token=token, _external=True)
-
-    if WA_TEMPLATE_NAME:
-        deadline_str = compute_round_deadline(current_round)
-        params = [player.name, current_round.round_number, pick_link, deadline_str]
-        if len(params) > WA_TEMPLATE_PARAM_COUNT:
-            params = params[:WA_TEMPLATE_PARAM_COUNT]
-        elif len(params) < WA_TEMPLATE_PARAM_COUNT:
-            params += [""] * (WA_TEMPLATE_PARAM_COUNT - len(params))
-        ok, data, err = whatsapp_send_message(
-            to_digits,
-            template_name=WA_TEMPLATE_NAME,
-            template_params=params
-        )
-    else:
-        body = build_pick_message(player.name, current_round.round_number, pick_link)
-        ok, data, err = whatsapp_send_message(to_digits, body_text=body)
-
-    # Persist the send attempt
-    try:
-        payload_text = json.dumps({'template': WA_TEMPLATE_NAME, 'params': params}) if WA_TEMPLATE_NAME else (body if 'body' in locals() else '')
-    except Exception:
-        payload_text = ''
-    wa_send = WhatsAppSend(player_id=player.id, ok=bool(ok), error_text=(err or None), payload=payload_text)
-    db.session.add(wa_send)
-    db.session.commit()
-
-    if not ok:
-        fails = _consecutive_whatsapp_failures(player.id, window=10)
-        if fails >= 5:
-            player.unreachable = True
-            db.session.commit()
+    body = build_pick_message(player.name, current_round.round_number, pick_link)
+    
+    # Queue the message
+    ok, err = queue_whatsapp_message(to_digits, body, player.id)
 
     if ok:
-        flash(f"Sent pick link to {player.name}.", "success")
+        flash(f"Queued pick link for {player.name}.", "success")
     else:
-        flash(f"Failed to send to {player.name}: {err}", "error")
+        flash(f"Failed to queue message for {player.name}: {err}", "error")
     return redirect(url_for('admin_dashboard'))
 
 
@@ -974,6 +909,18 @@ def player_picks(player_id):
     player = Player.query.get_or_404(player_id)
     picks = Pick.query.filter_by(player_id=player.id).join(Round).order_by(Round.round_number).all()
     return render_template('player_picks.html', player=player, picks=picks)
+
+
+@app.route('/my_picks/<token>')
+def my_picks(token):
+    player_id = parse_my_picks_token(token)
+    if not player_id:
+        flash('Invalid or expired link.', 'error')
+        return redirect(url_for('index'))
+
+    player = Player.query.get_or_404(player_id)
+    picks = Pick.query.filter_by(player_id=player.id).join(Round).order_by(Round.round_number).all()
+    return render_template('my_picks.html', player=player, picks=picks)
 
 
 # ----------------- Admin: Manage Round -----------------
@@ -992,38 +939,79 @@ def admin_round_links(round_id):
     players = Player.query.filter_by(status='active').all()
     
     player_pick_links = {}
+    my_picks_links = {}
     for player in players:
         token = make_pick_token(player.id, round_obj.id)
         player_pick_links[player.id] = url_for('pick_with_token', token=token, _external=True)
+        my_picks_token = make_my_picks_token(player.id)
+        my_picks_links[player.id] = url_for('my_picks', token=my_picks_token, _external=True)
 
-    return render_template('round_links.html', round=round_obj, fixtures=fixtures, players=players, player_pick_links=player_pick_links)
+    return render_template('round_links.html', round=round_obj, fixtures=fixtures, players=players, player_pick_links=player_pick_links, my_picks_links=my_picks_links)
 
 
-if __name__ == '__main__':
-    with app.app_context():
-        db.create_all() # Create database tables (will not add columns to existing tables)
+# ----------------- API Endpoints for Local Worker -----------------
+def validate_worker_token():
+    """Validate the worker API token from Authorization header"""
+    auth_header = request.headers.get('Authorization', '')
+    if not auth_header.startswith('Bearer '):
+        return False
+    token = auth_header.replace('Bearer ', '')
+    return token == WORKER_API_TOKEN
 
-        # Ensure small runtime migration: add `unreachable` column to `player` if missing.
-        try:
-            # Use PRAGMA to inspect existing columns in sqlite
-            with db.engine.connect() as conn:
-                res = conn.execute(text("PRAGMA table_info('player')")).all()
-                cols = [r[1] for r in res]
-                if 'unreachable' not in cols:
-                    app.logger.info('Adding missing player.unreachable column to database')
-                    conn.execute(text("ALTER TABLE player ADD COLUMN unreachable BOOLEAN DEFAULT 0"))
-                    conn.commit()
-                # Check for WhatsAppSend table
-                res = conn.execute(text("PRAGMA table_info('whatsapp_send')")).all()
-                if not res: # Table does not exist
-                    app.logger.info('Creating missing whatsapp_send table')
-                    # This will create the table if it doesn't exist
-                    # For simplicity, relying on SQLAlchemy's create_all() to handle the actual table creation
-                    # after the initial check. If create_all() is not sufficient for new tables,
-                    # a more robust migration strategy (e.g., Alembic) would be needed.
-                    pass # create_all() will handle this on next run if not already created
-                    WhatsAppSend.__table__.create(db.engine) # Explicitly create the table
-        except Exception as e:
-            app.logger.exception('Failed to ensure DB schema: %s', e)
-    # Start the Flask dev server
-    app.run(debug=True, port=5001)
+@app.route('/api/queue/next', methods=['GET'])
+def api_queue_next():
+    """API endpoint to get next pending messages for the worker"""
+    if not validate_worker_token():
+        return {'error': 'Unauthorized'}, 401
+    
+    limit = request.args.get('limit', 10, type=int)
+    
+    # Get pending messages, mark them as in_progress to avoid double processing
+    pending = SendQueue.query.filter_by(status='pending').limit(limit).all()
+    
+    jobs = []
+    for item in pending:
+        item.status = 'in_progress'
+        item.attempts += 1
+        jobs.append({
+            'id': item.id,
+            'number': item.number,
+            'message': item.message,
+            'player_id': item.player_id
+        })
+    
+    db.session.commit()
+    return jobs
+
+@app.route('/api/queue/mark', methods=['POST'])
+def api_queue_mark():
+    """API endpoint to mark a job as completed or failed"""
+    if not validate_worker_token():
+        return {'error': 'Unauthorized'}, 401
+    
+    data = request.get_json()
+    job_id = data.get('id')
+    status = data.get('status')  # 'sent' or 'failed'
+    error = data.get('error')
+    
+    item = SendQueue.query.get(job_id)
+    if not item:
+        return {'error': 'Job not found'}, 404
+    
+    item.status = status
+    if error:
+        item.last_error = str(error)
+    
+    # Check for consecutive failures and mark player unreachable
+    if status == 'failed' and item.player_id:
+        fails = _consecutive_whatsapp_failures(item.player_id, window=10)
+        if fails >= 5:
+            player = Player.query.get(item.player_id)
+            if player:
+                player.unreachable = True
+    
+    db.session.commit()
+    return {'success': True}
+
+
+

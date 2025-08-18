@@ -1,5 +1,8 @@
 # lms_automation/models.py
-from .database import db
+try:
+    from .database import db  # when imported as a package
+except ImportError:
+    from database import db   # when loaded as a top-level module
 from datetime import datetime
 
 class Player(db.Model):
@@ -14,28 +17,19 @@ class Player(db.Model):
     def __repr__(self):
         return f'<Player {self.name}>'
 
-class Game(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    status = db.Column(db.String(20), default='active') # 'active', 'completed'
-    rounds = db.relationship('Round', backref='game', lazy=True)
-
-    def __repr__(self):
-        return f'<Game {self.id}>'
 
 class Round(db.Model):
     id = db.Column(db.Integer, primary_key=True)
-    game_id = db.Column(db.Integer, db.ForeignKey('game.id'), nullable=False)
-    game_round_number = db.Column(db.Integer, nullable=False)
-    league_round_number = db.Column(db.Integer, nullable=False)
-    start_date = db.Column(db.DateTime, nullable=False)
-    end_date = db.Column(db.DateTime, nullable=False)
+    round_number = db.Column(db.Integer, nullable=False)
+    start_date = db.Column(db.Date, nullable=False)
+    end_date = db.Column(db.Date, nullable=False)
     status = db.Column(db.String(20), default='open') # 'open', 'closed', 'completed'
 
     fixtures = db.relationship('Fixture', backref='round', lazy=True)
     picks = db.relationship('Pick', backref='round', lazy=True)
 
     def __repr__(self):
-        return f'<Round {self.game_round_number}>'
+        return f'<Round {self.round_number}>'
 
 class Fixture(db.Model):
     id = db.Column(db.Integer, primary_key=True)

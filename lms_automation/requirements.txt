@@ -18,3 +18,4 @@ requests
 selenium
 webdriver-manager
 gunicorn
+Flask-Migrate
