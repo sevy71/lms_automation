@@ -1,5 +1,5 @@
 # lms_automation/init_db.py
-from app import app, db
+from lms_automation.app import app, db
 from sqlalchemy import text
 
 with app.app_context():
