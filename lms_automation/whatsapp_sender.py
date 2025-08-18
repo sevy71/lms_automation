@@ -1,6 +1,7 @@
 
 import os
 import time
+import random
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.service import Service
@@ -42,7 +43,7 @@ class WhatsAppSender:
         print("🚀 Starting Chrome browser...")
         self.driver = webdriver.Chrome(service=service, options=chrome_options)
         self.driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-        self.wait = WebDriverWait(self.driver, 30)
+        self.wait = WebDriverWait(self.driver, 60) # Increased wait time
         
         # Initialize WhatsApp Web
         self._initialize_whatsapp()
@@ -60,7 +61,7 @@ class WhatsAppSender:
             )
             
             # Wait a bit more for the interface to fully load
-            time.sleep(3)
+            time.sleep(random.uniform(2, 5))
             print("✅ WhatsApp Web loaded successfully")
             
         except TimeoutException:
@@ -91,13 +92,11 @@ class WhatsAppSender:
             # Wait for the chat to load and send button to appear
             print("⏳ Waiting for chat interface...")
             
-            # Multiple possible send button selectors
+            # More robust send button selectors
             send_button_selectors = [
                 '//button[@aria-label="Send"]',
-                '//button[@data-testid="send"]', 
-                '//span[@data-icon="send"]/..',
-                '//button[contains(@class, "send")]',
-                '//*[@data-testid="send" or @aria-label="Send"]'
+                '//span[@data-icon="send"]',
+                '//div[contains(@class, "_4sWnG")]//button',
             ]
             
             send_button = None
@@ -114,12 +113,13 @@ class WhatsAppSender:
             if not send_button:
                 return False, "Could not find send button"
             
-            time.sleep(2) # Small delay to ensure UI is ready
+            # Add a random delay before clicking
+            time.sleep(random.uniform(1.5, 3.5))
             send_button.click()
             print("✅ Send button clicked")
             
             # Wait a bit for the message to be sent before the next action
-            time.sleep(3)
+            time.sleep(random.uniform(2, 4))
             return True, "Message sent successfully."
 
         except TimeoutException:
