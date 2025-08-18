@@ -16,8 +16,17 @@ class WhatsAppSender:
         :param user_data_dir: Path to the Chrome user data directory for persistent sessions.
         """
         chrome_options = Options()
+        
+        # Add Chrome options for better compatibility
+        chrome_options.add_argument('--no-sandbox')
+        chrome_options.add_argument('--disable-dev-shm-usage')
+        chrome_options.add_argument('--disable-blink-features=AutomationControlled')
+        chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
+        chrome_options.add_experimental_option('useAutomationExtension', False)
+        
         if user_data_dir:
             chrome_options.add_argument(f"user-data-dir={user_data_dir}")
+            print(f"Using Chrome profile: {user_data_dir}")
         else:
             # If no user_data_dir is provided, Selenium will use a temporary profile.
             # This will require QR code scanning on each run.
@@ -30,9 +39,34 @@ class WhatsAppSender:
         except ImportError:
             raise ImportError("webdriver-manager is not installed. Please install it with 'pip install webdriver-manager'")
 
+        print("🚀 Starting Chrome browser...")
         self.driver = webdriver.Chrome(service=service, options=chrome_options)
-        self.wait = WebDriverWait(self.driver, 20)
+        self.driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+        self.wait = WebDriverWait(self.driver, 30)
+        
+        # Initialize WhatsApp Web
+        self._initialize_whatsapp()
 
+    def _initialize_whatsapp(self):
+        """Initialize WhatsApp Web and wait for login"""
+        print("🌐 Loading WhatsApp Web...")
+        try:
+            self.driver.get("https://web.whatsapp.com")
+            print("📱 Please scan QR code if not already logged in...")
+            
+            # Wait for WhatsApp to load (either QR code or chat interface)
+            self.wait.until(
+                lambda driver: "web.whatsapp.com" in driver.current_url
+            )
+            
+            # Wait a bit more for the interface to fully load
+            time.sleep(3)
+            print("✅ WhatsApp Web loaded successfully")
+            
+        except TimeoutException:
+            print("❌ Failed to load WhatsApp Web")
+            raise Exception("Could not load WhatsApp Web")
+    
     def send_message(self, phone_number, message):
         """
         Sends a WhatsApp message to a given phone number.
@@ -41,25 +75,51 @@ class WhatsAppSender:
             raise ValueError("Phone number must include the country code and start with '+'.")
 
         try:
+            print(f"📤 Sending message to {phone_number}...")
+            
             # URL encode the message
             import urllib.parse
             encoded_message = urllib.parse.quote(message)
             
-            url = f"https://web.whatsapp.com/send?phone={phone_number}&text={encoded_message}"
+            # Clean phone number (remove + if present for URL)
+            clean_number = phone_number.replace('+', '')
+            url = f"https://web.whatsapp.com/send?phone={clean_number}&text={encoded_message}"
+            
+            print(f"🔗 Navigating to: {url[:50]}...")
             self.driver.get(url)
 
-            # Wait for the send button to be clickable
-            send_button_xpath = '//button[@aria-label="Send"] | //button[@data-testid="send"] | //span[@data-icon="send"]'
+            # Wait for the chat to load and send button to appear
+            print("⏳ Waiting for chat interface...")
             
-            send_button = self.wait.until(
-                EC.element_to_be_clickable((By.XPATH, send_button_xpath))
-            )
+            # Multiple possible send button selectors
+            send_button_selectors = [
+                '//button[@aria-label="Send"]',
+                '//button[@data-testid="send"]', 
+                '//span[@data-icon="send"]/..',
+                '//button[contains(@class, "send")]',
+                '//*[@data-testid="send" or @aria-label="Send"]'
+            ]
+            
+            send_button = None
+            for selector in send_button_selectors:
+                try:
+                    send_button = self.wait.until(
+                        EC.element_to_be_clickable((By.XPATH, selector))
+                    )
+                    print(f"✅ Found send button with selector: {selector}")
+                    break
+                except TimeoutException:
+                    continue
+            
+            if not send_button:
+                return False, "Could not find send button"
             
             time.sleep(2) # Small delay to ensure UI is ready
             send_button.click()
+            print("✅ Send button clicked")
             
             # Wait a bit for the message to be sent before the next action
-            time.sleep(5)
+            time.sleep(3)
             return True, "Message sent successfully."
 
         except TimeoutException:

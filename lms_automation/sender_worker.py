@@ -64,11 +64,21 @@ def main_loop():
     The main worker loop.
     Initializes the sender, then continuously polls for and processes jobs.
     """
-    print("--- Initializing WhatsApp Sender ---")
-    print(f"Using Chrome user data dir: {CHROME_USER_DATA_DIR}")
+    print("🚀 --- Starting LMS WhatsApp Worker ---")
+    print(f"📁 Chrome user data dir: {CHROME_USER_DATA_DIR}")
+    print(f"🌐 API base URL: {BASE_URL}")
+    
     # Initialize the sender once at the start
-    sender = WhatsAppSender(user_data_dir=CHROME_USER_DATA_DIR)
-    print("--- WhatsApp Sender Initialized ---")
+    try:
+        sender = WhatsAppSender(user_data_dir=CHROME_USER_DATA_DIR)
+        print("✅ --- WhatsApp Sender Initialized ---")
+        print("💡 Chrome window should be open with WhatsApp Web loaded")
+        print("📱 If you see a QR code, scan it with your phone to continue")
+        input("⏳ Press Enter once WhatsApp Web is ready...")
+    except Exception as e:
+        print(f"❌ Failed to initialize WhatsApp sender: {e}")
+        print("💡 Make sure Chrome is installed and the profile path is correct")
+        return
     
     while True:
         print("\nPolling for new jobs...")
