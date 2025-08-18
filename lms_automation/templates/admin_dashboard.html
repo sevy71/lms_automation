@@ -25,7 +25,10 @@
         <form action="{{ url_for('admin_new_game') }}" method="post" style="display:inline">
             <button class="btn btn-sm btn-danger" type="submit">Start New Game</button>
         </form>
-        <a class="btn btn-sm btn-primary" href="{{ url_for('admin_load_fixtures') }}">Load {{ season_year }}/{{ season_year + 1 }} PL Fixtures</a>
+        <form action="#" method="get" style="display:inline-block;" onsubmit="this.action = '{{ url_for('admin_load_fixtures', season_year=1234) }}'.replace('1234', this.season.value); return true;">
+    <input type="number" name="season" value="{{ season_year }}" style="width: 80px; padding: .2rem .5rem; border-radius: .2rem; border: 1px solid #ccc;" placeholder="YYYY">
+    <button class="btn btn-sm btn-primary" type="submit">Load PL Fixtures</button>
+</form>
         <a class="btn btn-sm btn-secondary" href="{{ url_for('admin_unassigned_fixtures') }}">View Unassigned Fixtures</a>
         <a class="btn btn-sm btn-success" href="{{ url_for('admin_next_round') }}">Setup Next Round</a>
       </div>

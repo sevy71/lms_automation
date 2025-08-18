@@ -1131,13 +1131,12 @@ def admin_new_game():
         flash(f'An error occurred while starting new game: {e}', 'error')
     return redirect(url_for('admin_dashboard'))
 
-@app.route('/admin/load_fixtures')
-def admin_load_fixtures():
-    """Load fixtures for current season (2025)"""
-    current_year = 2025
-    fixtures_data = get_premier_league_fixtures_by_season(current_year)
+@app.route('/admin/load_fixtures/<int:season_year>')
+def admin_load_fixtures(season_year):
+    """Load fixtures for a given season"""
+    fixtures_data = get_premier_league_fixtures_by_season(season_year)
     if not fixtures_data:
-        flash(f"No fixtures found for season {current_year} from API.", 'warning')
+        flash(f"No fixtures found for season {season_year} from API.", 'warning')
         return redirect(url_for('admin_dashboard'))
 
     fixtures_added_count = 0

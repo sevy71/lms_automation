@@ -69,9 +69,6 @@ def get_premier_league_fixtures_by_season(season_year: int | None = None):
         return []
 
     try:
-        # Force the season year to 2025
-        season_year = 2025
-
         r = requests.get(
             f"https://api.football-data.org/v4/competitions/PL/matches?season={season_year}",
             headers={'X-Auth-Token': token}
