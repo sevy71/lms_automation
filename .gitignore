@@ -8,6 +8,7 @@ venv/
 .venv/
 env/
 ENV/
+new_venv/
 
 # Environment variables
 *.env
@@ -17,12 +18,15 @@ ENV/
 
 # Logs
 *.log
+sender_worker_output.log
 
 # VS Code settings
 .vscode/
 
 # SQLite database (if you’re using one locally)
 *.sqlite3
+*.db
+*.sqlite
 instance/
 
 # Distribution / packaging
@@ -34,3 +38,6 @@ build/
 
 # WhatsApp session files (browser profile, cache, etc.)
 lms_automation/whatsapp_session/
+
+# Local-only artifacts
+PyWhatKit_DB.txt

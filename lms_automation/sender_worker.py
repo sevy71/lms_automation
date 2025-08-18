@@ -3,13 +3,14 @@ import os
 import time
 import random
 import requests
-from dotenv import load_dotenv
+from dotenv import load_dotenv, find_dotenv
 
 # It's crucial that this worker can import the existing WhatsAppSender
 from whatsapp_sender import WhatsAppSender
 
 # Load environment variables from .env file
-load_dotenv()
+# Explicitly load from the project root's .env file
+load_dotenv(find_dotenv())
 
 # --- Configuration ---
 # The BASE_URL of your deployed Flask application

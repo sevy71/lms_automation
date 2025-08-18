@@ -1,5 +1,5 @@
 # lms_automation/models.py
-from database import db
+from .database import db
 from datetime import datetime
 
 class Player(db.Model):
@@ -77,3 +77,16 @@ class SendQueue(db.Model):
 
     def __repr__(self):
         return f'<SendQueue {self.id} to {self.number} - {self.status}>'
+
+class WhatsAppSend(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    player_id = db.Column(db.Integer, db.ForeignKey('player.id'), nullable=False)
+    ok = db.Column(db.Boolean, nullable=False)
+    error_text = db.Column(db.Text, nullable=True)
+    payload = db.Column(db.Text, nullable=True)
+    timestamp = db.Column(db.DateTime, default=datetime.utcnow)
+
+    player = db.relationship('Player', backref='whatsapp_sends', lazy=True)
+
+    def __repr__(self):
+        return f'<WhatsAppSend {self.id} (Player: {self.player_id}) - {self.ok}>'

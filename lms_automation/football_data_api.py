@@ -111,3 +111,29 @@ def get_premier_league_fixtures_by_season(season_year: int | None = None):
     except Exception as e:
         print(f"An error occurred: {e}")
         return []
+
+def get_fixture_by_id(fixture_id: int):
+    token = os.getenv('FOOTBALL_DATA_API_TOKEN')
+    if not token:
+        print("Error: FOOTBALL_DATA_API_TOKEN environment variable not set.")
+        return None
+
+    try:
+        url = f"https://api.football-data.org/v4/matches/{fixture_id}"
+        r = requests.get(url, headers={'X-Auth-Token': token})
+        r.raise_for_status()
+        return r.json().get('match')
+    except requests.exceptions.RequestException as e:
+        print(f"API request for fixture {fixture_id} failed: {e}")
+        return None
+    except Exception as e:
+        print(f"An error occurred fetching fixture {fixture_id}: {e}")
+        return None
+
+def get_fixtures_by_ids(fixture_ids: list):
+    results = {}
+    for fid in fixture_ids:
+        fixture_data = get_fixture_by_id(fid)
+        if fixture_data:
+            results[str(fid)] = fixture_data # Store by string ID for consistency
+    return results

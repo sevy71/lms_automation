@@ -1,0 +1,7 @@
+[build]
+builder = "NIXPACKS"
+
+[deploy]
+start = "gunicorn app:app --bind 0.0.0.0:$PORT"
+# uncomment if you want DB init after each deploy
+# postDeploy = "python -m init_db"
