@@ -129,10 +129,34 @@ def to_e164_digits(whatsapp_number: str) -> str:
         d = '44' + d[1:]  # Remove 0 and add 44 country code
     
     # Ensure it starts with + for WhatsApp Web
-    if not d.startswith('+'):
-        d = '+' + d
-        
-    return d
+    return '+' + d
+
+def is_valid_phone_number(phone_str: str) -> bool:
+    """
+    Validate if a phone number string is valid for WhatsApp.
+    Accepts numbers with or without + prefix.
+    """
+    if not phone_str:
+        return False
+    
+    # Extract digits only
+    digits = _digits_only(phone_str)
+    
+    # Must have digits
+    if not digits:
+        return False
+    
+    # Check length - international numbers are typically 7-15 digits
+    if len(digits) < 7 or len(digits) > 15:
+        return False
+    
+    # UK numbers should be 11 digits if starting with 0, or 12-13 if starting with 44
+    if digits.startswith('0') and len(digits) != 11:
+        return False
+    if digits.startswith('44') and not (12 <= len(digits) <= 13):
+        return False
+    
+    return True
 
 def queue_whatsapp_message(to_digits: str, body_text: str, player_id: int = None):
     """
@@ -869,11 +893,12 @@ def admin_send_whatsapp_links():
             failed += 1
             continue
         
-        to_digits = to_e164_digits(p.whatsapp_number)
-        if not to_digits or not to_digits.isdigit():
+        if not is_valid_phone_number(p.whatsapp_number):
             details.append(f"{p.name}: invalid number")
             failed += 1
             continue
+        
+        to_digits = to_e164_digits(p.whatsapp_number)
 
         token = make_pick_token(p.id, current_round.id)
         pick_link = url_for('pick_with_token', token=token, _external=True)
