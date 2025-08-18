@@ -226,7 +226,7 @@ def admin_fetch_fixtures():
 
 # Route to load fixtures for a specific season into the database
 @app.route('/admin/load_fixtures/<int:season_year>')
-def admin_load_fixtures(season_year):
+def admin_load_fixtures_season(season_year):
     fixtures_data = get_premier_league_fixtures_by_season(season_year)
     if not fixtures_data:
         return f"<p>No fixtures found for season {season_year} from API-Football.</p>"
@@ -353,47 +353,72 @@ def admin_create_round():
 # Admin Dashboard (formerly player_dashboard)
 @app.route('/admin_dashboard')
 def admin_dashboard():
-    players = Player.query.all()
-    current_round = Round.query.filter_by(status='open').first()
-    fixtures = []
-    if current_round:
-        fixtures = Fixture.query.filter_by(round_id=current_round.id).order_by(Fixture.date).all()
+    try:
+        players = Player.query.all()
+        current_round = Round.query.filter_by(status='open').first()
+        fixtures = []
+        if current_round:
+            fixtures = Fixture.query.filter_by(round_id=current_round.id).order_by(Fixture.date).all()
 
-    # Generate unique, tokenised pick links for each active player for the current round
-    player_pick_links = {}
-    cleaned_whatsapp_numbers = {}
-    if current_round:
-        for player in players:
-            if player.status == 'active':
-                token = make_pick_token(player.id, current_round.id)
-                player_pick_links[player.id] = url_for('pick_with_token', token=token, _external=True)
-                if player.whatsapp_number:
-                    # Clean the number by removing all non-digit characters
-                    cleaned_number = ''.join(filter(str.isdigit, player.whatsapp_number))
-                    cleaned_whatsapp_numbers[player.id] = cleaned_number
-    has_wa_config = True  # Always true for queue-based system
+        # Generate unique, tokenised pick links for each active player for the current round
+        player_pick_links = {}
+        cleaned_whatsapp_numbers = {}
+        if current_round:
+            for player in players:
+                if player.status == 'active':
+                    token = make_pick_token(player.id, current_round.id)
+                    player_pick_links[player.id] = url_for('pick_with_token', token=token, _external=True)
+                    if player.whatsapp_number:
+                        # Clean the number by removing all non-digit characters
+                        cleaned_number = ''.join(filter(str.isdigit, player.whatsapp_number))
+                        cleaned_whatsapp_numbers[player.id] = cleaned_number
+        has_wa_config = True  # Always true for queue-based system
 
-    # Get queue statistics
-    queue_stats = {
-        'pending': SendQueue.query.filter_by(status='pending').count(),
-        'in_progress': SendQueue.query.filter_by(status='in_progress').count(),
-        'sent': SendQueue.query.filter_by(status='sent').count(),
-        'failed': SendQueue.query.filter_by(status='failed').count(),
-    }
-    
-    # Get recent queue items for monitoring
-    recent_queue_items = SendQueue.query.order_by(SendQueue.updated_at.desc()).limit(10).all()
+        # Get queue statistics - with error handling
+        try:
+            queue_stats = {
+                'pending': SendQueue.query.filter_by(status='pending').count(),
+                'in_progress': SendQueue.query.filter_by(status='in_progress').count(),
+                'sent': SendQueue.query.filter_by(status='sent').count(),
+                'failed': SendQueue.query.filter_by(status='failed').count(),
+            }
+            # Get recent queue items for monitoring
+            recent_queue_items = SendQueue.query.order_by(SendQueue.updated_at.desc()).limit(10).all()
+        except Exception as e:
+            app.logger.warning(f"Could not load queue stats: {e}")
+            queue_stats = {'pending': 0, 'in_progress': 0, 'sent': 0, 'failed': 0}
+            recent_queue_items = []
 
-    return render_template('admin_dashboard.html', 
-                         players=players, 
-                         current_round=current_round, 
-                         fixtures=fixtures, 
-                         player_pick_links=player_pick_links, 
-                         cleaned_whatsapp_numbers=cleaned_whatsapp_numbers, 
-                         has_wa_config=has_wa_config,
-                         queue_stats=queue_stats,
-                         recent_queue_items=recent_queue_items,
-                         season_year=2025)
+        return render_template('admin_dashboard.html', 
+                             players=players, 
+                             current_round=current_round, 
+                             fixtures=fixtures, 
+                             player_pick_links=player_pick_links, 
+                             cleaned_whatsapp_numbers=cleaned_whatsapp_numbers, 
+                             has_wa_config=has_wa_config,
+                             queue_stats=queue_stats,
+                             recent_queue_items=recent_queue_items,
+                             season_year=2025)
+    except Exception as e:
+        app.logger.error(f"Error in admin_dashboard: {e}")
+        # If database isn't initialized, try to initialize it
+        try:
+            db.create_all()
+            flash('Database initialized. Please refresh the page.', 'info')
+        except Exception as init_error:
+            app.logger.error(f"Could not initialize database: {init_error}")
+            flash('Database error. Please contact administrator.', 'error')
+        
+        # Return a basic error page or redirect
+        return render_template_string('''
+        <!DOCTYPE html>
+        <html><head><title>Admin Dashboard Error</title></head>
+        <body>
+        <h1>Admin Dashboard Error</h1>
+        <p>There was an error loading the dashboard. The database may not be initialized.</p>
+        <a href="{{ url_for("admin_dashboard") }}">Try Again</a>
+        </body></html>
+        '''), 500
 
 
 # Tokenised pick submission route: /l/<token>
@@ -1015,6 +1040,40 @@ def api_queue_mark():
     return {'success': True}
 
 
+# ----------------- Database Initialization Route -----------------
+@app.route('/admin/init_db', methods=['GET', 'POST'])
+def admin_init_db():
+    """Initialize or reset the database"""
+    if request.method == 'POST':
+        try:
+            # Import and run init_db function
+            from init_db import init_db
+            init_db()
+            flash('Database initialized successfully!', 'success')
+        except Exception as e:
+            flash(f'Database initialization failed: {e}', 'error')
+        return redirect(url_for('admin_dashboard'))
+    
+    # Show confirmation form
+    return render_template_string('''
+    {% extends "base.html" %}
+    {% block title %}Initialize Database{% endblock %}
+    {% block content %}
+    <div class="container">
+        <h2>Initialize Database</h2>
+        <div class="alert alert-warning">
+            <strong>Warning:</strong> This will create/update database tables. 
+            Any existing data may be preserved during migration.
+        </div>
+        
+        <form method="post">
+            <button type="submit" class="btn btn-primary">Initialize Database</button>
+            <a href="{{ url_for('admin_dashboard') }}" class="btn btn-secondary">Cancel</a>
+        </form>
+    </div>
+    {% endblock %}
+    ''')
+
 # ----------------- Missing Admin Routes -----------------
 
 @app.route('/admin/new_game', methods=['POST'])
@@ -1036,9 +1095,66 @@ def admin_new_game():
     return redirect(url_for('admin_dashboard'))
 
 @app.route('/admin/load_fixtures')
-def admin_load_fixtures_default():
+def admin_load_fixtures():
     """Load fixtures for current season (2025)"""
-    return admin_load_fixtures(2025)
+    current_year = 2025
+    fixtures_data = get_premier_league_fixtures_by_season(current_year)
+    if not fixtures_data:
+        flash(f"No fixtures found for season {current_year} from API.", 'warning')
+        return redirect(url_for('admin_dashboard'))
+
+    fixtures_added_count = 0
+    for fixture_api in fixtures_data:
+        event_id = str(fixture_api['fixture']['id'])
+        home_team = fixture_api['teams']['home']['name']
+        away_team = fixture_api['teams']['away']['name']
+        fixture_date_str = fixture_api['fixture']['date']
+        fixture_date = datetime.fromisoformat(fixture_date_str.replace('Z', '+00:00'))
+        
+        # Extract round number
+        round_name = fixture_api['league']['round']
+        try:
+            round_number = int(round_name.split(' - ')[1])
+        except (IndexError, ValueError):
+            round_number = 0
+
+        # Check if round exists, create if not
+        round_obj = Round.query.filter_by(round_number=round_number).first()
+        if not round_obj:
+            round_obj = Round(
+                round_number=round_number,
+                start_date=fixture_date.date(),
+                end_date=fixture_date.date(),
+                status='open'
+            )
+            db.session.add(round_obj)
+            db.session.commit()
+
+        # Check if fixture already exists
+        existing_fixture = Fixture.query.filter_by(event_id=event_id).first()
+        if not existing_fixture:
+            new_fixture = Fixture(
+                round_id=round_obj.id,
+                event_id=event_id,
+                home_team=home_team,
+                away_team=away_team,
+                date=fixture_date,
+                time=fixture_date.strftime('%H:%M'),
+                home_score=fixture_api['goals']['home'],
+                away_score=fixture_api['goals']['away'],
+                status=fixture_api['fixture']['status']['short']
+            )
+            db.session.add(new_fixture)
+            fixtures_added_count += 1
+        else:
+            # Update existing fixture
+            existing_fixture.home_score = fixture_api['goals']['home']
+            existing_fixture.away_score = fixture_api['goals']['away']
+            existing_fixture.status = fixture_api['fixture']['status']['short']
+
+    db.session.commit()
+    flash(f"Loaded {fixtures_added_count} new fixtures for season {current_year}. Existing fixtures updated.", 'success')
+    return redirect(url_for('admin_dashboard'))
 
 @app.route('/admin/next_round')
 def admin_next_round():
