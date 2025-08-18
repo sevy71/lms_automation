@@ -1,2 +1,2 @@
-web: gunicorn app:app --bind 0.0.0.0:$PORT
+web: sh -c "python -m init_db && gunicorn app:app --bind 0.0.0.0:$PORT"
 # worker: python3 lms_automation/sender_worker.py   (only if you need it on Railway)
