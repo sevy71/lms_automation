@@ -876,64 +876,15 @@ def admin_send_whatsapp_links():
     if preview:
         flash(f"Examples: {preview}", 'info')
     
-    # Start the sender worker (for hybrid system)
+    # Start the sender worker
     if queued > 0:
         try:
-            import sys
-            import os
-            
-            # Check if we're running on Railway (cloud environment)
-            is_railway = os.environ.get('RAILWAY_ENVIRONMENT') is not None
-            base_url = os.environ.get('BASE_URL', '')
-            is_cloud_deployment = 'railway.app' in base_url or 'render.com' in base_url or 'heroku' in base_url
-            
-            if is_railway or is_cloud_deployment:
-                # On Railway/cloud: Messages queued for background service
-                flash(f'✅ {queued} WhatsApp messages queued successfully!', 'success')
-                flash('🚀 Messages will be sent automatically by your background service!', 'success')
-                flash('💡 If service isn\'t running: bash start_whatsapp_service.sh', 'info')
-                app.logger.info(f"Cloud deployment detected - {queued} messages queued for background service")
-            else:
-                # Local development: Try to start worker subprocess
-                current_dir = os.path.dirname(os.path.abspath(__file__))
-                sender_worker_path = os.path.join(current_dir, 'sender_worker.py')
-                
-                # Verify the sender_worker.py file exists
-                if not os.path.exists(sender_worker_path):
-                    raise FileNotFoundError(f"sender_worker.py not found at {sender_worker_path}")
-                
-                app.logger.info(f"Local development - starting sender worker: {sys.executable} {sender_worker_path}")
-                
-                # Set environment variables for the subprocess
-                env = os.environ.copy()
-                env['PYTHONPATH'] = current_dir
-                
-                process = subprocess.Popen(
-                    [sys.executable, sender_worker_path], 
-                    cwd=current_dir,
-                    env=env,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE
-                )
-                
-                # Give the process a moment to start
-                import time
-                time.sleep(1)
-                
-                # Check if process is still running
-                if process.poll() is None:
-                    flash('✅ WhatsApp sender worker started successfully!', 'success')
-                    app.logger.info("Worker process started successfully")
-                else:
-                    # Process died immediately, capture error
-                    stdout, stderr = process.communicate()
-                    error_msg = stderr.decode() if stderr else "Process exited immediately"
-                    raise Exception(f"Worker failed to start: {error_msg}")
-                    
+            # Using python -m to ensure it runs within the correct environment
+            subprocess.Popen(['python', '-m', 'lms_automation.sender_worker'])
+            flash('WhatsApp sender worker started.', 'info')
         except Exception as e:
             app.logger.error(f"Failed to start sender worker: {e}")
-            flash(f'⚠️ Worker start failed: {str(e)[:100]}...', 'warning')
-            flash('💡 Messages are queued - run worker manually: python sender_worker.py', 'info')
+            flash(f'Failed to start sender worker: {e}', 'error')
 
     return redirect(url_for('admin_dashboard'))
 
