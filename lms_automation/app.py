@@ -888,11 +888,11 @@ def admin_send_whatsapp_links():
             is_cloud_deployment = 'railway.app' in base_url or 'render.com' in base_url or 'heroku' in base_url
             
             if is_railway or is_cloud_deployment:
-                # On Railway/cloud: Worker runs on local machine, just inform user
+                # On Railway/cloud: Messages queued for background service
                 flash(f'✅ {queued} WhatsApp messages queued successfully!', 'success')
-                flash('📱 Run your local worker to send messages: python sender_worker.py', 'info')
-                flash('💡 The worker on your local machine will connect to this cloud database', 'info')
-                app.logger.info(f"Cloud deployment detected - {queued} messages queued for local worker")
+                flash('🚀 Messages will be sent automatically by your background service!', 'success')
+                flash('💡 If service isn\'t running: bash start_whatsapp_service.sh', 'info')
+                app.logger.info(f"Cloud deployment detected - {queued} messages queued for background service")
             else:
                 # Local development: Try to start worker subprocess
                 current_dir = os.path.dirname(os.path.abspath(__file__))
