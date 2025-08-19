@@ -1089,30 +1089,19 @@ def admin_load_fixtures(season_year):
         fixture_date_str = fixture_api['fixture']['date']
         fixture_date = datetime.fromisoformat(fixture_date_str.replace('Z', '+00:00'))
         
-        # Extract round number
+        # Extract Premier League matchday number
         round_name = fixture_api['league']['round']
         try:
-            round_number = int(round_name.split(' - ')[1])
+            pl_matchday = int(round_name.split(' - ')[1])
         except (IndexError, ValueError):
-            round_number = 0
-
-        # Check if round exists, create if not
-        round_obj = Round.query.filter_by(round_number=round_number).first()
-        if not round_obj:
-            round_obj = Round(
-                round_number=round_number,
-                start_date=fixture_date.date(),
-                end_date=fixture_date.date(),
-                status='open'
-            )
-            db.session.add(round_obj)
-            db.session.commit()
+            pl_matchday = 1
 
         # Check if fixture already exists
         existing_fixture = Fixture.query.filter_by(event_id=event_id).first()
         if not existing_fixture:
             new_fixture = Fixture(
-                round_id=round_obj.id,
+                round_id=None,  # Don't auto-assign to game rounds - let admin create rounds manually
+                round_number=pl_matchday,  # Store the Premier League matchday number
                 event_id=event_id,
                 home_team=home_team,
                 away_team=away_team,
@@ -1126,6 +1115,7 @@ def admin_load_fixtures(season_year):
             fixtures_added_count += 1
         else:
             # Update existing fixture
+            existing_fixture.round_number = pl_matchday  # Update the PL matchday
             existing_fixture.home_score = fixture_api['goals']['home']
             existing_fixture.away_score = fixture_api['goals']['away']
             existing_fixture.status = fixture_api['fixture']['status']['short']
@@ -1136,32 +1126,56 @@ def admin_load_fixtures(season_year):
 
 @app.route('/admin/next_round')
 def admin_next_round():
-    """Setup next round page"""
-    # Get the highest game round number
+    """Setup next round page - intelligently finds next unplayed Premier League matchday"""
+    from datetime import date
+    from sqlalchemy import text
+    
+    # Get the highest game round number (LMS rounds reset to 1 after wins, but continue progressing through PL season)
     last_round = Round.query.order_by(Round.round_number.desc()).first()
     next_game_round = (last_round.round_number + 1) if last_round else 1
     
-    # Get unassigned fixtures grouped by their league round
-    unassigned_fixtures = Fixture.query.filter(Fixture.round_id.is_(None)).order_by(Fixture.date.asc()).all()
+    # SMART LOGIC: Find the next unplayed Premier League matchday
+    # Get all fixtures and group them by their Premier League matchday (stored in round_number)
+    all_fixtures = Fixture.query.order_by(Fixture.date.asc()).all()
     
-    # Group fixtures by league round and find the next available league round
-    league_rounds = {}
-    for fixture in unassigned_fixtures:
-        # Try to extract league round from fixture data or use round_number field
-        league_round = getattr(fixture, 'round_number', None)
-        if not league_round:
-            # If no round_number, try to infer from date or set to 1
-            league_round = 1
-            
-        if league_round not in league_rounds:
-            league_rounds[league_round] = []
-        league_rounds[league_round].append(fixture)
+    # Group fixtures by Premier League matchday
+    matchday_fixtures = {}
+    for fixture in all_fixtures:
+        # Use the stored round_number which contains the Premier League matchday
+        pl_matchday = fixture.round_number if fixture.round_number else 1
+        
+        if pl_matchday not in matchday_fixtures:
+            matchday_fixtures[pl_matchday] = {
+                'all': [],
+                'assigned': [],
+                'unassigned': []
+            }
+        
+        matchday_fixtures[pl_matchday]['all'].append(fixture)
+        if fixture.round_id is None:
+            matchday_fixtures[pl_matchday]['unassigned'].append(fixture)
+        else:
+            matchday_fixtures[pl_matchday]['assigned'].append(fixture)
     
-    # Find the next available league round (smallest unassigned round)
-    next_league_round = min(league_rounds.keys()) if league_rounds else 1
-    next_round_fixtures = league_rounds.get(next_league_round, [])
+    # Find the earliest matchday that has unassigned fixtures
+    available_matchdays = sorted(matchday_fixtures.keys())
+    next_matchday = None
+    next_round_fixtures = []
     
-    # Calculate start and end dates from fixtures
+    for matchday in available_matchdays:
+        if matchday_fixtures[matchday]['unassigned']:
+            next_matchday = matchday
+            next_round_fixtures = matchday_fixtures[matchday]['unassigned']
+            break
+    
+    # If no unassigned fixtures found in weekly groups, fall back to any unassigned fixtures
+    if not next_round_fixtures:
+        unassigned_fixtures = Fixture.query.filter(Fixture.round_id.is_(None)).order_by(Fixture.date.asc()).all()
+        if unassigned_fixtures:
+            next_round_fixtures = unassigned_fixtures[:10]  # Take next 10 fixtures
+            next_matchday = 1
+    
+    # Calculate start and end dates from selected fixtures
     start_date = None
     end_date = None
     
@@ -1177,17 +1191,19 @@ def admin_next_round():
         if fixture_dates:
             start_date = min(fixture_dates)
             end_date = max(fixture_dates)
-    else:
-        # Default to today if no fixtures
-        from datetime import date
+    
+    if not start_date:
         start_date = date.today()
         end_date = date.today()
     
+    # Get all unassigned fixtures for fallback display
+    all_unassigned = Fixture.query.filter(Fixture.round_id.is_(None)).order_by(Fixture.date.asc()).all()
+    
     return render_template('next_round.html', 
                          game_round_number=next_game_round,
-                         league_round_number=next_league_round,
+                         league_round_number=next_matchday or 1,
                          fixtures=next_round_fixtures,
-                         all_unassigned=unassigned_fixtures,
+                         all_unassigned=all_unassigned,
                          start_date=start_date,
                          end_date=end_date)
 

@@ -1,25 +1,82 @@
 {% extends "base.html" %}
-{% block title %}Setup Next Round{% endblock %}
+{% block title %}Create New Round{% endblock %}
 {% block content %}
 <div class="container">
-    <h2 class="text-center mt-4">Setup Next Round</h2>
+    <h2 class="text-center mt-4">Create New Round</h2>
 
     {% if not fixtures %}
-    <div class="alert alert-warning">
-        <strong>No unassigned fixtures found!</strong> 
-        Please <a href="{{ url_for('admin_load_fixtures', season_year=2025) }}">load fixtures</a> first.
-    </div>
+        {% if all_unassigned %}
+            <div class="alert alert-warning">
+                <strong>Fixtures need Premier League matchday data!</strong> 
+                Found {{ all_unassigned|length }} available fixtures, but they don't have proper matchday information.
+                Please <a href="{{ url_for('admin_load_fixtures', season_year=2025) }}">reload fixtures</a> to get updated matchday data.
+                <br><small class="text-muted mt-2">This updates existing fixtures with Premier League matchday numbers for smart progression.</small>
+            </div>
+            
+            <div class="card mt-4">
+                <div class="card-header">
+                    <h4>Create Game Round from Available Fixtures</h4>
+                </div>
+                <div class="card-body">
+                    <form action="{{ url_for('admin_create_next_round') }}" method="post">
+                        <input type="hidden" name="game_round_number" value="{{ game_round_number }}">
+                        <input type="hidden" name="league_round_number" value="1">
+                        
+                        <div class="row">
+                            <div class="col-md-6">
+                                <div class="mb-3">
+                                    <label for="start_date" class="form-label">Round Start Date</label>
+                                    <input type="date" class="form-control" id="start_date" name="start_date" 
+                                           value="{{ start_date.strftime('%Y-%m-%d') if start_date else '' }}" required>
+                                </div>
+                            </div>
+                            <div class="col-md-6">
+                                <div class="mb-3">
+                                    <label for="end_date" class="form-label">Round End Date</label>
+                                    <input type="date" class="form-control" id="end_date" name="end_date" 
+                                           value="{{ end_date.strftime('%Y-%m-%d') if end_date else '' }}" required>
+                                </div>
+                            </div>
+                        </div>
+                        
+                        <div class="mb-3">
+                            <label class="form-label">Select Fixtures for this Round</label>
+                            {% for fixture in all_unassigned %}
+                            <div class="form-check">
+                                <input class="form-check-input" type="checkbox" name="selected_fixtures" 
+                                       value="{{ fixture.id }}" id="fixture_{{ fixture.id }}" checked>
+                                <label class="form-check-label" for="fixture_{{ fixture.id }}">
+                                    <strong>{{ fixture.home_team }} vs {{ fixture.away_team }}</strong>
+                                    <br><small class="text-muted">
+                                        {{ fixture.date.strftime('%a %d %b %Y at %H:%M') if fixture.date else 'No date' }}
+                                    </small>
+                                </label>
+                            </div>
+                            {% endfor %}
+                        </div>
+                        
+                        <button type="submit" class="btn btn-primary btn-lg">Create Game Round {{ game_round_number }}</button>
+                        <a href="{{ url_for('admin_dashboard') }}" class="btn btn-secondary">Cancel</a>
+                    </form>
+                </div>
+            </div>
+        {% else %}
+            <div class="alert alert-warning">
+                <strong>No available fixtures found!</strong> 
+                Please <a href="{{ url_for('admin_load_fixtures', season_year=2025) }}">load fixtures</a> first.
+            </div>
+        {% endif %}
     {% else %}
     
     <div class="card mt-4">
         <div class="card-header">
-            <h4>Create Game Round {{ game_round_number }} from League Round {{ league_round_number }}</h4>
+            <h4>Create Game Round {{ game_round_number }} from Premier League Matchday {{ league_round_number }}</h4>
         </div>
         <div class="card-body">
             <p class="text-muted">
-                <strong>Game Round:</strong> Your internal round counter ({{ game_round_number }})<br>
-                <strong>League Round:</strong> Premier League matchday ({{ league_round_number }})<br>
-                <strong>Dates:</strong> Auto-calculated from fixture times
+                <strong>Game Round:</strong> Your LMS round counter - resets to 1 after each winner ({{ game_round_number }})<br>
+                <strong>Premier League Matchday:</strong> Continues progressing through the season ({{ league_round_number }})<br>
+                <strong>Dates:</strong> Auto-calculated from fixture kick-off times
             </p>
             
             <form action="{{ url_for('admin_create_next_round') }}" method="post">
