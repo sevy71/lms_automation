@@ -113,13 +113,18 @@ class WhatsAppSender:
             if not send_button:
                 return False, "Could not find send button"
             
-            # Add a random delay before clicking
-            time.sleep(random.uniform(1.5, 3.5))
+            # Add a random delay before clicking to appear more human-like
+            delay_before = random.uniform(2.0, 4.5)
+            print(f"⏰ Waiting {delay_before:.1f}s before clicking send...")
+            time.sleep(delay_before)
+            
             send_button.click()
             print("✅ Send button clicked")
             
-            # Wait a bit for the message to be sent before the next action
-            time.sleep(random.uniform(2, 4))
+            # Wait for the message to be sent with random delay
+            delay_after = random.uniform(3, 6)
+            print(f"⏰ Waiting {delay_after:.1f}s for message delivery...")
+            time.sleep(delay_after)
             return True, "Message sent successfully."
 
         except TimeoutException:

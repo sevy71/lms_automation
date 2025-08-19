@@ -6,7 +6,7 @@ import requests
 from dotenv import load_dotenv, find_dotenv
 
 # It's crucial that this worker can import the existing WhatsAppSender
-from .whatsapp_sender import WhatsAppSender
+from whatsapp_sender import WhatsAppSender
 
 # Load environment variables from .env file
 # Explicitly load from the project root's .env file
@@ -123,9 +123,9 @@ def main_loop():
                     print(f"    -> Failed: {status_message}")
                     mark_job_status(job_id, "failed", error=status_message)
 
-                # Be human, wait a random amount of time between sends
-                sleep_time = random.randint(8, 15)
-                print(f"    (Sleeping for {sleep_time}s)")
+                # Be human, wait a random amount of time between sends to avoid detection
+                sleep_time = random.randint(15, 45)  # Longer delays to avoid WhatsApp detection
+                print(f"    💤 Waiting {sleep_time}s before next message (anti-detection)...")
                 time.sleep(sleep_time)
 
             except Exception as e:

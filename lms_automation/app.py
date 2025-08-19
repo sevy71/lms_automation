@@ -797,14 +797,18 @@ def download_fixtures():
     headers = ["Round Number", "Home Team", "Away Team", "Date", "Time", "Status", "Home Score", "Away Score"]
     cw.writerow(headers)
 
-    fixtures = Fixture.query.join(Round).order_by(Round.round_number, Fixture.date).all()
+    # Get all fixtures, including unassigned ones
+    fixtures = Fixture.query.outerjoin(Round).order_by(
+        Round.round_number.asc().nullsfirst(), 
+        Fixture.date.asc()
+    ).all()
 
     for fixture in fixtures:
         row = [
             fixture.round.round_number if fixture.round else "N/A",
             fixture.home_team,
             fixture.away_team,
-            fixture.date.strftime('%Y-%m-%d'),
+            fixture.date.strftime('%Y-%m-%d') if fixture.date else "N/A",
             fixture.time,
             fixture.status,
             fixture.home_score if fixture.home_score is not None else "",
@@ -1224,9 +1228,17 @@ def admin_next_round():
     end_date = None
     
     if next_round_fixtures:
-        fixture_dates = [f.date.date() if hasattr(f.date, 'date') else f.date for f in next_round_fixtures]
-        start_date = min(fixture_dates)
-        end_date = max(fixture_dates)
+        fixture_dates = []
+        for f in next_round_fixtures:
+            if f.date:
+                if hasattr(f.date, 'date'):
+                    fixture_dates.append(f.date.date())
+                else:
+                    fixture_dates.append(f.date)
+        
+        if fixture_dates:
+            start_date = min(fixture_dates)
+            end_date = max(fixture_dates)
     else:
         # Default to today if no fixtures
         from datetime import date
