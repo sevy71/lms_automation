@@ -788,7 +788,7 @@ def eliminate_player(player_id):
 
 @app.route('/admin/unassigned_fixtures')
 def admin_unassigned_fixtures():
-    fixtures = Fixture.query.order_by(Fixture.date.asc()).all()
+    fixtures = Fixture.query.filter(Fixture.round_id.is_(None)).order_by(Fixture.date.asc()).all()
     return render_template('unassigned_fixtures.html', fixtures=fixtures, show_round_id=True)
 
 
@@ -1131,7 +1131,7 @@ def admin_load_fixtures(season_year):
             existing_fixture.status = fixture_api['fixture']['status']['short']
 
     db.session.commit()
-    flash(f"Loaded {fixtures_added_count} new fixtures for season {current_year}. Existing fixtures updated.", 'success')
+    flash(f"Loaded {fixtures_added_count} new fixtures for season {season_year}. Existing fixtures updated.", 'success')
     return redirect(url_for('admin_dashboard'))
 
 @app.route('/admin/next_round')
