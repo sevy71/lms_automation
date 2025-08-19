@@ -879,8 +879,10 @@ def admin_send_whatsapp_links():
     # Start the sender worker
     if queued > 0:
         try:
-            # Using python -m to ensure it runs within the correct environment
-            subprocess.Popen(['python', '-m', 'lms_automation.sender_worker'])
+            # Get the absolute path to the sender_worker.py script
+            script_path = os.path.join(basedir, 'sender_worker.py')
+            # Using an absolute path to the script
+            subprocess.Popen(['python', script_path])
             flash('WhatsApp sender worker started.', 'info')
         except Exception as e:
             app.logger.error(f"Failed to start sender worker: {e}")

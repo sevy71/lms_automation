@@ -1,9 +1,15 @@
 # lms_automation/sender_worker.py
 import os
+import sys
 import time
 import random
 import requests
 from dotenv import load_dotenv, find_dotenv
+
+# Add the script's directory to the Python path to resolve local imports
+script_dir = os.path.dirname(os.path.abspath(__file__))
+if script_dir not in sys.path:
+    sys.path.insert(0, script_dir)
 
 # It's crucial that this worker can import the existing WhatsAppSender
 from whatsapp_sender import WhatsAppSender
