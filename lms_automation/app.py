@@ -39,6 +39,31 @@ app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('DATABASE_URL') or 'sqlit
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'please_change_me')
 
+# --- Team Colors ---
+TEAM_COLORS = {
+    'arsenal': {'bg': '#EF0107', 'text': '#FFFFFF'},
+    'aston villa': {'bg': '#670E36', 'text': '#95BFE5'},
+    'bournemouth': {'bg': '#DA291C', 'text': '#000000'},
+    'brentford': {'bg': '#E30613', 'text': '#FFFFFF'},
+    'brighton & hove albion': {'bg': '#0057B8', 'text': '#FFFFFF'},
+    'chelsea': {'bg': '#034694', 'text': '#FFFFFF'},
+    'crystal palace': {'bg': '#1B458F', 'text': '#A7A5A6'},
+    'everton': {'bg': '#003399', 'text': '#FFFFFF'},
+    'fulham': {'bg': '#FFFFFF', 'text': '#000000'},
+    'leicester city': {'bg': '#003090', 'text': '#FFFFFF'},
+    'leeds united': {'bg': '#FFCD00', 'text': '#1D428A'},
+    'liverpool': {'bg': '#C8102E', 'text': '#FFFFFF'},
+    'manchester city': {'bg': '#6CABDD', 'text': '#FFFFFF'},
+    'manchester united': {'bg': '#DA291C', 'text': '#FFE500'},
+    'newcastle united': {'bg': '#241F20', 'text': '#FFFFFF'},
+    'nottingham forest': {'bg': '#E53233', 'text': '#FFFFFF'},
+    'southampton': {'bg': '#D71920', 'text': '#FFFFFF'},
+    'tottenham hotspur': {'bg': '#132257', 'text': '#FFFFFF'},
+    'west ham united': {'bg': '#7A263A', 'text': '#274763'},
+    'wolverhampton wanderers': {'bg': '#FDB913', 'text': '#231F20'},
+    'default': {'bg': '#F0F0F0', 'text': '#333333'}
+}
+
 # Connect database to the app
 db.init_app(app)
 migrate = Migrate(app, db)
@@ -438,7 +463,9 @@ def pick_with_token(token):
                            player=player,
                            current_round=this_round,
                            fixtures=fixtures,
-                           previously_picked_teams=previously_picked_teams)
+                           previously_picked_teams=previously_picked_teams,
+                           team_colors=TEAM_COLORS,
+                           normalize_team=normalize_team)
 
 # Player-specific Pick Submission
 @app.route('/submit_pick/<int:player_id>', methods=['GET', 'POST'])
