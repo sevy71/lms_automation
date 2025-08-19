@@ -867,9 +867,32 @@ def admin_send_whatsapp_links():
     # Start the sender worker
     if queued > 0:
         try:
-            # Using python -m to ensure it runs within the correct environment
-            subprocess.Popen(['python', '-m', 'lms_automation.sender_worker'])
-            flash('WhatsApp sender worker started.', 'info')
+            import sys
+            import os
+            
+            # Get the current directory where app.py is located
+            current_dir = os.path.dirname(os.path.abspath(__file__))
+            sender_worker_path = os.path.join(current_dir, 'sender_worker.py')
+            
+            # Verify the sender_worker.py file exists
+            if not os.path.exists(sender_worker_path):
+                raise FileNotFoundError(f"sender_worker.py not found at {sender_worker_path}")
+            
+            app.logger.info(f"Starting sender worker: {sys.executable} {sender_worker_path}")
+            
+            # Use sys.executable to get the correct Python path and run sender_worker.py directly
+            # Set environment variables for the subprocess
+            env = os.environ.copy()
+            env['PYTHONPATH'] = current_dir
+            
+            subprocess.Popen(
+                [sys.executable, sender_worker_path], 
+                cwd=current_dir,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+            flash('WhatsApp sender worker started successfully.', 'info')
         except Exception as e:
             app.logger.error(f"Failed to start sender worker: {e}")
             flash(f'Failed to start sender worker: {e}', 'error')

@@ -41,12 +41,23 @@ def get_jobs(limit=10):
     headers = {"Authorization": f"Bearer {WORKER_API_TOKEN}"}
     api_url = f"{BASE_URL}/api/queue/next?limit={limit}"
     
+    print(f"🔗 Connecting to: {api_url}")
+    
     try:
         response = requests.get(api_url, headers=headers, timeout=15)
+        print(f"📡 Response status: {response.status_code}")
         response.raise_for_status()  # Raises an HTTPError for bad responses (4xx or 5xx)
-        return response.json()
+        jobs = response.json()
+        print(f"📥 Found {len(jobs)} pending job(s)")
+        return jobs
+    except requests.exceptions.ConnectionError as e:
+        print(f"❌ Connection Error: Cannot connect to {BASE_URL}")
+        print(f"   Make sure your Flask server is running on the correct URL")
+        print(f"   For localhost: python app.py")
+        print(f"   Error details: {e}")
+        return None
     except requests.exceptions.RequestException as e:
-        print(f"API Error (get_jobs): {e}")
+        print(f"❌ API Error (get_jobs): {e}")
         return None
 
 def mark_job_status(job_id, status, error=None):
@@ -57,13 +68,19 @@ def mark_job_status(job_id, status, error=None):
     payload = {"id": job_id, "status": status}
     if error:
         payload["error"] = str(error)
+    
+    print(f"📤 Reporting job {job_id} as {status}")
         
     try:
         response = requests.post(api_url, headers=headers, json=payload, timeout=15)
+        print(f"📡 Mark status response: {response.status_code}")
         response.raise_for_status()
         return True
+    except requests.exceptions.ConnectionError as e:
+        print(f"❌ Connection Error: Cannot connect to {BASE_URL} for status update")
+        return False
     except requests.exceptions.RequestException as e:
-        print(f"API Error (mark_job_status for job {job_id}): {e}")
+        print(f"❌ API Error (mark_job_status for job {job_id}): {e}")
         return False
 
 def main_loop():
@@ -81,7 +98,15 @@ def main_loop():
         print("✅ --- WhatsApp Sender Initialized ---")
         print("💡 Chrome window should be open with WhatsApp Web loaded")
         print("📱 If you see a QR code, scan it with your phone to continue")
-        input("⏳ Press Enter once WhatsApp Web is ready...")
+        
+        # Check if running interactively (has stdin) or as subprocess
+        import sys
+        if sys.stdin.isatty():
+            input("⏳ Press Enter once WhatsApp Web is ready...")
+        else:
+            print("🤖 Running in automated mode - waiting 10 seconds for WhatsApp Web to load...")
+            time.sleep(10)
+            
     except Exception as e:
         print(f"❌ Failed to initialize WhatsApp sender: {e}")
         print("💡 Make sure Chrome is installed and the profile path is correct")

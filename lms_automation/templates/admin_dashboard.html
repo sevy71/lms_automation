@@ -65,7 +65,7 @@
         <a class="btn btn-sm btn-outline-info" href="{{ url_for('standings') }}">View Standings</a>
         <a class="btn btn-sm btn-outline-dark" href="{{ url_for('download_fixtures') }}">Download All Fixtures (CSV)</a>
         <form action="{{ url_for('admin_reset_game') }}" method="post" style="display:inline"
-              onsubmit="return confirm('Reset the entire game? This will delete rounds, fixtures and picks.');">
+              onsubmit="return confirm('⚠️ RESET GAME WARNING ⚠️\\n\\nThis will DELETE ALL:\\n• Game rounds\\n• Fixtures\\n• Player picks\\n• WhatsApp queue\\n\\nPlayers will be kept but reset to active status.\\n\\nAre you sure you want to continue?');">
           <button class="btn btn-sm btn-danger" type="submit">Reset Game</button>
         </form>
       </div>
