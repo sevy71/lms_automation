@@ -22,6 +22,9 @@ RUN pip install gunicorn
 # Copy the rest of the application code into the container at /app
 COPY . .
 
+# Add the project root to the Python path
+ENV PYTHONPATH=/app
+
 # Make port 8080 available to the world outside this container
 # Railway will automatically use this port.
 EXPOSE 8080
