@@ -6,6 +6,29 @@
 <div class="container">
   <h1 class="my-4 text-center">Update Results – Round {{ round.round_number }}</h1>
 
+  <div class="card bg-light border-primary mb-4">
+    <div class="card-body">
+      <h5 class="card-title">Simplified Workflow</h5>
+      <p class="card-text">Click this button to automatically fetch the latest results from the API and immediately process all eliminations for this round.</p>
+      <form method="post" action="{{ url_for('admin_auto_update_and_process_round', round_id=round.id) }}" class="d-grid">
+        <button type="submit" class="btn btn-primary btn-lg">Auto-Update & Process Round</button>
+      </form>
+    </div>
+  </div>
+
+  <hr>
+
+  <h4 class="mt-4">Manual Control</h4>
+  <p>Or, use the manual controls below.</p>
+
+  <form method="post" action="{{ url_for('admin_auto_update_results', round_id=round.id) }}" class="mb-3">
+    <button type="submit" class="btn btn-secondary">1. Auto-update from API</button>
+  </form>
+
+  <div class="d-flex gap-2 mb-3">
+    <a href="{{ url_for('admin_process_round', round_id=round.id) }}" class="btn btn-warning">2. Process Eliminations</a>
+  </div>
+
   <form method="post">
     <div class="table-responsive mb-3">
       <table class="table table-striped table-bordered table-hover">
@@ -43,15 +66,10 @@
         </tbody>
       </table>
     </div>
-    <button type="submit" class="btn btn-primary mb-3">Save Results</button>
-  </form>
-
-  <form method="post" action="{{ url_for('admin_auto_update_results', round_id=round.id) }}" class="mb-3">
-    <button type="submit" class="btn btn-secondary">Auto-update from API</button>
+    <button type="submit" class="btn btn-secondary mb-3">Save Manual Changes</button>
   </form>
 
   <div class="d-flex gap-2">
-    <a href="{{ url_for('admin_process_round', round_id=round.id) }}" class="btn btn-warning">Process Eliminations</a>
     <a href="{{ url_for('admin_round_summary', round_id=round.id) }}" class="btn btn-info">Round Summary</a>
     <a href="{{ url_for('admin_dashboard') }}" class="btn btn-secondary">Back to Admin</a>
   </div>

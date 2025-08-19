@@ -876,25 +876,9 @@ def admin_send_whatsapp_links():
     if preview:
         flash(f"Examples: {preview}", 'info')
     
-    # Start the sender worker
+    # The local worker should be started manually to process the queue.
     if queued > 0:
-        try:
-            # Get the absolute path to the sender_worker.py script
-            script_path = os.path.join(basedir, 'sender_worker.py')
-            
-            # Create an environment for the subprocess, ensuring critical variables are set
-            worker_env = os.environ.copy()
-            if 'BASE_URL' not in worker_env:
-                worker_env['BASE_URL'] = request.url_root.rstrip('/')
-            if 'CHROME_USER_DATA_DIR' not in worker_env:
-                worker_env['CHROME_USER_DATA_DIR'] = '/tmp/whatsapp_session'
-
-            # Using an absolute path to the script and passing the environment
-            subprocess.Popen(['python', script_path], env=worker_env)
-            flash('WhatsApp sender worker started.', 'info')
-        except Exception as e:
-            app.logger.error(f"Failed to start sender worker: {e}")
-            flash(f'Failed to start sender worker: {e}', 'error')
+        flash('Messages have been queued. Please start your local worker to send them.', 'info')
 
     return redirect(url_for('admin_dashboard'))
 
@@ -1291,25 +1275,71 @@ def admin_send_whatsapp():
     app.logger.info("📱 WhatsApp route (alias) called")
     return admin_send_whatsapp_links()
 
-# Debug route for Railway deployment testing
-@app.route('/admin/test_deployment', methods=['GET', 'POST'])
-def admin_test_deployment():
-    """Test route to verify Railway deployment is working"""
-    import os
+# ----------------- Admin: Auto-update and process round (simplified) -----------------
+@app.route('/admin/auto_process_round/<int:round_id>', methods=['POST'])
+def admin_auto_update_and_process_round(round_id):
+    """Automated one-click round processing."""
+    app.logger.info(f"--- Starting auto-processing for round {round_id} ---")
     
-    info = {
-        'method': request.method,
-        'railway_env': os.environ.get('RAILWAY_ENVIRONMENT', 'Not detected'),
-        'base_url': os.environ.get('BASE_URL', 'Not set'),
-        'worker_token': 'Set' if os.environ.get('WORKER_API_TOKEN') else 'Not set',
-        'python_path': sys.executable if 'sys' in globals() else 'Unknown'
-    }
+    # 1. Auto-update results from API
+    rnd = Round.query.get_or_404(round_id)
+    fixtures = Fixture.query.filter_by(round_id=rnd.id).all()
+    event_ids = [f.event_id for f in fixtures if f.event_id and str(f.event_id).isdigit()]
     
-    if request.method == 'POST':
-        flash('✅ POST request working on Railway!', 'success')
-        app.logger.info("Test deployment POST route called successfully")
-        
-    return f"<h2>Railway Deployment Test</h2><pre>{info}</pre><form method='post'><button>Test POST</button></form><a href='/admin_dashboard'>Back to Dashboard</a>"
+    if event_ids:
+        results_by_id = get_fixtures_by_ids(event_ids)
+        updated_count = 0
+        for f in fixtures:
+            if str(f.event_id).isdigit():
+                data = results_by_id.get(str(f.event_id))
+                if data:
+                    goals = data.get('goals') or {}
+                    status_short = ((data.get('fixture') or {}).get('status') or {}).get('short')
+                    hs = goals.get('home')
+                    as_ = goals.get('away')
+                    if hs is not None: f.home_score = hs
+                    if as_ is not None: f.away_score = as_
+                    if status_short: f.status = status_short
+                    updated_count += 1
+        db.session.commit()
+        app.logger.info(f"Auto-updated {updated_count} fixtures from API.")
+
+    # 2. Process eliminations (same logic as admin_process_round)
+    fixtures_by_team = {normalize_team(f.home_team): f for f in rnd.fixtures}
+    fixtures_by_team.update({normalize_team(f.away_team): f for f in rnd.fixtures})
+
+    undecided = []
+    for f in rnd.fixtures:
+        if fixture_decision(f) is None and f.status not in ('PST', 'P', 'postponed', 'cancelled'):
+            undecided.append(f)
+    
+    if undecided:
+        flash(f'There are {len(undecided)} undecided fixtures after API update. Cannot process round.', 'warning')
+        return redirect(url_for('admin_update_results', round_id=round_id))
+
+    eliminated = 0
+    survived = 0
+    for pick in rnd.picks:
+        if pick.is_winner is not None: continue
+        fix = fixtures_by_team.get(normalize_team(pick.team_picked))
+        if not fix: continue
+        outcome = pick_outcome_for_fixture(pick, fix)
+        if outcome == 'WIN':
+            pick.is_winner = True
+            survived += 1
+        elif outcome == 'LOSE':
+            pick.is_winner = False
+            pick.is_eliminated = True
+            if pick.player.status != 'eliminated':
+                pick.player.status = 'eliminated'
+            eliminated += 1
+
+    rnd.status = 'completed'
+    db.session.commit()
+
+    flash(f'Auto-processed Round {rnd.round_number}: {survived} survived, {eliminated} eliminated.', 'success')
+    app.logger.info(f"--- Finished auto-processing for round {round_id} ---")
+    return redirect(url_for('admin_round_summary', round_id=round_id))
 
 
 
