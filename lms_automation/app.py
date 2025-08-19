@@ -249,68 +249,6 @@ def admin_fetch_fixtures():
         output = "<p>No upcoming Premier League fixtures found.</p>"
     return output
 
-# Route to load fixtures for a specific season into the database
-@app.route('/admin/load_fixtures/<int:season_year>')
-def admin_load_fixtures_season(season_year):
-    fixtures_data = get_premier_league_fixtures_by_season(season_year)
-    if not fixtures_data:
-        return f"<p>No fixtures found for season {season_year} from API-Football.</p>"
-
-    fixtures_added_count = 0
-    for fixture_api in fixtures_data:
-        event_id = str(fixture_api['fixture']['id']) # Ensure event_id is string
-        home_team = fixture_api['teams']['home']['name']
-        away_team = fixture_api['teams']['away']['name']
-        fixture_date_str = fixture_api['fixture']['date']
-        fixture_date = datetime.fromisoformat(fixture_date_str.replace('Z', '+00:00'))
-        fixture_time = fixture_date.strftime('%H:%M')
-        
-        # Extract round number (assuming 'round' field exists and is consistent)
-        # API-Football's 'round' field is like "Regular Season - 1", "Regular Season - 2"
-        round_name = fixture_api['league']['round']
-        try:
-            round_number = int(round_name.split(' - ')[1])
-        except (IndexError, ValueError):
-            round_number = 0 # Default or handle error if round name is not as expected
-
-        # Check if round exists, create if not
-        round_obj = Round.query.filter_by(round_number=round_number).first()
-        if not round_obj:
-            # For simplicity, setting start/end dates to fixture date for now.
-            # In a real scenario, you'd define round start/end more broadly.
-            round_obj = Round(
-                round_number=round_number,
-                start_date=fixture_date.date(), # Store date only for round
-                end_date=fixture_date.date(),   # Store date only for round
-                status='open'
-            )
-            db.session.add(round_obj)
-            db.session.commit() # Commit to get round_obj.id
-
-        # Check if fixture already exists to avoid duplicates
-        existing_fixture = Fixture.query.filter_by(event_id=event_id).first()
-        if not existing_fixture:
-            new_fixture = Fixture(
-                round_id=round_obj.id,
-                event_id=event_id,
-                home_team=home_team,
-                away_team=away_team,
-                date=fixture_date,
-                time=fixture_time,
-                home_score=fixture_api['goals']['home'],
-                away_score=fixture_api['goals']['away'],
-                status=fixture_api['fixture']['status']['short'] # e.g., 'FT', 'NS'
-            )
-            db.session.add(new_fixture)
-            fixtures_added_count += 1
-        else:
-            # Update existing fixture if status or scores have changed
-            existing_fixture.home_score = fixture_api['goals']['home']
-            existing_fixture.away_score = fixture_api['goals']['away']
-            existing_fixture.status = fixture_api['fixture']['status']['short']
-
-    db.session.commit()
-    return f"<p>Loaded {fixtures_added_count} new fixtures for season {season_year} into the database. Existing fixtures updated.</p>"
 
 # Player Registration Route
 @app.route('/register_player', methods=['GET', 'POST'])
