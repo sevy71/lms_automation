@@ -881,8 +881,16 @@ def admin_send_whatsapp_links():
         try:
             # Get the absolute path to the sender_worker.py script
             script_path = os.path.join(basedir, 'sender_worker.py')
-            # Using an absolute path to the script
-            subprocess.Popen(['python', script_path])
+            
+            # Create an environment for the subprocess, ensuring critical variables are set
+            worker_env = os.environ.copy()
+            if 'BASE_URL' not in worker_env:
+                worker_env['BASE_URL'] = request.url_root.rstrip('/')
+            if 'CHROME_USER_DATA_DIR' not in worker_env:
+                worker_env['CHROME_USER_DATA_DIR'] = '/tmp/whatsapp_session'
+
+            # Using an absolute path to the script and passing the environment
+            subprocess.Popen(['python', script_path], env=worker_env)
             flash('WhatsApp sender worker started.', 'info')
         except Exception as e:
             app.logger.error(f"Failed to start sender worker: {e}")
