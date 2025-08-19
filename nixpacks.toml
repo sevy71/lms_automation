@@ -1,0 +1,24 @@
+[phases.setup]
+aptPkgs = [
+    "libgconf-2-4",
+    "libnss3",
+    "libxss1",
+    "libx11-xcb1",
+    "libxcomposite1",
+    "libxcursor1",
+    "libxdamage1",
+    "libxi6",
+    "libxtst6",
+    "libcups2",
+    "libxrandr2",
+    "libasound2",
+    "libatk1.0-0",
+    "libgtk-3-0",
+    "libgbm-dev",
+    "wget",
+    "unzip"
+]
+cmds = [
+    "wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb",
+    "dpkg -i google-chrome-stable_current_amd64.deb || apt-get -fy install"
+]
