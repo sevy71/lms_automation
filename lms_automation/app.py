@@ -811,14 +811,26 @@ def admin_reset_game():
 # ----------------- Admin: Queue WhatsApp links for sending -----------------
 @app.route('/admin/send_whatsapp_links', methods=['POST'])
 def admin_send_whatsapp_links():
-    current_round = Round.query.filter_by(status='open').first()
-    if not current_round:
-        flash('No open round available.', 'error')
-        return redirect(url_for('admin_dashboard'))
+    try:
+        app.logger.info("📱 WhatsApp links route called - starting processing")
+        
+        current_round = Round.query.filter_by(status='open').first()
+        if not current_round:
+            app.logger.warning("No open round available for WhatsApp sending")
+            flash('No open round available.', 'error')
+            return redirect(url_for('admin_dashboard'))
 
-    players = Player.query.filter_by(status='active').all()
-    if not players:
-        flash('No active players to message.', 'warning')
+        players = Player.query.filter_by(status='active').all()
+        app.logger.info(f"Found {len(players)} active players")
+        
+        if not players:
+            app.logger.warning("No active players to message")
+            flash('No active players to message.', 'warning')
+            return redirect(url_for('admin_dashboard'))
+            
+    except Exception as e:
+        app.logger.error(f"Early error in WhatsApp route: {e}")
+        flash(f'Error processing WhatsApp request: {e}', 'error')
         return redirect(url_for('admin_dashboard'))
 
     queued = 0
@@ -864,38 +876,64 @@ def admin_send_whatsapp_links():
     if preview:
         flash(f"Examples: {preview}", 'info')
     
-    # Start the sender worker
+    # Start the sender worker (for hybrid system)
     if queued > 0:
         try:
             import sys
             import os
             
-            # Get the current directory where app.py is located
-            current_dir = os.path.dirname(os.path.abspath(__file__))
-            sender_worker_path = os.path.join(current_dir, 'sender_worker.py')
+            # Check if we're running on Railway (cloud environment)
+            is_railway = os.environ.get('RAILWAY_ENVIRONMENT') is not None
+            base_url = os.environ.get('BASE_URL', '')
+            is_cloud_deployment = 'railway.app' in base_url or 'render.com' in base_url or 'heroku' in base_url
             
-            # Verify the sender_worker.py file exists
-            if not os.path.exists(sender_worker_path):
-                raise FileNotFoundError(f"sender_worker.py not found at {sender_worker_path}")
-            
-            app.logger.info(f"Starting sender worker: {sys.executable} {sender_worker_path}")
-            
-            # Use sys.executable to get the correct Python path and run sender_worker.py directly
-            # Set environment variables for the subprocess
-            env = os.environ.copy()
-            env['PYTHONPATH'] = current_dir
-            
-            subprocess.Popen(
-                [sys.executable, sender_worker_path], 
-                cwd=current_dir,
-                env=env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE
-            )
-            flash('WhatsApp sender worker started successfully.', 'info')
+            if is_railway or is_cloud_deployment:
+                # On Railway/cloud: Worker runs on local machine, just inform user
+                flash(f'✅ {queued} WhatsApp messages queued successfully!', 'success')
+                flash('📱 Run your local worker to send messages: python sender_worker.py', 'info')
+                flash('💡 The worker on your local machine will connect to this cloud database', 'info')
+                app.logger.info(f"Cloud deployment detected - {queued} messages queued for local worker")
+            else:
+                # Local development: Try to start worker subprocess
+                current_dir = os.path.dirname(os.path.abspath(__file__))
+                sender_worker_path = os.path.join(current_dir, 'sender_worker.py')
+                
+                # Verify the sender_worker.py file exists
+                if not os.path.exists(sender_worker_path):
+                    raise FileNotFoundError(f"sender_worker.py not found at {sender_worker_path}")
+                
+                app.logger.info(f"Local development - starting sender worker: {sys.executable} {sender_worker_path}")
+                
+                # Set environment variables for the subprocess
+                env = os.environ.copy()
+                env['PYTHONPATH'] = current_dir
+                
+                process = subprocess.Popen(
+                    [sys.executable, sender_worker_path], 
+                    cwd=current_dir,
+                    env=env,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE
+                )
+                
+                # Give the process a moment to start
+                import time
+                time.sleep(1)
+                
+                # Check if process is still running
+                if process.poll() is None:
+                    flash('✅ WhatsApp sender worker started successfully!', 'success')
+                    app.logger.info("Worker process started successfully")
+                else:
+                    # Process died immediately, capture error
+                    stdout, stderr = process.communicate()
+                    error_msg = stderr.decode() if stderr else "Process exited immediately"
+                    raise Exception(f"Worker failed to start: {error_msg}")
+                    
         except Exception as e:
             app.logger.error(f"Failed to start sender worker: {e}")
-            flash(f'Failed to start sender worker: {e}', 'error')
+            flash(f'⚠️ Worker start failed: {str(e)[:100]}...', 'warning')
+            flash('💡 Messages are queued - run worker manually: python sender_worker.py', 'info')
 
     return redirect(url_for('admin_dashboard'))
 
@@ -1289,7 +1327,28 @@ def admin_create_next_round():
 @app.route('/admin/send_whatsapp', methods=['POST'])
 def admin_send_whatsapp():
     """Alias for admin_send_whatsapp_links to match template expectations"""
+    app.logger.info("📱 WhatsApp route (alias) called")
     return admin_send_whatsapp_links()
+
+# Debug route for Railway deployment testing
+@app.route('/admin/test_deployment', methods=['GET', 'POST'])
+def admin_test_deployment():
+    """Test route to verify Railway deployment is working"""
+    import os
+    
+    info = {
+        'method': request.method,
+        'railway_env': os.environ.get('RAILWAY_ENVIRONMENT', 'Not detected'),
+        'base_url': os.environ.get('BASE_URL', 'Not set'),
+        'worker_token': 'Set' if os.environ.get('WORKER_API_TOKEN') else 'Not set',
+        'python_path': sys.executable if 'sys' in globals() else 'Unknown'
+    }
+    
+    if request.method == 'POST':
+        flash('✅ POST request working on Railway!', 'success')
+        app.logger.info("Test deployment POST route called successfully")
+        
+    return f"<h2>Railway Deployment Test</h2><pre>{info}</pre><form method='post'><button>Test POST</button></form><a href='/admin_dashboard'>Back to Dashboard</a>"
 
 
 
