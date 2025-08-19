@@ -1,14 +1,14 @@
 {% extends "base.html" %}
 
-{% block title %}All Fixtures{% endblock %}
+{% block title %}Unassigned Fixtures{% endblock %}
 
 {% block content %}
 <div class="container">
-    <h1 class="my-4 text-center">All Fixtures</h1>
+    <h1 class="my-4 text-center">Unassigned Fixtures</h1>
 
     <div class="card mb-4">
         <div class="card-header bg-primary text-white">
-            <h2 class="h5 mb-0">All Fixtures in the Database</h2>
+            <h2 class="h5 mb-0">Unassigned Fixtures</h2>
         </div>
         <div class="card-body">
             {% if fixtures %}
@@ -26,7 +26,7 @@
                     {% endfor %}
                 </ul>
             {% else %}
-                <p class="card-text">No fixtures found in the database. Please load fixtures first.</p>
+                <p class="card-text">No unassigned fixtures found. All fixtures have been assigned to rounds.</p>
             {% endif %}
         </div>
     </div>

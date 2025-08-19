@@ -20,17 +20,17 @@
   <div class="section">
     <h3>Game Setup</h3>
     <div class="body">
-      <p class="muted">Use these buttons to set up the game, load fixtures, and create new rounds.</p>
+      <p class="muted"><strong>Quick Start:</strong> 1) Reset game 2) Load Premier League fixtures 3) Create your first round</p>
       <div class="btnbar">
         <form action="{{ url_for('admin_new_game') }}" method="post" style="display:inline">
-            <button class="btn btn-sm btn-danger" type="submit">Start New Game</button>
+            <button class="btn btn-sm btn-danger" type="submit">🔄 Reset Game</button>
         </form>
         <form action="#" method="get" style="display:inline-block;" onsubmit="this.action = '{{ url_for('admin_load_fixtures', season_year=1234) }}'.replace('1234', this.season.value); return true;">
     <input type="number" name="season" value="{{ season_year }}" style="width: 80px; padding: .2rem .5rem; border-radius: .2rem; border: 1px solid #ccc;" placeholder="YYYY">
-    <button class="btn btn-sm btn-primary" type="submit">Load PL Fixtures</button>
+    <button class="btn btn-sm btn-primary" type="submit">📅 Load Premier League Fixtures</button>
 </form>
-        <a class="btn btn-sm btn-secondary" href="{{ url_for('admin_unassigned_fixtures') }}">View Unassigned Fixtures</a>
-        <a class="btn btn-sm btn-success" href="{{ url_for('admin_next_round') }}">Setup Next Round</a>
+        <a class="btn btn-sm btn-secondary" href="{{ url_for('admin_unassigned_fixtures') }}">📋 Browse Available Fixtures</a>
+        <a class="btn btn-sm btn-success" href="{{ url_for('admin_next_round') }}">🎯 Create New Round</a>
       </div>
     </div>
   </div>
