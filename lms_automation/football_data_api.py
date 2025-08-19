@@ -119,7 +119,7 @@ def get_fixture_by_id(fixture_id: int):
         url = f"https://api.football-data.org/v4/matches/{fixture_id}"
         r = requests.get(url, headers={'X-Auth-Token': token})
         r.raise_for_status()
-        return r.json().get('match')
+        return r.json() # Corrected: return the entire JSON response
     except requests.exceptions.RequestException as e:
         print(f"API request for fixture {fixture_id} failed: {e}")
         return None
