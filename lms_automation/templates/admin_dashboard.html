@@ -50,7 +50,10 @@
         {% if current_round %}
           <a class="btn btn-lg btn-success" href="{{ url_for('admin_round_links', round_id=current_round.id) }}">Get Round {{ current_round.round_number }} Links</a>
           <form action="{{ url_for('admin_send_whatsapp') }}" method="post" style="display:inline">
-            <button class="btn btn-lg btn-info" type="submit">Send Links via WhatsApp</button>
+            <button class="btn btn-lg btn-info" type="submit">Queue Links for WhatsApp</button>
+          </form>
+          <form action="{{ url_for('admin_manual_send_whatsapp') }}" method="post" style="display:inline">
+            <button class="btn btn-lg btn-primary" type="submit">Manually Send All Queued Messages</button>
           </form>
           <hr>
           <h4 class="mt-4">Other Round Actions</h4>

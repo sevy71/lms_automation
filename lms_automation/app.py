@@ -13,6 +13,11 @@ import json
 import subprocess
 
 # Load environment variables
+if os.environ.get('FLASK_ENV') == 'production':
+    load_dotenv('.env.production')
+else:
+    load_dotenv('.env.local', override=True)
+# Fallback for standard .env file
 load_dotenv()
 
 # Import database and models
@@ -210,12 +215,6 @@ def _consecutive_whatsapp_failures(player_id: int, window: int = 10) -> int:
     return len(sends)
 
 def build_pick_message(player_name: str, round_number: int, pick_link: str) -> str:
-    # Ensure the link has proper protocol for clickability in WhatsApp
-    if pick_link and not pick_link.startswith(('http://', 'https://')):
-        if 'localhost' in pick_link or '127.0.0.1' in pick_link:
-            pick_link = f"http://{pick_link}"
-        else:
-            pick_link = f"https://{pick_link}"
     
     return f"Hello {player_name}! It's time to make your pick for LMS Round {round_number}.\nClick here to make your pick: {pick_link}\n(Deadline: 1 hour before first kick-off)"
 
@@ -348,6 +347,9 @@ def admin_create_round():
 # Admin Dashboard (formerly player_dashboard)
 @app.route('/admin_dashboard')
 def admin_dashboard():
+    # --- DEBUGGING PRINT STATEMENT ---
+    print(f"DEBUG: WORKER_API_TOKEN in app.py = {os.environ.get('WORKER_API_TOKEN')}")
+    # --- END DEBUGGING ---
     try:
         players = Player.query.all()
         current_round = Round.query.filter_by(status='open').first()
@@ -1094,6 +1096,31 @@ def api_queue_next():
     db.session.commit()
     return jobs
 
+@app.route('/api/queue/all_pending', methods=['GET'])
+def api_queue_all_pending():
+    """
+    API endpoint to get all pending messages for the manual sender.
+    """
+    if not validate_worker_token():
+        return {'error': 'Unauthorized'}, 401
+
+    # Get all pending messages, mark them as in_progress to avoid double processing
+    pending = SendQueue.query.filter_by(status='pending').all()
+    
+    jobs = []
+    for item in pending:
+        item.status = 'in_progress'
+        item.attempts += 1
+        jobs.append({
+            'id': item.id,
+            'number': item.number,
+            'message': item.message,
+            'player_id': item.player_id
+        })
+    
+    db.session.commit()
+    return jobs
+
 @app.route('/api/queue/mark', methods=['POST'])
 def api_queue_mark():
     """API endpoint to mark a job as completed or failed"""
@@ -1374,6 +1401,31 @@ def admin_send_whatsapp():
     """Alias for admin_send_whatsapp_links to match template expectations"""
     app.logger.info("📱 WhatsApp route (alias) called")
     return admin_send_whatsapp_links()
+
+
+@app.route('/admin/manual_send_whatsapp', methods=['POST'])
+def admin_manual_send_whatsapp():
+    """
+    Manually trigger the sending of all queued WhatsApp messages.
+    """
+    try:
+        # Get the absolute path to the project root directory
+        project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+        script_path = os.path.join(project_root, 'run_manual_sender.sh')
+
+        # Check if the script is executable
+        if not os.access(script_path, os.X_OK):
+            # If not, make it executable
+            os.chmod(script_path, 0o755)
+
+        # Run the script in the background
+        subprocess.Popen([script_path], cwd=project_root)
+        
+        flash('Manual WhatsApp sending process started in the background.', 'success')
+    except Exception as e:
+        flash(f'Failed to start manual sending process: {e}', 'error')
+    
+    return redirect(url_for('admin_dashboard'))
 
 
 

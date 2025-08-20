@@ -1,7 +1,8 @@
-
 import os
 import time
 import random
+import tempfile
+import shutil
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.service import Service
@@ -19,7 +20,6 @@ class WhatsAppSender:
         chrome_options = Options()
         
         # Add Chrome options for better compatibility
-        chrome_options.add_argument('--headless')
         chrome_options.add_argument('--no-sandbox')
         chrome_options.add_argument('--disable-dev-shm-usage')
         chrome_options.add_argument('--disable-blink-features=AutomationControlled')
@@ -30,9 +30,9 @@ class WhatsAppSender:
             chrome_options.add_argument(f"user-data-dir={user_data_dir}")
             print(f"Using Chrome profile: {user_data_dir}")
         else:
-            # If no user_data_dir is provided, Selenium will use a temporary profile.
-            # This will require QR code scanning on each run.
-            print("Warning: No user_data_dir provided. You will need to scan the QR code.")
+            self.temp_dir = tempfile.mkdtemp()
+            chrome_options.add_argument(f"user-data-dir={self.temp_dir}")
+            print(f"Using temporary Chrome profile: {self.temp_dir}")
 
         # Use webdriver-manager to handle chromedriver
         try:
@@ -42,7 +42,11 @@ class WhatsAppSender:
             raise ImportError("webdriver-manager is not installed. Please install it with 'pip install webdriver-manager'")
 
         print("🚀 Starting Chrome browser...")
-        self.driver = webdriver.Chrome(service=service, options=chrome_options)
+        try:
+            self.driver = webdriver.Chrome(service=service, options=chrome_options)
+        except Exception as e:
+            raise Exception(f"Failed to start Chrome: {e}")
+
         self.driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
         self.wait = WebDriverWait(self.driver, 60) # Increased wait time
         
@@ -90,9 +94,16 @@ class WhatsAppSender:
             print(f"🔗 Navigating to: {url[:50]}...")
             self.driver.get(url)
 
-            # Wait for the chat to load and send button to appear
+            # Wait for the chat to load and the input field to be ready
             print("⏳ Waiting for chat interface...")
-            
+            try:
+                self.wait.until(
+                    EC.presence_of_element_located((By.XPATH, '//div[@role="textbox"]'))
+                )
+                print("✅ Chat interface loaded.")
+            except TimeoutException:
+                return False, "Timed out waiting for chat interface to load."
+
             # More robust send button selectors
             send_button_selectors = [
                 '//button[@aria-label="Send"]',
@@ -143,5 +154,6 @@ class WhatsAppSender:
         Closes the browser.
         """
         self.driver.quit()
-
-
+        if hasattr(self, 'temp_dir'):
+            shutil.rmtree(self.temp_dir)
+            print(f"Removed temporary profile: {self.temp_dir}")
