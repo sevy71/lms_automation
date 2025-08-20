@@ -22,6 +22,9 @@ RUN pip install gunicorn
 # Copy the rest of the application code into the container at /app
 COPY . .
 
+# Make the script executable
+RUN chmod +x /app/run_manual_sender.sh
+
 # Add the project root to the Python path
 ENV PYTHONPATH=/app
 
