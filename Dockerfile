@@ -19,11 +19,12 @@ COPY lms_automation/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 RUN pip install gunicorn
 
+# Copy the script and make it executable
+COPY run_manual_sender.sh .
+RUN chmod +x ./run_manual_sender.sh
+
 # Copy the rest of the application code into the container at /app
 COPY . .
-
-# Make the script executable
-RUN chmod +x /app/run_manual_sender.sh
 
 # Add the project root to the Python path
 ENV PYTHONPATH=/app
