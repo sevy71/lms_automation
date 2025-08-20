@@ -1409,6 +1409,8 @@ def admin_manual_send_whatsapp():
     Manually trigger the sending of all queued WhatsApp messages.
     """
     try:
+        print(f"Current working directory: {os.getcwd()}")
+        print(f"Directory contents: {os.listdir('.')}")
         # Get the absolute path to the project root directory
         project_root = os.getcwd()
         script_path = os.path.join(project_root, 'run_manual_sender.sh')
