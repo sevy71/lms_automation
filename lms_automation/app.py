@@ -1410,7 +1410,7 @@ def admin_manual_send_whatsapp():
     """
     try:
         # Get the absolute path to the project root directory
-        project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+        project_root = os.getcwd()
         script_path = os.path.join(project_root, 'run_manual_sender.sh')
 
         # Check if the script is executable
