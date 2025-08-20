@@ -234,8 +234,8 @@ class WhatsAppWorker:
                     continue
                 
                 if not jobs:
-                    logger.info("No pending jobs, waiting 30 seconds...")
-                    time.sleep(30)
+                    logger.info("No pending jobs, waiting 5 seconds...")  # Reduced from 30 to 5 seconds
+                    time.sleep(5)
                     continue
                 
                 # Process jobs
