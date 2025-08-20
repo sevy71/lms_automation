@@ -210,7 +210,14 @@ def _consecutive_whatsapp_failures(player_id: int, window: int = 10) -> int:
     return len(sends)
 
 def build_pick_message(player_name: str, round_number: int, pick_link: str) -> str:
-    return f"Hello {player_name}! It’s time to make your pick for LMS Round {round_number}.\n{pick_link}\n(Deadline: 1 hour before first kick-off)"
+    # Ensure the link has proper protocol for clickability in WhatsApp
+    if pick_link and not pick_link.startswith(('http://', 'https://')):
+        if 'localhost' in pick_link or '127.0.0.1' in pick_link:
+            pick_link = f"http://{pick_link}"
+        else:
+            pick_link = f"https://{pick_link}"
+    
+    return f"Hello {player_name}! It's time to make your pick for LMS Round {round_number}.\nClick here to make your pick: {pick_link}\n(Deadline: 1 hour before first kick-off)"
 
 # ----------------- Helpers for results & pick outcomes -----------------
 
@@ -945,7 +952,9 @@ def admin_send_whatsapp_links():
         to_digits = to_e164_digits(p.whatsapp_number)
 
         token = make_pick_token(p.id, current_round.id)
-        pick_link = url_for('pick_with_token', token=token, _external=True)
+        # Generate pick link with proper base URL
+        base_url = os.environ.get('BASE_URL', request.url_root.rstrip('/'))
+        pick_link = f"{base_url}/l/{token}"
         body = build_pick_message(p.name, current_round.round_number, pick_link)
         
         # Queue the message
@@ -991,7 +1000,9 @@ def admin_send_whatsapp_link(player_id):
 
     to_digits = to_e164_digits(player.whatsapp_number)
     token = make_pick_token(player.id, current_round.id)
-    pick_link = url_for('pick_with_token', token=token, _external=True)
+    # Generate pick link with proper base URL
+    base_url = os.environ.get('BASE_URL', request.url_root.rstrip('/'))
+    pick_link = f"{base_url}/l/{token}"
     body = build_pick_message(player.name, current_round.round_number, pick_link)
     
     # Queue the message

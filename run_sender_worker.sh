@@ -18,5 +18,5 @@ set -a
 [ -f .env ] && source .env
 set +a
 
-echo "🚀 Starting worker with $PYTHON"
-exec "$PYTHON" lms_automation/sender_worker.py
+echo "🚀 Starting enhanced worker with $PYTHON"
+exec "$PYTHON" lms_automation/sender_worker_enhanced.py
