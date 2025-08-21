@@ -11,6 +11,7 @@ from dotenv import load_dotenv
 from sqlalchemy import text
 import json
 import subprocess
+import threading
 
 # Load environment variables
 if os.environ.get('FLASK_ENV') == 'production':
@@ -1403,15 +1404,58 @@ def admin_send_whatsapp():
     return admin_send_whatsapp_links()
 
 
+def _run_manual_sender():
+    """
+    Internal function to run the manual sender directly in Python.
+    This avoids shell script dependency issues.
+    """
+    import threading
+    
+    def sender_thread():
+        try:
+            # Import the main function from send_all_queued_messages
+            sys.path.insert(0, os.path.dirname(__file__))
+            from send_all_queued_messages import main as sender_main
+            
+            app.logger.info("Starting manual WhatsApp sender thread...")
+            sender_main()
+            app.logger.info("Manual WhatsApp sender completed.")
+            
+        except Exception as e:
+            app.logger.error(f"Manual sender thread failed: {e}")
+    
+    # Start the sender in a background thread
+    thread = threading.Thread(target=sender_thread, daemon=True)
+    thread.start()
+
 @app.route('/admin/manual_send_whatsapp', methods=['POST'])
 def admin_manual_send_whatsapp():
     """
     Manually trigger the sending of all queued WhatsApp messages.
     """
     try:
+        app.logger.info("Manual WhatsApp send requested")
+        
+        # Try direct Python execution first (more reliable)
+        try:
+            _run_manual_sender()
+            flash('Manual WhatsApp sending process started in the background (Python).', 'success')
+            return redirect(url_for('admin_dashboard'))
+        except Exception as python_error:
+            app.logger.warning(f"Python execution failed, trying shell script: {python_error}")
+        
+        # Fallback to shell script execution
         # Get the absolute path to the project root directory
-        project_root = os.getcwd()
+        # The app.py is in lms_automation/, so project root is parent directory
+        app_dir = os.path.dirname(os.path.abspath(__file__))
+        project_root = os.path.dirname(app_dir)  # Go up one level from lms_automation/
         script_path = os.path.join(project_root, 'run_manual_sender.sh')
+        
+        app.logger.info(f"Looking for script at: {script_path}")
+        
+        # Check if the script exists
+        if not os.path.exists(script_path):
+            raise FileNotFoundError(f"Script not found at {script_path}")
 
         # Check if the script is executable
         if not os.access(script_path, os.X_OK):
@@ -1421,8 +1465,11 @@ def admin_manual_send_whatsapp():
         # Run the script in the background
         subprocess.Popen([script_path], cwd=project_root)
         
-        flash('Manual WhatsApp sending process started in the background.', 'success')
+        flash('Manual WhatsApp sending process started in the background (shell).', 'success')
     except Exception as e:
+        app.logger.error(f"Manual send failed: {e}")
+        app.logger.error(f"Current working directory: {os.getcwd()}")
+        app.logger.error(f"App file location: {__file__}")
         flash(f'Failed to start manual sending process: {e}', 'error')
     
     return redirect(url_for('admin_dashboard'))
