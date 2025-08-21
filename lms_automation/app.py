@@ -12,6 +12,7 @@ from sqlalchemy import text
 import json
 import subprocess
 import threading
+import sys
 
 # Load environment variables
 if os.environ.get('FLASK_ENV') == 'production':
@@ -1409,10 +1410,15 @@ def _run_manual_sender():
     Internal function to run the manual sender directly in Python.
     This avoids shell script dependency issues.
     """
-    import threading
-    
     def sender_thread():
         try:
+            # Check if we're running in a cloud environment where GUI won't work
+            if os.environ.get('RAILWAY_ENVIRONMENT') or os.environ.get('HEROKU_APP_NAME') or os.environ.get('VERCEL'):
+                app.logger.error("Cannot run WhatsApp sender in cloud environment (Railway/Heroku/Vercel)")
+                app.logger.error("The WhatsApp sender requires Chrome browser and GUI access")
+                app.logger.error("Please run this locally or use a different messaging solution")
+                return
+            
             # Import the main function from send_all_queued_messages
             sys.path.insert(0, os.path.dirname(__file__))
             from send_all_queued_messages import main as sender_main
@@ -1423,6 +1429,9 @@ def _run_manual_sender():
             
         except Exception as e:
             app.logger.error(f"Manual sender thread failed: {e}")
+            # Also log some debugging info
+            app.logger.error(f"Environment: Railway={bool(os.environ.get('RAILWAY_ENVIRONMENT'))}")
+            app.logger.error(f"Display available: {bool(os.environ.get('DISPLAY'))}")
     
     # Start the sender in a background thread
     thread = threading.Thread(target=sender_thread, daemon=True)
@@ -1435,6 +1444,11 @@ def admin_manual_send_whatsapp():
     """
     try:
         app.logger.info("Manual WhatsApp send requested")
+        
+        # Check if we're in a cloud environment first
+        if os.environ.get('RAILWAY_ENVIRONMENT') or os.environ.get('HEROKU_APP_NAME') or os.environ.get('VERCEL'):
+            flash('⚠️ WhatsApp sender cannot run in cloud environments. Please run locally or set up a local worker.', 'error')
+            return redirect(url_for('admin_dashboard'))
         
         # Try direct Python execution first (more reliable)
         try:
@@ -1475,6 +1489,99 @@ def admin_manual_send_whatsapp():
     return redirect(url_for('admin_dashboard'))
 
 
+@app.route('/admin/queue_status')
+def admin_queue_status():
+    """Display detailed queue status for debugging"""
+    try:
+        # Get queue statistics
+        queue_stats = {
+            'pending': SendQueue.query.filter_by(status='pending').count(),
+            'in_progress': SendQueue.query.filter_by(status='in_progress').count(),
+            'sent': SendQueue.query.filter_by(status='sent').count(),
+            'failed': SendQueue.query.filter_by(status='failed').count(),
+        }
+        
+        # Get recent queue items
+        recent_items = SendQueue.query.order_by(SendQueue.updated_at.desc()).limit(20).all()
+        
+        # Environment info
+        env_info = {
+            'railway': bool(os.environ.get('RAILWAY_ENVIRONMENT')),
+            'base_url': os.environ.get('BASE_URL'),
+            'has_worker_token': bool(os.environ.get('WORKER_API_TOKEN')),
+            'chrome_dir': os.environ.get('CHROME_USER_DATA_DIR'),
+        }
+        
+        return render_template_string('''
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Queue Status</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; }
+        table { border-collapse: collapse; width: 100%; }
+        th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+        th { background-color: #f2f2f2; }
+        .pending { background-color: #fff3cd; }
+        .in_progress { background-color: #d1ecf1; }
+        .sent { background-color: #d4edda; }
+        .failed { background-color: #f8d7da; }
+        .stats { display: flex; gap: 20px; margin: 20px 0; }
+        .stat { padding: 10px; border-radius: 5px; text-align: center; }
+    </style>
+</head>
+<body>
+    <h1>WhatsApp Queue Status</h1>
+    
+    <h2>Queue Statistics</h2>
+    <div class="stats">
+        <div class="stat pending"><strong>{{ stats.pending }}</strong><br>Pending</div>
+        <div class="stat in_progress"><strong>{{ stats.in_progress }}</strong><br>In Progress</div>
+        <div class="stat sent"><strong>{{ stats.sent }}</strong><br>Sent</div>
+        <div class="stat failed"><strong>{{ stats.failed }}</strong><br>Failed</div>
+    </div>
+    
+    <h2>Environment Info</h2>
+    <table>
+        <tr><td>Railway Environment</td><td>{{ env.railway }}</td></tr>
+        <tr><td>Base URL</td><td>{{ env.base_url }}</td></tr>
+        <tr><td>Worker Token</td><td>{{ '✓' if env.has_worker_token else '✗' }}</td></tr>
+        <tr><td>Chrome Data Dir</td><td>{{ env.chrome_dir or 'Not set' }}</td></tr>
+    </table>
+    
+    <h2>Recent Queue Items</h2>
+    <table>
+        <tr>
+            <th>ID</th>
+            <th>Player</th>
+            <th>Number</th>
+            <th>Status</th>
+            <th>Attempts</th>
+            <th>Created</th>
+            <th>Updated</th>
+            <th>Message Preview</th>
+        </tr>
+        {% for item in items %}
+        <tr class="{{ item.status }}">
+            <td>{{ item.id }}</td>
+            <td>{{ item.player.name if item.player else 'Unknown' }}</td>
+            <td>{{ item.number }}</td>
+            <td>{{ item.status }}</td>
+            <td>{{ item.attempts }}</td>
+            <td>{{ item.created_at.strftime('%m/%d %H:%M') if item.created_at else '' }}</td>
+            <td>{{ item.updated_at.strftime('%m/%d %H:%M') if item.updated_at else '' }}</td>
+            <td>{{ (item.message[:50] + '...') if item.message and item.message|length > 50 else item.message }}</td>
+        </tr>
+        {% endfor %}
+    </table>
+    
+    <p><a href="{{ url_for('admin_dashboard') }}">← Back to Admin Dashboard</a></p>
+</body>
+</html>
+        ''', stats=queue_stats, items=recent_items, env=env_info)
+        
+    except Exception as e:
+        return f"Error loading queue status: {e}"
 
 
 
