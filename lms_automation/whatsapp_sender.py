@@ -27,6 +27,11 @@ class WhatsAppSender:
         chrome_options.add_experimental_option('useAutomationExtension', False)
         
         if user_data_dir:
+            # Ensure the user data directory exists
+            if not os.path.exists(user_data_dir):
+                print(f"⚠️ Chrome user data directory doesn't exist: {user_data_dir}")
+                print("📁 Creating Chrome user data directory...")
+                os.makedirs(user_data_dir, exist_ok=True)
             chrome_options.add_argument(f"user-data-dir={user_data_dir}")
             print(f"Using Chrome profile: {user_data_dir}")
         else:
@@ -45,6 +50,24 @@ class WhatsAppSender:
         try:
             self.driver = webdriver.Chrome(service=service, options=chrome_options)
         except Exception as e:
+            error_msg = str(e)
+            print(f"❌ Chrome startup failed: {error_msg}")
+            print("💡 Troubleshooting tips:")
+            print("   - Ensure Chrome is installed on your system")
+            print("   - Check if Chrome is running in another session")
+            print("   - Verify Chrome user data directory permissions")
+            
+            if "chrome not reachable" in error_msg.lower():
+                print("   - Chrome may have crashed or is unresponsive")
+                print("   - Try restarting your system or closing all Chrome windows")
+            elif "session not created" in error_msg.lower():
+                print("   - ChromeDriver version may be incompatible with Chrome browser")
+                print("   - Try updating ChromeDriver or Chrome browser")
+            elif "permission denied" in error_msg.lower():
+                print("   - Check file/directory permissions for Chrome and user data directory")
+                
+            if user_data_dir and not os.path.exists(user_data_dir):
+                print(f"   - Chrome user data directory doesn't exist: {user_data_dir}")
             raise Exception(f"Failed to start Chrome: {e}")
 
         self.driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")

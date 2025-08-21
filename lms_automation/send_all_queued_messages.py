@@ -67,12 +67,21 @@ def main():
     
     if not all([BASE_URL, WORKER_API_TOKEN]):
         print("FATAL: Missing one or more required environment variables.")
+        print(f"BASE_URL: {'✓' if BASE_URL else '✗'}")
+        print(f"WORKER_API_TOKEN: {'✓' if WORKER_API_TOKEN else '✗'}")
+        print(f"CHROME_USER_DATA_DIR: {'✓' if CHROME_USER_DATA_DIR else '✗'}")
         exit(1)
+    
+    print(f"Configuration loaded:")
+    print(f"  BASE_URL: {BASE_URL}")
+    print(f"  CHROME_USER_DATA_DIR: {CHROME_USER_DATA_DIR or 'Using temporary directory'}")
 
     sender = None
     try:
-        sender = WhatsAppSender(user_data_dir=None)
+        print("Initializing WhatsApp Sender...")
+        sender = WhatsAppSender(user_data_dir=CHROME_USER_DATA_DIR)
         print("--- WhatsApp Sender Initialized ---")
+        print("Waiting for WhatsApp Web to fully load...")
         time.sleep(10) # Give WhatsApp Web time to load
             
         jobs = get_all_queued_jobs()
