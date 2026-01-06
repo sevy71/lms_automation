@@ -1,3 +1,8 @@
+import os
+print("BOOT __file__ =", __file__)
+print("BOOT lines    =", sum(1 for _ in open(__file__, "r", encoding="utf-8")))
+print("BOOT commit   =", os.environ.get("RAILWAY_GIT_COMMIT_SHA") or os.environ.get("GIT_COMMIT"))
+
 from flask import Flask, render_template, request, jsonify, session, redirect, url_for, flash
 from flask_migrate import Migrate
 import os
@@ -61,6 +66,10 @@ from lms_automation.telegram_service import telegram_service
 
 # Initialize db with app
 db.init_app(app)
+
+with app.app_context():
+    _ensure_minimum_schema()
+
 migrate = Migrate(app, db)
 
 # --- Game policy configuration ---
@@ -214,7 +223,6 @@ def _ensure_minimum_schema():
         db.session.rollback()
         app.logger.warning(f'Schema ensure fallback encountered an error: {e}')
 
-_ensure_minimum_schema()
 
 # Admin authentication
 ADMIN_PASSWORD = os.environ.get('ADMIN_PASSWORD', 'admin123')  # Change this!
