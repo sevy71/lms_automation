@@ -38,11 +38,13 @@ class LMSClient:
         except ValueError as exc:
             raise LMSAPIError("Invalid JSON response from LMS") from exc
 
-    async def register_player(self, name: str, whatsapp_number: str | None = None) -> Dict[str, Any]:
+    async def register_player(self, name: str, whatsapp_number: str | None = None, telegram_id: str | None = None) -> Dict[str, Any]:
         """Call the existing /api/register endpoint."""
         payload = {"name": name}
         if whatsapp_number:
             payload["whatsapp_number"] = whatsapp_number
+        if telegram_id:
+            payload["telegram_id"] = telegram_id
 
         data = await self._request("POST", "/api/register", json=payload)
         if not data.get("success"):
@@ -62,17 +64,19 @@ class LMSClient:
         return await self._request("POST", f"/api/admin/mark-reminder-sent/{reminder_id}")
 
     async def get_pick_options(self, pick_token: str) -> Dict[str, Any]:
-        """Placeholder for retrieving pickable teams for a token."""
-        raise LMSAPIError(
-            "Pick options API is not exposed yet. Please use the web form via "
-            f"{self.base_url}/pick/{pick_token}"
-        )
+        """Get available teams for a pick token."""
+        data = await self._request("GET", f"/api/picks/options/{pick_token}")
+        if not data.get("success"):
+            raise LMSAPIError(data.get("error") or "Failed to get pick options")
+        return data
 
     async def submit_pick(self, pick_token: str, team_name: str) -> Dict[str, Any]:
-        """Placeholder for submitting a pick via API."""
-        raise LMSAPIError(
-            "Pick submission via Telegram is not enabled yet. Use the pick form link instead."
-        )
+        """Submit a pick via API."""
+        payload = {"token": pick_token, "team": team_name}
+        data = await self._request("POST", "/api/picks/submit", json=payload)
+        if not data.get("success"):
+            raise LMSAPIError(data.get("error") or "Failed to submit pick")
+        return data
 
 
 def _extract_error_message(response: httpx.Response) -> str:

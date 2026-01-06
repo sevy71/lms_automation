@@ -30,12 +30,12 @@ try:
     print("All imports successful!")
     
     print("Testing Flask app creation...")
-    worker_app = Flask(__name__)
-    worker_app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('DATABASE_URL', 'sqlite:///lms.db')
-    worker_app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-    print("✓ Flask app created")
-    
-    worker_db = SQLAlchemy(worker_app)
+    from lms_automation.app import app
+    from lms_automation.extensions import db
+    print("✓ Flask app loaded")
+
+    with app.app_context():
+        _ = db.engine
     print("✓ SQLAlchemy initialized")
     
     print("Testing ChromeDriverManager...")

@@ -5,10 +5,13 @@ Import historical Last Man Standing data for Rounds 1 and 2
 
 import sys
 import os
-sys.path.append(os.path.join(os.path.dirname(__file__), 'lms_automation'))
 
-from app import app
-from models import db, Player, Round, Pick
+project_root = os.path.dirname(__file__)
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
+from lms_automation.app import app
+from lms_automation.models import db, Player, Round, Pick
 
 # Historical data
 historical_data = [

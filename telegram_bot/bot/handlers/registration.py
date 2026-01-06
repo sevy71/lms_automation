@@ -64,7 +64,7 @@ async def _complete_registration(
     whatsapp_number: str | None,
 ) -> int:
     message = update.message
-    if not message:
+    if not message or not message.from_user:
         return ConversationHandler.END
 
     pending = context.user_data.get("registration") or {}
@@ -78,14 +78,21 @@ async def _complete_registration(
         await message.reply_text("Bot misconfigured: LMS client missing.")
         return ConversationHandler.END
 
+    # Get the Telegram user ID (chat ID)
+    telegram_id = str(message.from_user.id)
+
     try:
-        response = await lms_client.register_player(name=name, whatsapp_number=whatsapp_number)
+        response = await lms_client.register_player(
+            name=name,
+            whatsapp_number=whatsapp_number,
+            telegram_id=telegram_id
+        )
     except LMSAPIError as exc:
         await message.reply_text(f"Registration failed: {exc}")
         return ConversationHandler.END
 
     success_msg = response.get("message") or f"Welcome {name}! You're now registered."
-    await message.reply_text(success_msg)
+    await message.reply_text(success_msg + "\n\nYou'll receive pick reminders and game updates here on Telegram!")
     context.user_data.pop("registration", None)
     return ConversationHandler.END
 

@@ -71,8 +71,8 @@
             <div class="card">
                 <div class="card-header">
                     <h5 class="mb-0">
-                        <i class="fas fa-bell text-warning"></i> 
-                        Due Reminders (Ready to Send)
+                        <i class="fas fa-bell text-warning"></i>
+                        Due Reminders (Telegram Delivery)
                     </h5>
                 </div>
                 <div class="card-body">
@@ -109,18 +109,6 @@
 .reminder-sent {
     opacity: 0.6;
     border-left-color: #28a745;
-}
-
-.whatsapp-btn {
-    background-color: #25D366;
-    border-color: #25D366;
-    color: white;
-}
-
-.whatsapp-btn:hover {
-    background-color: #128C7E;
-    border-color: #128C7E;
-    color: white;
 }
 
 @media (max-width: 768px) {
@@ -201,19 +189,20 @@ function renderDueReminders(reminders) {
                             </small>
                             <br>
                             <small class="text-muted">
-                                <i class="fas fa-phone"></i> 
-                                ${reminder.whatsapp_number}
+                                <i class="fas fa-mobile-alt"></i>
+                                ${reminder.telegram_id ? `Telegram ID: ${reminder.telegram_id}` : 'Missing telegram_chat_id'}
+                            </small>
+                            <br>
+                            <small class="text-muted">
+                                <i class="fas fa-phone"></i>
+                                ${reminder.phone_number || 'No phone'}
                             </small>
                         </div>
                         
                         <div class="reminder-actions d-flex gap-2">
-                            <a href="${reminder.whatsapp_link}" 
-                               class="btn btn-sm whatsapp-btn flex-fill" 
-                               target="_blank"
-                               onclick="markReminderSent(${reminder.reminder_id})">
-                                <i class="fab fa-whatsapp me-1"></i> 
-                                Send WhatsApp
-                            </a>
+                            <span class="badge bg-primary flex-fill text-center py-2">
+                                Telegram-only automation
+                            </span>
                             <button class="btn btn-sm btn-outline-secondary" 
                                     onclick="showReminderMessage(${reminder.reminder_id})">
                                 <i class="fas fa-eye"></i> 

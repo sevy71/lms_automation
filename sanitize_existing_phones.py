@@ -3,10 +3,13 @@
 import os
 import sys
 
-# Add the lms_automation directory to the path
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'lms_automation'))
+project_root = os.path.dirname(__file__)
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
 
-from app import app, db, Player, sanitize_phone_number
+from lms_automation.app import app, sanitize_phone_number
+from lms_automation.extensions import db
+from lms_automation.models import Player
 
 def sanitize_all_phone_numbers():
     """Sanitize all existing phone numbers in the database."""

@@ -1,6 +1,7 @@
 from flask import Flask, render_template, request, jsonify, session, redirect, url_for, flash
 from flask_migrate import Migrate
 import os
+import sys
 from dotenv import load_dotenv
 from datetime import datetime, timedelta, timezone
 import urllib.parse
@@ -8,6 +9,11 @@ from functools import wraps
 from io import BytesIO
 
 load_dotenv()
+
+package_root = os.path.dirname(os.path.abspath(__file__))
+project_root = os.path.dirname(package_root)
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'dev-secret-key-change-in-production')
@@ -39,17 +45,18 @@ if database_uri:
     app.config['SQLALCHEMY_DATABASE_URI'] = database_uri.replace('postgres://', 'postgresql://')
     print("Using DATABASE_PUBLIC_URL" if os.environ.get('DATABASE_PUBLIC_URL') else "Using DATABASE_URL")
 else:
-    app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///lms.db'
-    print("Using local SQLite database.")
+    app.config['SQLALCHEMY_DATABASE_URI'] = (
+        'sqlite:////Users/antoniosirignanonew/Projects/LMS2_telegram_experiment/instance/lms.db'
+    )
+    print("Using local SQLite database (absolute path).")
 
 print(f"Database URI set to: {app.config['SQLALCHEMY_DATABASE_URI']}")
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
 # Import models and db
-import sys
-import os
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-from models import db, Player, Round, Fixture, Pick, PickToken, ReminderSchedule
+from lms_automation.extensions import db
+from lms_automation.models import Player, Round, Fixture, Pick, PickToken, ReminderSchedule
+from lms_automation.telegram_service import telegram_service
 
 
 # Initialize db with app
@@ -708,11 +715,15 @@ def send_picks():
         return "No active round found", 404
 
     active_players = Player.query.filter_by(status='active').all()
-    
+
+    sent_count = 0
+    skipped_missing = 0
+    failed_count = 0
+
     for player in active_players:
         # Generate or refresh token; it will auto-expire at the round deadline if set
         pick_token = PickToken.create_for_player_round(player.id, current_round.id)
-        db.session.commit() # Commit to get the token
+        db.session.commit()  # Commit to get the token
         # Get base URL - prioritize Railway deployment URL
         base_url = os.environ.get('BASE_URL')
         if not base_url:
@@ -726,63 +737,75 @@ def send_picks():
             base_url = f"https://{base_url}"
         
         pick_url = pick_token.get_pick_url(base_url)
-        
-        # Debug logging
-        print(f"Generated pick URL for {player.name}: {pick_url}")
-        
+
         # Generate general registration link
         registration_url = f"{base_url}/register"
-        
-        # Format message with better mobile WhatsApp compatibility
+
+        # Format Telegram message
         deadline_str = current_round.end_date.strftime('%a %d %b %Y, %H:%M') if current_round.end_date else None
         message_lines = [
-            f"🏆 Last Man Standing - Round {current_round.round_number}",
+            f"🏆 <b>Last Man Standing - Round {current_round.round_number}</b>",
             "",
             f"Hi {player.name}!",
             "",
             f"Time to make your pick for Round {current_round.round_number} (PL Matchday {current_round.pl_matchday}).",
             "",
-            "⚠️ Remember:",
+            "⚠️ <b>Remember:</b>",
             "• Pick a team you think will WIN",
-            "• You can only use each team ONCE", 
+            "• You can only use each team ONCE",
             "• If your team loses or draws, you're out!",
             (f"• Link valid until: {deadline_str}" if deadline_str else "• Link valid until the round deadline"),
             "",
             "Good luck! 🍀",
             "",
-            "Your pick link:",
+            "<b>Your pick link:</b>",
             pick_url,
             "",
             "👥 Want to invite friends/family?",
-            "Share this registration link:",
-            registration_url
+            f"{registration_url}"
         ]
-        
-        message = "\n".join(message_lines)
-        
-        # Don't encode the URL at all - WhatsApp mobile is very sensitive to URL encoding
-        # Just encode line breaks and special characters, preserve the URL completely
-        encoded_message = message.replace('\n', '%0A')
-        
-        # Only generate WhatsApp link if player has a WhatsApp number
-        if player.whatsapp_number:
-            # Sanitize and clean the number (remove spaces, dashes, then remove +)
-            sanitized_number = sanitize_phone_number(player.whatsapp_number)
-            clean_number = sanitized_number.replace('+', '')
-            # Prepare both mobile and desktop links; we will choose client-side
-            player.wa_link_mobile = f"https://api.whatsapp.com/send?phone={clean_number}&text={encoded_message}"
-            player.wa_link_desktop = f"https://web.whatsapp.com/send?phone={clean_number}&text={encoded_message}"
-            # Backwards-compatible default (will be overridden client-side)
-            player.whatsapp_link = player.wa_link_mobile
-            # Debug logging
-            print(f"WhatsApp links for {player.name}: mobile={player.wa_link_mobile[:80]}..., desktop={player.wa_link_desktop[:80]}...")
-        else:
-            player.whatsapp_link = None
-            print(f"No WhatsApp number for {player.name}, link generation skipped")
-        
-        print(f"Pick URL in message: {pick_url}")
 
-    return render_template('send_picks.html', players=active_players, round=current_round)
+        message = "\n".join(message_lines)
+
+        if getattr(player, 'telegram_id', None):
+            sent = telegram_service.send_message(player.telegram_id, message, parse_mode='HTML')
+            if sent:
+                sent_count += 1
+                player.telegram_status = "sent"
+            else:
+                failed_count += 1
+                player.telegram_status = "failed"
+                app.logger.warning(
+                    "Failed to send Telegram pick link to %s (id=%s, phone=%s)",
+                    player.name,
+                    player.id,
+                    player.whatsapp_number or "-"
+                )
+        else:
+            skipped_missing += 1
+            player.telegram_status = "missing telegram_chat_id"
+            app.logger.warning(
+                "Skipping pick link for %s (id=%s, phone=%s) missing telegram_chat_id",
+                player.name,
+                player.id,
+                player.whatsapp_number or "-"
+            )
+
+    app.logger.info(
+        "Pick link send summary: sent=%s skipped_missing_telegram=%s failed=%s",
+        sent_count,
+        skipped_missing,
+        failed_count
+    )
+
+    return render_template(
+        'send_picks.html',
+        players=active_players,
+        round=current_round,
+        sent_count=sent_count,
+        skipped_missing=skipped_missing,
+        failed_count=failed_count
+    )
 
 @app.route('/api/players', methods=['GET', 'POST'])
 @admin_required
@@ -2682,32 +2705,39 @@ def register_with_whatsapp(whatsapp_number):
 
 @app.route('/api/register', methods=['POST'])
 def api_register_player():
-    """Register a new player via the public registration form"""
+    """Register a new player via the public registration form or Telegram bot"""
     try:
         data = request.get_json()
-        
+
         if not data or not data.get('name'):
             return jsonify({'success': False, 'error': 'Player name is required'}), 400
-        
+
         name = data['name'].strip()
         whatsapp = data.get('whatsapp_number', '').strip() or None
-        
+        telegram_id = data.get('telegram_id', '').strip() or None
+
         # Check if player with same name already exists
         existing_player = Player.query.filter_by(name=name).first()
         if existing_player:
+            # If registering via Telegram, update the telegram_id
+            if telegram_id and not existing_player.telegram_id:
+                existing_player.telegram_id = telegram_id
+                db.session.commit()
+                return jsonify({'success': True, 'message': f'Welcome back {name}! Your Telegram account has been linked.'})
             return jsonify({'success': False, 'error': 'Player with this name already exists'}), 400
-        
+
         # Create new player
         player = Player(
             name=name,
-            whatsapp_number=sanitize_phone_number(whatsapp) if whatsapp else None
+            whatsapp_number=sanitize_phone_number(whatsapp) if whatsapp else None,
+            telegram_id=telegram_id
         )
-        
+
         db.session.add(player)
         db.session.commit()
-        
+
         return jsonify({'success': True, 'message': f'Welcome {name}! You have been registered successfully.'})
-        
+
     except Exception as e:
         db.session.rollback()
         return jsonify({'success': False, 'error': str(e)}), 500
@@ -2932,16 +2962,13 @@ def get_player_upcoming_fixtures(token):
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
-# Manual WhatsApp Reminder System
+# Manual Reminder Dashboard (Telegram delivery)
 class WhatsAppReminder:
-    """Class to handle WhatsApp reminder links for manual sending"""
+    """Build reminder preview data (Telegram-only delivery)."""
     
     @staticmethod
     def generate_reminder_data(player, round_obj, reminder_type, pick_token):
-        """Generate WhatsApp reminder data for manual sending"""
-        
-        if not player.whatsapp_number:
-            return None
+        """Generate reminder preview data for admin display"""
 
         # Determine anchor (kickoff) and cutoff (1 hour before kickoff) times
         anchor_time = getattr(round_obj, 'first_kickoff_at', None) or getattr(round_obj, 'end_date', None)
@@ -3001,26 +3028,18 @@ Haven't picked yet? Don't get eliminated!
 Good luck! 🍀
 Last Man Standing"""
         
-        # Generate WhatsApp link (prefer WhatsApp Web on desktop per request)
-        encoded_message = message.replace('\n', '%0A').replace(' ', '%20')
-        # Sanitize and clean the number (remove spaces, dashes, then remove +)
-        sanitized_number = sanitize_phone_number(player.whatsapp_number)
-        clean_number = sanitized_number.replace('+', '')
-        # Use WhatsApp Web as default so it opens in the browser
-        whatsapp_link = f"https://web.whatsapp.com/send?phone={clean_number}&text={encoded_message}"
-        
         return {
             'player_name': player.name,
             'player_id': player.id,
-            'whatsapp_number': player.whatsapp_number,
+            'telegram_id': player.telegram_id,
+            'phone_number': player.whatsapp_number,
             'message': message,
-            'whatsapp_link': whatsapp_link,
             'reminder_type': reminder_type,
             'round_number': round_obj.round_number
         }
     
 def get_due_reminders():
-    """Get reminders that are due and ready for manual sending"""
+    """Get reminders that are due for admin visibility (Telegram-only delivery)"""
     try:
         with app.app_context():
             # Lazy auto-schedule: ensure reminders exist for the active round
@@ -3105,7 +3124,7 @@ def get_due_reminders_api():
 @app.route('/api/admin/mark-reminder-sent/<int:reminder_id>', methods=['POST'])
 @admin_required
 def mark_reminder_sent(reminder_id):
-    """Mark a reminder as sent after manual WhatsApp sending"""
+    """Mark a reminder as sent after manual review"""
     try:
         reminder = ReminderSchedule.query.get(reminder_id)
         if not reminder:
@@ -3214,10 +3233,284 @@ def admin_statistics_page():
     except Exception as e:
         return render_template('admin_statistics.html', error=str(e), competition_stats={}, player_stats=[], pick_history=[]), 500
 
-if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port)
+# ========== TELEGRAM BOT API ENDPOINTS ==========
+
+@app.route('/api/picks/options/<token>', methods=['GET'])
+def get_pick_options_api(token):
+    """API endpoint for Telegram bot to get available teams for a pick token"""
+    try:
+        # Find the pick token
+        pick_token = PickToken.query.filter_by(token=token).first()
+
+        if not pick_token:
+            return jsonify({'success': False, 'error': 'Invalid or expired token'}), 404
+
+        # Check if token is expired
+        if pick_token.expires_at and pick_token.expires_at < datetime.now():
+            return jsonify({'success': False, 'error': 'Token has expired'}), 410
+
+        # Check if token has been used too many times
+        if pick_token.edit_count >= 2:
+            return jsonify({'success': False, 'error': 'Maximum edits reached for this token'}), 403
+
+        player = pick_token.player
+        round_obj = pick_token.round
+
+        # Get teams available this round
+        teams_in_round = _teams_in_round(round_obj.id)
+
+        # Get teams already used by player in this cycle
+        used_teams = _teams_used_this_cycle(player.id, round_obj.cycle_number or 1)
+
+        # Available teams = teams in round - teams already used
+        available_teams = teams_in_round - used_teams
+
+        # Get current pick if exists
+        current_pick = Pick.query.filter_by(
+            player_id=player.id,
+            round_id=round_obj.id
+        ).first()
+
+        return jsonify({
+            'success': True,
+            'player_name': player.name,
+            'round_number': round_obj.round_number,
+            'teams': sorted(list(available_teams)),
+            'current_pick': current_pick.team_picked if current_pick else None,
+            'edits_remaining': 2 - pick_token.edit_count,
+            'deadline': round_obj.end_date.isoformat() if round_obj.end_date else None
+        })
+
+    except Exception as e:
+        app.logger.error(f"Error in get_pick_options_api: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/picks/submit', methods=['POST'])
+def submit_pick_api():
+    """API endpoint for Telegram bot to submit a pick"""
+    try:
+        data = request.json
+        token = data.get('token')
+        team_picked = data.get('team')
+
+        if not token or not team_picked:
+            return jsonify({'success': False, 'error': 'Token and team are required'}), 400
+
+        # Find the pick token
+        pick_token = PickToken.query.filter_by(token=token).first()
+
+        if not pick_token:
+            return jsonify({'success': False, 'error': 'Invalid or expired token'}), 404
+
+        # Check if token is expired
+        if pick_token.expires_at and pick_token.expires_at < datetime.now():
+            return jsonify({'success': False, 'error': 'Token has expired'}), 410
+
+        # Check if token has been used too many times
+        if pick_token.edit_count >= 2:
+            return jsonify({'success': False, 'error': 'Maximum edits reached for this token'}), 403
+
+        player = pick_token.player
+        round_obj = pick_token.round
+
+        # Validate team is available
+        teams_in_round = _teams_in_round(round_obj.id)
+        if team_picked not in teams_in_round:
+            return jsonify({'success': False, 'error': f'{team_picked} is not playing in this round'}), 400
+
+        # Check if team already used by player in this cycle
+        used_teams = _teams_used_this_cycle(player.id, round_obj.cycle_number or 1)
+        if team_picked in used_teams:
+            return jsonify({'success': False, 'error': f'You have already used {team_picked} in this cycle'}), 400
+
+        # Find or create pick
+        pick = Pick.query.filter_by(
+            player_id=player.id,
+            round_id=round_obj.id
+        ).first()
+
+        if pick:
+            # Update existing pick
+            pick.team_picked = team_picked
+            pick.last_edited_at = datetime.now()
+            message = f'Pick updated to {team_picked} for Round {round_obj.round_number}'
+        else:
+            # Create new pick
+            pick = Pick(
+                player_id=player.id,
+                round_id=round_obj.id,
+                team_picked=team_picked,
+                timestamp=datetime.now()
+            )
+            db.session.add(pick)
+            message = f'Pick saved: {team_picked} for Round {round_obj.round_number}'
+
+        # Update token usage
+        pick_token.is_used = True
+        pick_token.edit_count += 1
+        if not pick_token.used_at:
+            pick_token.used_at = datetime.now()
+
+        db.session.commit()
+
+        return jsonify({
+            'success': True,
+            'message': message,
+            'team_picked': team_picked,
+            'edits_remaining': 2 - pick_token.edit_count
+        })
+
+    except Exception as e:
+        db.session.rollback()
+        app.logger.error(f"Error in submit_pick_api: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+# ========== AUTOMATION API ENDPOINTS ==========
+
+@app.route('/api/automation/process-round/<int:round_id>', methods=['POST'])
+@admin_required
+def process_round_automation(round_id):
+    """Process eliminations and check for rollover after a round completes"""
+    try:
+        round_obj = Round.query.get(round_id)
+        if not round_obj:
+            return jsonify({'success': False, 'error': 'Round not found'}), 404
+
+        # Process eliminations for all picks in this round
+        eliminated_count = 0
+        for pick in round_obj.picks:
+            if pick.is_winner == False and not pick.is_eliminated:
+                pick.is_eliminated = True
+                pick.player.status = 'eliminated'
+                eliminated_count += 1
+
+        db.session.commit()
+
+        # Check game state after eliminations
+        active_players = Player.query.filter_by(status='active').all()
+
+        result = {
+            'success': True,
+            'eliminated_count': eliminated_count,
+            'active_players': len(active_players),
+            'game_state': 'ongoing'
+        }
+
+        # Check for winner (exactly 1 active player)
+        if len(active_players) == 1:
+            winner = active_players[0]
+            winner.status = 'winner'
+            db.session.commit()
+            result['game_state'] = 'winner'
+            result['winner'] = winner.name
+            result['message'] = f'{winner.name} has won the game!'
+            result['needs_reset'] = True
+
+        # Check for rollover (0 active players - everyone eliminated)
+        elif len(active_players) == 0:
+            result['game_state'] = 'all_eliminated'
+            result['message'] = 'All players eliminated! Game needs reset for new cycle.'
+            result['needs_reset'] = True
+
+        # Check for end of cycle (Round 20 completed with 2+ active)
+        elif round_obj.round_number == 20 and len(active_players) >= 2:
+            result['game_state'] = 'cycle_complete'
+            result['message'] = f'Cycle {round_obj.cycle_number} complete with {len(active_players)} survivors. Starting new cycle.'
+            result['survivors'] = [p.name for p in active_players]
+            result['needs_new_cycle'] = True
+
+        return jsonify(result)
+
+    except Exception as e:
+        db.session.rollback()
+        app.logger.error(f"Error in process_round_automation: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/automation/start-new-cycle', methods=['POST'])
+@admin_required
+def start_new_cycle():
+    """Start a new cycle after Round 20 or when all players are eliminated"""
+    try:
+        data = request.json
+        reset_all_players = data.get('reset_all_players', False)  # True if everyone was eliminated
+
+        # Get current cycle number
+        last_round = Round.query.order_by(Round.id.desc()).first()
+        new_cycle_number = (last_round.cycle_number or 1) + 1 if last_round else 1
+
+        if reset_all_players:
+            # Everyone was eliminated - reset all players to active
+            Player.query.update({'status': 'active'}, synchronize_session=False)
+            message = f'Started Cycle {new_cycle_number} with all players reset to active'
+        else:
+            # Only keep active players active, rest stay eliminated
+            message = f'Started Cycle {new_cycle_number} with survivors from previous cycle'
+
+        db.session.commit()
+
+        return jsonify({
+            'success': True,
+            'message': message,
+            'new_cycle_number': new_cycle_number,
+            'active_players': Player.query.filter_by(status='active').count()
+        })
+
+    except Exception as e:
+        db.session.rollback()
+        app.logger.error(f"Error in start_new_cycle: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/automation/generate-tokens/<int:round_id>', methods=['POST'])
+@admin_required
+def generate_tokens_for_round(round_id):
+    """Generate pick tokens for all active players for a specific round"""
+    try:
+        round_obj = Round.query.get(round_id)
+        if not round_obj:
+            return jsonify({'success': False, 'error': 'Round not found'}), 404
+
+        active_players = Player.query.filter_by(status='active').all()
+        tokens_created = []
+
+        for player in active_players:
+            # Check if token already exists
+            existing_token = PickToken.query.filter_by(
+                player_id=player.id,
+                round_id=round_obj.id
+            ).first()
+
+            if not existing_token:
+                # Create new token
+                token = PickToken.create_for_player_round(
+                    player.id,
+                    round_obj.id,
+                    expires_hours=168  # 7 days or until round deadline
+                )
+                tokens_created.append({
+                    'player': player.name,
+                    'token': token.token,
+                    'url': f"{request.url_root}pick/{token.token}"
+                })
+
+        db.session.commit()
+
+        return jsonify({
+            'success': True,
+            'tokens_created': len(tokens_created),
+            'round_number': round_obj.round_number,
+            'tokens': tokens_created
+        })
+
+    except Exception as e:
+        db.session.rollback()
+        app.logger.error(f"Error in generate_tokens_for_round: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
 # --- Public pages ---
 @app.route('/rules')
 def rules():
     return render_template('rules.html')
+
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port)
