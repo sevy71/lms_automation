@@ -139,4 +139,13 @@ dmypy.json
 Thumbs.db
 
 # Chrome profile for Selenium
-/tmp/chrome_profile/
+/tmp/chrome_profile/venv/
+__pycache__/
+*.pyc
+*.db
+*.db.*
+*.sqlite
+*.backup
+*.whl
+.env
+instance/
