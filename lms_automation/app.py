@@ -50,10 +50,8 @@ if database_uri:
     app.config['SQLALCHEMY_DATABASE_URI'] = database_uri.replace('postgres://', 'postgresql://')
     print("Using DATABASE_PUBLIC_URL" if os.environ.get('DATABASE_PUBLIC_URL') else "Using DATABASE_URL")
 else:
-    app.config['SQLALCHEMY_DATABASE_URI'] = (
-        'sqlite:////Users/antoniosirignanonew/Projects/LMS2_telegram_experiment/instance/lms.db'
-    )
-    print("Using local SQLite database (absolute path).")
+    app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///instance/lms.db'
+    print("Using local SQLite database.")
 
 print(f"Database URI set to: {app.config['SQLALCHEMY_DATABASE_URI']}")
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
@@ -66,9 +64,6 @@ from lms_automation.telegram_service import telegram_service
 
 # Initialize db with app
 db.init_app(app)
-
-with app.app_context():
-    _ensure_minimum_schema()
 
 migrate = Migrate(app, db)
 
@@ -3520,5 +3515,5 @@ def rules():
     return render_template('rules.html')
 
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
+    port = int(os.getenv('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
