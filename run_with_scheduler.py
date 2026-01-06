@@ -32,16 +32,8 @@ def main():
         port = int(os.environ.get('PORT', 5000))
         logger.info(f"Starting Flask app on port {port}...")
 
-        # In production, this would be handled by gunicorn
-        # For development/testing, use Flask's built-in server
-        if os.environ.get('FLASK_ENV') == 'production':
-            logger.info("Running in production mode - use gunicorn instead!")
-            # Keep the scheduler running
-            import time
-            while True:
-                time.sleep(60)
-        else:
-            app.run(host='0.0.0.0', port=port, debug=False)
+        # Always start the Flask server so pick links are reachable in production.
+        app.run(host='0.0.0.0', port=port, debug=False)
 
     except KeyboardInterrupt:
         logger.info("Shutting down...")
