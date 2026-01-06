@@ -1,11 +1,6 @@
 import os
-print("BOOT __file__ =", __file__)
-print("BOOT lines    =", sum(1 for _ in open(__file__, "r", encoding="utf-8")))
-print("BOOT commit   =", os.environ.get("RAILWAY_GIT_COMMIT_SHA") or os.environ.get("GIT_COMMIT"))
-
 from flask import Flask, render_template, request, jsonify, session, redirect, url_for, flash
 from flask_migrate import Migrate
-import os
 import sys
 from dotenv import load_dotenv
 from datetime import datetime, timedelta, timezone
