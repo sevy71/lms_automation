@@ -6,6 +6,7 @@ from dotenv import load_dotenv
 from datetime import datetime, timedelta, timezone
 import urllib.parse
 from functools import wraps
+import random
 from io import BytesIO
 
 load_dotenv()
@@ -446,6 +447,76 @@ def whoami_telegram():
 
     value = getattr(player, field_name)
     return str(value) if value else "not set"
+
+@app.route('/admin/seed-random-picks')
+@admin_required
+def seed_random_picks():
+    try:
+        round_id = request.args.get('round_id', type=int)
+        if not round_id:
+            return jsonify({'error': 'round_id is required'}), 400
+
+        count = request.args.get('count', default=25, type=int)
+        only_missing = str(request.args.get('only_missing', '1')).lower() in ('1', 'true', 'yes', 'y')
+
+        round_obj = Round.query.get_or_404(round_id)
+        fixtures = Fixture.query.filter_by(round_id=round_id).all()
+        if not fixtures:
+            return jsonify({
+                'round_id': round_id,
+                'created': 0,
+                'skipped_existing': 0,
+                'skipped_no_fixtures': count
+            })
+
+        teams_in_round = _eligible_teams_for_round(round_obj)
+        players = Player.query.order_by(Player.id).all()
+
+        created = 0
+        skipped_existing = 0
+
+        for player in players:
+            if created >= count:
+                break
+            existing_pick = Pick.query.filter_by(player_id=player.id, round_id=round_id).first()
+            if existing_pick:
+                if only_missing:
+                    skipped_existing += 1
+                    continue
+
+            used_teams = _teams_used_this_cycle(player.id, round_obj.cycle_number or 1)
+            available = list(teams_in_round - used_teams)
+            if available:
+                team_picked = random.choice(sorted(available))
+            else:
+                team_picked = random.choice(sorted(teams_in_round))
+
+            pick = Pick(
+                player_id=player.id,
+                round_id=round_id,
+                team_picked=team_picked,
+                timestamp=datetime.utcnow()
+            )
+            db.session.add(pick)
+            created += 1
+            app.logger.info(
+                "Seeded pick: player=%s id=%s team=%s round=%s",
+                player.name,
+                player.id,
+                team_picked,
+                round_id
+            )
+
+        db.session.commit()
+        return jsonify({
+            'round_id': round_id,
+            'created': created,
+            'skipped_existing': skipped_existing,
+            'skipped_no_fixtures': 0
+        })
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/admin/change-password', methods=['POST'])
 @admin_required

@@ -75,6 +75,12 @@
 
                     <!-- Picks submission status -->
                     <div id="picksStatus" class="mt-3"></div>
+                    <div class="mt-3">
+                        <a class="btn btn-sm btn-outline-primary"
+                           href="/admin/seed-random-picks?round_id={{ current_round.id }}&count=25&only_missing=1">
+                            Seed 25 Random Picks
+                        </a>
+                    </div>
                 {% else %}
                     <div class="text-center py-4">
                         <i class="fas fa-exclamation-triangle text-warning fa-3x mb-3"></i>
