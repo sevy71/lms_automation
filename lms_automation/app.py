@@ -1179,6 +1179,8 @@ def handle_rounds():
                             pass
                     if earliest_kickoff:
                         new_round.first_kickoff_at = earliest_kickoff
+                        if not new_round.end_date:
+                            new_round.end_date = earliest_kickoff - timedelta(hours=1)
                     
                     db.session.commit()
                     

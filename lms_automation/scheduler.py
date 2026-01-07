@@ -271,16 +271,16 @@ class LMSScheduler:
             winning_team = fixture.away_team
         else:
             # Draw - both teams are considered winners for LMS
-            winning_teams = [fixture.home_team, fixture.away_team]
+            drawn_teams = [fixture.home_team, fixture.away_team]
 
-            # Update picks for draws
+            # Update picks for draws (draws eliminate picks)
             picks = Pick.query.filter_by(round_id=fixture.round_id).filter(
-                Pick.team_picked.in_(winning_teams)
+                Pick.team_picked.in_(drawn_teams)
             ).all()
 
             for pick in picks:
                 if pick.is_winner is None:
-                    pick.is_winner = True
+                    pick.is_winner = False
             return
 
         # Update picks for wins/losses
