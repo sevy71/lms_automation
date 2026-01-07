@@ -1,12 +1,17 @@
-import requests
+import logging
 import os
 import time
+import requests
 from datetime import datetime
 from typing import Dict, List, Optional
 
+logger = logging.getLogger(__name__)
+
 class FootballDataAPI:
     def __init__(self):
-        self.api_token = os.environ.get('FOOTBALL_API_TOKEN', 'fffc0c77c6d24545958210fcec5f4f03')
+        self.api_token = os.environ.get('FOOTBALL_API_TOKEN')
+        if not self.api_token:
+            raise RuntimeError("FOOTBALL_API_TOKEN is required to use the Football API.")
         self.base_url = 'https://api.football-data.org/v4'
         self.headers = {
             'X-Auth-Token': self.api_token,
@@ -14,6 +19,10 @@ class FootballDataAPI:
         }
         # Premier League competition ID
         self.premier_league_id = 2021
+
+    @staticmethod
+    def _default_season() -> Optional[str]:
+        return os.environ.get('FOOTBALL_SEASON') or os.environ.get('SEASON')
 
     def get_premier_league_fixtures(self, matchday: Optional[int] = None, season: str = None) -> Dict:
         """
@@ -31,56 +40,45 @@ class FootballDataAPI:
             
             # Use current season (2025/26) if no season specified  
             if season is None:
-                params = {'season': '2025'}  # Current 2025/26 season
-            else:
-                params = {'season': season}
+                season = self._default_season()
+
+            params = {}
+            if season:
+                params['season'] = season
             
             if matchday:
                 params['matchday'] = matchday
             
-            print(f"API Request: {url} with params: {params}")
-            
+            logger.info("Football API request: %s params=%s", url, params)
+
             # Add a small delay to avoid rate limiting
             time.sleep(0.1)
             
             response = requests.get(url, headers=self.headers, params=params, timeout=10)
-            
-            print(f"API Response Status: {response.status_code}")
-            
+
+            logger.info("Football API response status: %s", response.status_code)
+
             if response.status_code == 429:
-                print("Rate limit hit, waiting 60 seconds...")
-                time.sleep(60)
-                response = requests.get(url, headers=self.headers, params=params, timeout=10)
+                logger.warning("Football API rate limit hit (429).")
+                return {'matches': []}
             
             if response.status_code == 403:
-                print("API Error: 403 Forbidden - Check your API token and subscription")
-                print(f"Using API token: {self.api_token[:10]}...")
+                logger.error("Football API error 403: check token/subscription.")
                 return {'matches': []}
             elif response.status_code == 404:
-                print(f"API Error: 404 Not Found - Season or competition not found")
+                logger.error("Football API error 404: season or competition not found.")
                 return {'matches': []}  
             elif response.status_code != 200:
-                print(f"API Error: {response.status_code} - {response.text}")
+                logger.error("Football API error %s: %s", response.status_code, response.text[:200])
                 return {'matches': []}
             
             data = response.json()
-            print(f"API Response: Found {len(data.get('matches', []))} matches")
-            
-            # Print some debug info about the matches
-            if data.get('matches'):
-                first_match = data['matches'][0]
-                print(f"First match sample: {first_match.get('homeTeam', {}).get('name')} vs {first_match.get('awayTeam', {}).get('name')} on {first_match.get('utcDate')}")
-                
-                # Print season info if available
-                if 'season' in data:
-                    print(f"Season info: {data['season']}")
+            logger.info("Football API response: %s matches", len(data.get('matches', [])))
             
             return data
             
         except requests.RequestException as e:
-            print(f"Error fetching fixtures: {e}")
-            if "429" in str(e):
-                print("Rate limiting detected. The free tier has limited requests per minute.")
+            logger.error("Error fetching fixtures: %s", e)
             return {'matches': []}
 
     def get_available_matchdays(self) -> List[int]:
@@ -101,7 +99,7 @@ class FootballDataAPI:
             return sorted(list(matchdays))
             
         except Exception as e:
-            print(f"Error getting matchdays: {e}")
+            logger.error("Error getting matchdays: %s", e)
             return list(range(1, 39))  # Default to 1-38
 
     def format_fixtures_for_db(self, fixtures_data: Dict, target_matchday: int) -> List[Dict]:
@@ -156,7 +154,7 @@ class FootballDataAPI:
             match_status = status_map.get(match.get('status'), 'scheduled')
             
             formatted_fixture = {
-                'event_id': str(match.get('id', '')),
+                'event_id': str(match.get('id')) if match.get('id') is not None else None,
                 'home_team': home_team,
                 'away_team': away_team,
                 'date': match_date,
@@ -210,7 +208,7 @@ class FootballDataAPI:
             }
             
         except Exception as e:
-            print(f"Error getting matchday info: {e}")
+            logger.error("Error getting matchday info: %s", e)
             return {
                 'matchday': matchday,
                 'fixture_count': 0,

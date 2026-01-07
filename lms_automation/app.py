@@ -38,6 +38,9 @@ def to_local(dt: datetime) -> datetime:
     except Exception:
         return dt
 
+def _football_season() -> str | None:
+    return os.environ.get('FOOTBALL_SEASON') or os.environ.get('SEASON')
+
 # --- Database configuration ---
 database_uri = os.environ.get('DATABASE_PUBLIC_URL') or os.environ.get('DATABASE_URL')
 if database_uri:
@@ -1029,9 +1032,12 @@ def handle_rounds():
             
             # Fetch and populate fixtures
             try:
-                from football_api import FootballDataAPI
+                from lms_automation.football_api import FootballDataAPI
                 api = FootballDataAPI()
-                fixtures_data = api.get_premier_league_fixtures(pl_matchday)
+                fixtures_data = api.get_premier_league_fixtures(
+                    matchday=pl_matchday,
+                    season=_football_season()
+                )
                 formatted_fixtures = api.format_fixtures_for_db(fixtures_data, pl_matchday)
                 
                 if formatted_fixtures:
@@ -1107,7 +1113,7 @@ def handle_rounds():
                     'round_number': new_round.round_number,
                     'pl_matchday': new_round.pl_matchday,
                     'fixtures_added': len(fallback_fixtures),
-                    'warning': f'Round created with fallback fixtures (API failed): {str(fixture_error)}'
+                    'warning': f'Football API unavailable: {str(fixture_error)}. Used fallback fixtures.'
                 })
             
         except Exception as e:
@@ -1152,17 +1158,19 @@ def get_available_matchdays():
         
         # Optional: Try to get real data from API if available
         try:
-            from football_api import FootballDataAPI
+            from lms_automation.football_api import FootballDataAPI
             api = FootballDataAPI()
             print("Attempting to get real matchday data from API...")
-            
-            fixtures_data = api.get_premier_league_fixtures(season='2025')
-            if fixtures_data and fixtures_data.get('matches'):
-                print(f"Got {len(fixtures_data['matches'])} matches from API")
+            fixtures_data = api.get_premier_league_fixtures(season=_football_season())
+            matches = fixtures_data.get('matches', []) if fixtures_data else []
+            if not matches:
+                raise Exception("Football API returned no matches")
+            if matches:
+                print(f"Got {len(matches)} matches from API")
                 
                 # Extract real matchdays
                 real_matchdays = set()
-                for match in fixtures_data.get('matches', []):
+                for match in matches:
                     if match.get('matchday'):
                         real_matchdays.add(match['matchday'])
                 
@@ -1171,7 +1179,7 @@ def get_available_matchdays():
                     # Replace fallback with real data
                     matchday_data = []
                     for matchday in sorted(real_matchdays):
-                        fixture_count = len([m for m in fixtures_data['matches'] if m.get('matchday') == matchday])
+                        fixture_count = len([m for m in matches if m.get('matchday') == matchday])
                         matchday_data.append({
                             'matchday': matchday,
                             'fixture_count': fixture_count,
@@ -1183,6 +1191,12 @@ def get_available_matchdays():
             
         except Exception as api_error:
             print(f"API failed (using fallback): {api_error}")
+            return jsonify({
+                'success': True,
+                'matchdays': matchday_data,
+                'source': 'fallback',
+                'warning': f'Football API unavailable: {str(api_error)}'
+            })
         
         # Return fallback data
         print("Using fallback matchday data")
@@ -1215,13 +1229,19 @@ def get_matchday_info(matchday):
         
         # Try to get real API data to enhance the info
         try:
-            from football_api import FootballDataAPI
+            from lms_automation.football_api import FootballDataAPI
             api = FootballDataAPI()
             print(f"Attempting to get real data for matchday {matchday}")
-            
-            fixtures_data = api.get_premier_league_fixtures(matchday=matchday, season='2025')
-            matches = fixtures_data.get('matches', [])
-            
+
+            fixtures_data = api.get_premier_league_fixtures(
+                matchday=matchday,
+                season=_football_season()
+            )
+            matches = fixtures_data.get('matches', []) if fixtures_data else []
+
+            if not matches:
+                raise Exception("Football API returned no matches")
+
             if matches:
                 print(f"Got {len(matches)} matches for matchday {matchday}")
                 
@@ -1247,6 +1267,12 @@ def get_matchday_info(matchday):
             
         except Exception as api_error:
             print(f"API failed for matchday {matchday}: {api_error}")
+            return jsonify({
+                'success': True,
+                'info': info,
+                'source': 'fallback',
+                'warning': f'Football API unavailable: {str(api_error)}'
+            })
         
         # Return fallback info
         print(f"Using fallback data for matchday {matchday}")
@@ -1369,9 +1395,12 @@ def add_fixtures_to_round(round_id):
         
         # Try to get fixtures from API
         try:
-            from football_api import FootballDataAPI
+            from lms_automation.football_api import FootballDataAPI
             api = FootballDataAPI()
-            fixtures_data = api.get_premier_league_fixtures(round_obj.pl_matchday)
+            fixtures_data = api.get_premier_league_fixtures(
+                matchday=round_obj.pl_matchday,
+                season=_football_season()
+            )
             formatted_fixtures = api.format_fixtures_for_db(fixtures_data, round_obj.pl_matchday)
             
             if formatted_fixtures:
@@ -1441,7 +1470,7 @@ def add_fixtures_to_round(round_id):
                 'success': True,
                 'fixtures_added': len(fallback_fixtures),
                 'source': 'fallback',
-                'warning': f'Used fallback fixtures due to API error: {str(api_error)}'
+                'warning': f'Football API unavailable: {str(api_error)}. Used fallback fixtures.'
             })
         
     except Exception as e:
@@ -1508,36 +1537,50 @@ def auto_populate_results(round_id):
             return jsonify({'success': False, 'error': 'No fixtures found for this round'}), 400
         
         # Get updated results from API
-        from football_api import FootballDataAPI
+        from lms_automation.football_api import FootballDataAPI
         api = FootballDataAPI()
-        fixtures_data = api.get_premier_league_fixtures(round_obj.pl_matchday)
+        fixtures_data = api.get_premier_league_fixtures(
+            matchday=round_obj.pl_matchday,
+            season=_football_season()
+        )
         
         if not fixtures_data or not fixtures_data.get('matches'):
             return jsonify({'success': False, 'error': 'Unable to fetch results from football API'}), 500
         
         updated_count = 0
         api_matches = fixtures_data['matches']
+        matches_by_id = {
+            str(m.get('id')): m for m in api_matches if m.get('id') is not None
+        }
         
         # Update fixtures with API results
         for fixture in fixtures:
-            # Find matching API fixture by team names
-            for api_match in api_matches:
-                if (api_match.get('homeTeam', {}).get('name') == fixture.home_team and 
-                    api_match.get('awayTeam', {}).get('name') == fixture.away_team):
-                    
-                    # Check if match is finished and has scores
-                    if api_match.get('status') == 'FINISHED':
-                        score = api_match.get('score', {})
-                        full_time = score.get('fullTime', {})
-                        home_score = full_time.get('home')
-                        away_score = full_time.get('away')
-                        
-                        if home_score is not None and away_score is not None:
-                            fixture.home_score = home_score
-                            fixture.away_score = away_score
-                            fixture.status = 'completed'
-                            updated_count += 1
-                    break
+            api_match = None
+            if fixture.event_id:
+                api_match = matches_by_id.get(str(fixture.event_id))
+
+            if not api_match:
+                for candidate in api_matches:
+                    if (candidate.get('homeTeam', {}).get('name') == fixture.home_team and
+                        candidate.get('awayTeam', {}).get('name') == fixture.away_team):
+                        api_match = candidate
+                        break
+
+            if not api_match:
+                continue
+
+            # Check if match is finished and has scores
+            if api_match.get('status') == 'FINISHED':
+                score = api_match.get('score', {})
+                full_time = score.get('fullTime', {})
+                home_score = full_time.get('home')
+                away_score = full_time.get('away')
+
+                if home_score is not None and away_score is not None:
+                    fixture.home_score = home_score
+                    fixture.away_score = away_score
+                    fixture.status = 'completed'
+                    updated_count += 1
         
         if updated_count > 0:
             db.session.commit()
@@ -1550,7 +1593,7 @@ def auto_populate_results(round_id):
         
     except Exception as e:
         db.session.rollback()
-        return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({'success': False, 'error': f'Football API unavailable: {str(e)}'}), 502
 
 @app.route('/api/players/<int:player_id>/status', methods=['PUT'])
 @admin_required

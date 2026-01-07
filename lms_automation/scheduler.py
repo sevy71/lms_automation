@@ -23,13 +23,19 @@ class LMSScheduler:
     def __init__(self, app: Optional[Flask] = None):
         self.scheduler = BackgroundScheduler()
         self.app = app
-        self.football_api = FootballDataAPI()
         self.notification_service = NotificationService()
         self.telegram_bot_url = os.environ.get('TELEGRAM_BOT_URL', 'http://localhost:8080')
 
     def init_app(self, app: Flask):
         """Initialize scheduler with Flask app context"""
         self.app = app
+
+    def _get_api(self) -> Optional[FootballDataAPI]:
+        try:
+            return FootballDataAPI()
+        except Exception as e:
+            logger.error("Football API unavailable: %s", e)
+            return None
 
     def start(self):
         """Start the scheduler with all jobs"""
@@ -42,6 +48,15 @@ class LMSScheduler:
                 trigger=IntervalTrigger(minutes=30),
                 id='update_fixtures',
                 name='Update fixture results from Football API',
+                replace_existing=True
+            )
+
+            # Sync fixtures every 60 minutes
+            self.scheduler.add_job(
+                func=self.sync_fixtures,
+                trigger=IntervalTrigger(minutes=60),
+                id='sync_fixtures',
+                name='Sync fixtures from Football API',
                 replace_existing=True
             )
 
@@ -100,47 +115,148 @@ class LMSScheduler:
             logger.info("Scheduler stopped")
 
     def update_fixture_results(self):
-        """Poll Football API for fixture updates and update database"""
+        """Poll Football API for fixture results and update database"""
         with self.app.app_context():
             try:
                 logger.info("Checking for fixture updates...")
+                api = self._get_api()
+                if not api:
+                    return
+                season = os.environ.get('FOOTBALL_SEASON') or os.environ.get('SEASON')
 
                 # Get active rounds
                 active_rounds = Round.query.filter_by(status='active').all()
 
                 for round_obj in active_rounds:
-                    fixtures = Fixture.query.filter_by(round_id=round_obj.id, status='scheduled').all()
+                    if not round_obj.pl_matchday:
+                        continue
 
-                    # Get all fixtures for the matchday
-                    if round_obj.pl_matchday:
-                        api_data = self.football_api.get_premier_league_fixtures(matchday=round_obj.pl_matchday)
+                    api_data = api.get_premier_league_fixtures(
+                        matchday=round_obj.pl_matchday,
+                        season=season
+                    )
 
-                        if api_data and 'matches' in api_data:
-                            for match in api_data['matches']:
-                                # Find corresponding fixture in database
-                                home_team = match.get('homeTeam', {}).get('name')
-                                away_team = match.get('awayTeam', {}).get('name')
+                    if api_data and 'matches' in api_data:
+                        matches_by_id = {
+                            str(m.get('id')): m for m in api_data['matches'] if m.get('id') is not None
+                        }
+                        fixtures = Fixture.query.filter_by(round_id=round_obj.id).all()
 
-                                for fixture in fixtures:
-                                    if (fixture.home_team == home_team and
-                                        fixture.away_team == away_team and
-                                        match.get('status') == 'FINISHED'):
+                        for fixture in fixtures:
+                            match = None
+                            if fixture.event_id:
+                                match = matches_by_id.get(str(fixture.event_id))
+                            if not match:
+                                for candidate in api_data['matches']:
+                                    if (candidate.get('homeTeam', {}).get('name') == fixture.home_team and
+                                        candidate.get('awayTeam', {}).get('name') == fixture.away_team):
+                                        match = candidate
+                                        break
 
-                                        # Update fixture with results
-                                        fixture.status = 'completed'
-                                        fixture.home_score = match.get('score', {}).get('fullTime', {}).get('home')
-                                        fixture.away_score = match.get('score', {}).get('fullTime', {}).get('away')
+                            if not match or match.get('status') != 'FINISHED':
+                                continue
 
-                                        # Determine winner and update picks
-                                        self._update_picks_for_fixture(fixture)
+                            fixture.status = 'completed'
+                            fixture.home_score = match.get('score', {}).get('fullTime', {}).get('home')
+                            fixture.away_score = match.get('score', {}).get('fullTime', {}).get('away')
 
-                                        logger.info(f"Updated fixture: {fixture.home_team} {fixture.home_score} - {fixture.away_score} {fixture.away_team}")
+                            # Determine winner and update picks
+                            self._update_picks_for_fixture(fixture)
+
+                            logger.info(
+                                "Updated fixture: %s %s - %s %s",
+                                fixture.home_team,
+                                fixture.home_score,
+                                fixture.away_score,
+                                fixture.away_team
+                            )
 
                 db.session.commit()
                 logger.info("Fixture updates completed")
 
             except Exception as e:
                 logger.error(f"Error updating fixtures: {e}")
+                db.session.rollback()
+
+    def sync_fixtures(self):
+        """Sync fixtures from Football API without changing round status"""
+        with self.app.app_context():
+            try:
+                logger.info("Syncing fixtures from Football API...")
+                api = self._get_api()
+                if not api:
+                    return
+                season = os.environ.get('FOOTBALL_SEASON') or os.environ.get('SEASON')
+
+                rounds = Round.query.filter(Round.status.in_(['pending', 'active'])).all()
+                created = 0
+                updated = 0
+                skipped = 0
+
+                for round_obj in rounds:
+                    if not round_obj.pl_matchday:
+                        skipped += 1
+                        continue
+
+                    fixtures_data = api.get_premier_league_fixtures(
+                        matchday=round_obj.pl_matchday,
+                        season=season
+                    )
+                    formatted = api.format_fixtures_for_db(fixtures_data, round_obj.pl_matchday)
+                    if not formatted:
+                        continue
+
+                    for fx in formatted:
+                        event_id = fx.get('event_id') or None
+                        fixture = None
+
+                        if event_id:
+                            fixture = Fixture.query.filter_by(
+                                round_id=round_obj.id,
+                                event_id=event_id
+                            ).first()
+                        if not fixture:
+                            fixture = Fixture.query.filter_by(
+                                round_id=round_obj.id,
+                                home_team=fx['home_team'],
+                                away_team=fx['away_team'],
+                                date=fx['date']
+                            ).first()
+
+                        if fixture:
+                            fixture.event_id = event_id or fixture.event_id
+                            fixture.home_team = fx['home_team']
+                            fixture.away_team = fx['away_team']
+                            fixture.date = fx['date']
+                            fixture.time = fx['time']
+                            fixture.home_score = fx['home_score']
+                            fixture.away_score = fx['away_score']
+                            fixture.status = fx['status']
+                            updated += 1
+                        else:
+                            fixture = Fixture(
+                                round_id=round_obj.id,
+                                event_id=event_id,
+                                home_team=fx['home_team'],
+                                away_team=fx['away_team'],
+                                date=fx['date'],
+                                time=fx['time'],
+                                home_score=fx['home_score'],
+                                away_score=fx['away_score'],
+                                status=fx['status']
+                            )
+                            db.session.add(fixture)
+                            created += 1
+
+                db.session.commit()
+                logger.info(
+                    "Fixture sync summary: created=%s updated=%s skipped_rounds=%s",
+                    created,
+                    updated,
+                    skipped
+                )
+            except Exception as e:
+                logger.error("Error syncing fixtures: %s", e)
                 db.session.rollback()
 
     def _update_picks_for_fixture(self, fixture):
