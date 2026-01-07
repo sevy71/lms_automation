@@ -405,6 +405,48 @@ def admin_logout():
     flash('You have been logged out', 'info')
     return redirect(url_for('index'))
 
+def _get_tony_player():
+    player = Player.query.filter_by(name="Tony").first()
+    if not player:
+        player = Player.query.filter_by(whatsapp_number="07545851594").first()
+    return player
+
+def _telegram_field_name():
+    if hasattr(Player, "telegram_id"):
+        return "telegram_id"
+    if hasattr(Player, "telegram_chat_id"):
+        return "telegram_chat_id"
+    return None
+
+@app.route('/admin/link-telegram')
+@admin_required
+def link_tony_telegram():
+    player = _get_tony_player()
+    if not player:
+        return "Tony not found (name or whatsapp_number).", 404
+
+    field_name = _telegram_field_name()
+    if not field_name:
+        return "No telegram field found on Player model.", 500
+
+    setattr(player, field_name, 441421387)
+    db.session.commit()
+    return "Linked Tony to 441421387"
+
+@app.route('/admin/whoami-telegram')
+@admin_required
+def whoami_telegram():
+    player = _get_tony_player()
+    if not player:
+        return "Tony not found (name or whatsapp_number).", 404
+
+    field_name = _telegram_field_name()
+    if not field_name:
+        return "No telegram field found on Player model.", 500
+
+    value = getattr(player, field_name)
+    return str(value) if value else "not set"
+
 @app.route('/admin/change-password', methods=['POST'])
 @admin_required
 def change_admin_password():
