@@ -609,12 +609,29 @@ class LMSScheduler:
             try:
                 logger.info("Checking for missed picks...")
 
-                now = datetime.now()
+                now = datetime.utcnow()
                 active_rounds = Round.query.filter_by(status='active').all()
 
                 for round_obj in active_rounds:
-                    # Check if deadline has passed
-                    if round_obj.end_date and round_obj.end_date < now:
+                    kickoff = round_obj.first_kickoff_at
+                    if not kickoff:
+                        fixtures = Fixture.query.filter_by(round_id=round_obj.id).all()
+                        kickoff = None
+                        for fixture in fixtures:
+                            if fixture.date and fixture.time:
+                                dt = datetime.combine(fixture.date, fixture.time)
+                                if kickoff is None or dt < kickoff:
+                                    kickoff = dt
+
+                    if not kickoff:
+                        logger.info(
+                            "Round %s: no kickoff time available; skipping auto-picks",
+                            round_obj.round_number
+                        )
+                        continue
+
+                    deadline = kickoff - timedelta(hours=1)
+                    if now >= deadline:
                         # Get active players without picks
                         active_players = Player.query.filter_by(status='active').all()
 
@@ -635,10 +652,23 @@ class LMSScheduler:
                                         team_picked=auto_team,
                                         auto_assigned=True,
                                         auto_reason='missed_deadline',
-                                        timestamp=datetime.now()
+                                        timestamp=now
                                     )
                                     db.session.add(pick)
-                                    logger.info(f"Auto-picked {auto_team} for {player.name}")
+                                    logger.info(
+                                        "Auto-picked %s for %s (deadline %s, kickoff %s)",
+                                        auto_team,
+                                        player.name,
+                                        deadline,
+                                        kickoff
+                                    )
+                    else:
+                        logger.info(
+                            "Round %s: not in auto-pick window yet (now %s, deadline %s)",
+                            round_obj.round_number,
+                            now,
+                            deadline
+                        )
 
                 db.session.commit()
                 logger.info("Auto-pick processing completed")
