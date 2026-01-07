@@ -102,6 +102,7 @@ class LMSScheduler:
                 trigger=IntervalTrigger(hours=1),
                 id='apply_missed_picks',
                 name='Apply auto-picks for players who missed deadline',
+                next_run_time=datetime.now(),
                 replace_existing=True
             )
 
