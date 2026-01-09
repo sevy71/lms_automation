@@ -5,7 +5,7 @@ Handles periodic tasks for automated game management
 
 import os
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from flask import Flask
@@ -106,6 +106,16 @@ class LMSScheduler:
                 replace_existing=True
             )
 
+            # Orchestrator job - ensures proper round progression
+            self.scheduler.add_job(
+                func=self.round_progression_orchestrator,
+                trigger=IntervalTrigger(minutes=10),
+                id='round_orchestrator',
+                name='Orchestrate round progression (activate pending rounds with tokens)',
+                next_run_time=datetime.now(),
+                replace_existing=True
+            )
+
             self.scheduler.start()
             logger.info("Scheduler started with all jobs configured")
 
@@ -119,14 +129,20 @@ class LMSScheduler:
         """Poll Football API for fixture results and update database"""
         with self.app.app_context():
             try:
-                logger.info("Checking for fixture updates...")
+                logger.info("=== FIXTURE UPDATE JOB START ===")
                 api = self._get_api()
                 if not api:
+                    logger.warning("Football API unavailable, skipping fixture updates")
                     return
                 season = os.environ.get('FOOTBALL_SEASON') or os.environ.get('SEASON')
 
                 # Get active rounds
                 active_rounds = Round.query.filter_by(status='active').all()
+                logger.info(f"Found {len(active_rounds)} active round(s) to check for fixture updates")
+
+                if not active_rounds:
+                    logger.info("No active rounds found, nothing to update")
+                    return
 
                 for round_obj in active_rounds:
                     if not round_obj.pl_matchday:
@@ -165,15 +181,16 @@ class LMSScheduler:
                             self._update_picks_for_fixture(fixture)
 
                             logger.info(
-                                "Updated fixture: %s %s - %s %s",
+                                "Updated fixture: %s %s - %s %s (Round %s)",
                                 fixture.home_team,
                                 fixture.home_score,
                                 fixture.away_score,
-                                fixture.away_team
+                                fixture.away_team,
+                                round_obj.round_number
                             )
 
                 db.session.commit()
-                logger.info("Fixture updates completed")
+                logger.info("=== FIXTURE UPDATE JOB COMPLETE ===")
 
             except Exception as e:
                 logger.error(f"Error updating fixtures: {e}")
@@ -297,15 +314,30 @@ class LMSScheduler:
         """Process eliminations for completed rounds and check for rollover"""
         with self.app.app_context():
             try:
-                logger.info("Processing eliminations...")
+                logger.info("=== ELIMINATION PROCESSING JOB START ===")
 
                 # Get active rounds with all fixtures completed
                 active_rounds = Round.query.filter_by(status='active').all()
+                logger.info(f"Found {len(active_rounds)} active round(s) to check for elimination processing")
+
+                if not active_rounds:
+                    logger.info("No active rounds found")
+                    return
+
+                rounds_processed = 0
+                total_eliminations = 0
 
                 for round_obj in active_rounds:
                     # Check if all fixtures are completed
                     fixtures = Fixture.query.filter_by(round_id=round_obj.id).all()
+                    completed_fixtures = [f for f in fixtures if f.status == 'completed']
+
+                    logger.info(
+                        f"Round {round_obj.round_number}: {len(completed_fixtures)}/{len(fixtures)} fixtures completed"
+                    )
+
                     if not fixtures or not all(f.status == 'completed' for f in fixtures):
+                        logger.info(f"Round {round_obj.round_number}: Not all fixtures completed yet, skipping")
                         continue
 
                     # Process eliminations
@@ -317,16 +349,24 @@ class LMSScheduler:
                             eliminated_count += 1
 
                     if eliminated_count > 0:
-                        logger.info(f"Eliminated {eliminated_count} players in Round {round_obj.round_number}")
+                        logger.info(f"Round {round_obj.round_number}: Eliminated {eliminated_count} player(s)")
+                        total_eliminations += eliminated_count
+                    else:
+                        logger.info(f"Round {round_obj.round_number}: No new eliminations")
 
                     # Mark round as completed
                     round_obj.status = 'completed'
+                    logger.info(f"Round {round_obj.round_number}: Marked as COMPLETED")
 
                     # Check for game state changes
                     self._check_game_state(round_obj)
+                    rounds_processed += 1
 
                 db.session.commit()
-                logger.info("Elimination processing completed")
+                logger.info(
+                    f"=== ELIMINATION PROCESSING COMPLETE: {rounds_processed} round(s) processed, "
+                    f"{total_eliminations} player(s) eliminated ==="
+                )
 
             except Exception as e:
                 logger.error(f"Error processing eliminations: {e}")
@@ -464,10 +504,15 @@ class LMSScheduler:
         """Send initial round announcement to all players when new round starts"""
         with self.app.app_context():
             try:
-                logger.info("Checking for new rounds to announce...")
+                logger.info("=== ROUND ANNOUNCEMENT JOB START ===")
 
                 # Get active rounds
                 active_rounds = Round.query.filter_by(status='active').all()
+                logger.info(f"Found {len(active_rounds)} active round(s) for announcements")
+
+                if not active_rounds:
+                    logger.info("No active rounds found")
+                    return
 
                 for round_obj in active_rounds:
                     active_players = Player.query.filter_by(status='active').all()
@@ -554,32 +599,45 @@ class LMSScheduler:
                                     player.whatsapp_number or "-"
                                 )
 
-                    if sent_count or skipped_missing:
-                        logger.info(
-                            "Round %s announcement summary: sent=%s skipped_missing_telegram=%s",
-                            round_obj.round_number,
-                            sent_count,
-                            skipped_missing
-                        )
+                    logger.info(
+                        f"Round {round_obj.round_number} announcement summary: "
+                        f"sent={sent_count}, skipped_missing_telegram={skipped_missing}"
+                    )
 
                 db.session.commit()
-                logger.info("Round announcements completed")
+                logger.info("=== ROUND ANNOUNCEMENT JOB COMPLETE ===")
 
             except Exception as e:
                 logger.error(f"Error sending round announcements: {e}")
                 db.session.rollback()
 
     def generate_round_tokens(self):
-        """Generate pick tokens for active rounds without tokens"""
+        """Generate pick tokens for pending/active rounds without tokens"""
         with self.app.app_context():
             try:
-                logger.info("Checking for rounds needing tokens...")
+                logger.info("=== TOKEN GENERATION JOB START ===")
 
-                # Get active rounds
-                active_rounds = Round.query.filter_by(status='active').all()
+                # Get pending AND active rounds (tokens should be created before activation)
+                rounds_needing_tokens = Round.query.filter(
+                    Round.status.in_(['pending', 'active'])
+                ).all()
+                logger.info(
+                    f"Found {len(rounds_needing_tokens)} round(s) (pending/active) for token generation check"
+                )
 
-                for round_obj in active_rounds:
+                if not rounds_needing_tokens:
+                    logger.info("No pending or active rounds found")
+                    return
+
+                tokens_created = 0
+
+                for round_obj in rounds_needing_tokens:
                     active_players = Player.query.filter_by(status='active').all()
+                    logger.info(
+                        f"Round {round_obj.round_number}: Processing {len(active_players)} active player(s)"
+                    )
+
+                    round_tokens_created = 0
 
                     for player in active_players:
                         # Check if token exists
@@ -594,10 +652,18 @@ class LMSScheduler:
                                 player.id, round_obj.id, expires_hours=168
                             )
                             db.session.add(token)
-                            logger.info(f"Created token for {player.name} - Round {round_obj.round_number}")
+                            logger.info(
+                                f"Created token for player '{player.name}' (id={player.id}) - Round {round_obj.round_number}"
+                            )
+                            round_tokens_created += 1
+
+                    tokens_created += round_tokens_created
+                    logger.info(
+                        f"Round {round_obj.round_number}: Created {round_tokens_created} new token(s)"
+                    )
 
                 db.session.commit()
-                logger.info("Token generation completed")
+                logger.info(f"=== TOKEN GENERATION COMPLETE: {tokens_created} token(s) created ===")
 
             except Exception as e:
                 logger.error(f"Error generating tokens: {e}")
@@ -607,10 +673,20 @@ class LMSScheduler:
         """Apply auto-picks for players who missed the deadline"""
         with self.app.app_context():
             try:
-                logger.info("Checking for missed picks...")
+                logger.info("=== AUTO-PICK JOB START ===")
 
+                # Always use UTC for consistency
                 now = datetime.utcnow()
+                logger.info(f"Current time (UTC): {now}")
+
                 active_rounds = Round.query.filter_by(status='active').all()
+                logger.info(f"Found {len(active_rounds)} active round(s) to check for missed picks")
+
+                if not active_rounds:
+                    logger.info("No active rounds found")
+                    return
+
+                auto_picks_applied = 0
 
                 for round_obj in active_rounds:
                     kickoff = round_obj.first_kickoff_at
@@ -625,12 +701,22 @@ class LMSScheduler:
 
                     if not kickoff:
                         logger.info(
-                            "Round %s: no kickoff time available; skipping auto-picks",
-                            round_obj.round_number
+                            f"Round {round_obj.round_number}: No kickoff time available, skipping auto-picks"
                         )
                         continue
 
+                    # Ensure kickoff is timezone-aware UTC (or convert naive to UTC)
+                    if kickoff.tzinfo is None:
+                        kickoff = kickoff.replace(tzinfo=timezone.utc)
+                    else:
+                        kickoff = kickoff.astimezone(timezone.utc).replace(tzinfo=None)
+
                     deadline = kickoff - timedelta(hours=1)
+
+                    logger.info(
+                        f"Round {round_obj.round_number}: Kickoff={kickoff} (UTC), Deadline={deadline} (UTC), Now={now} (UTC)"
+                    )
+
                     if now >= deadline:
                         # Get active players without picks
                         active_players = Player.query.filter_by(status='active').all()
@@ -656,25 +742,100 @@ class LMSScheduler:
                                     )
                                     db.session.add(pick)
                                     logger.info(
-                                        "Auto-picked %s for %s (deadline %s, kickoff %s)",
-                                        auto_team,
-                                        player.name,
-                                        deadline,
-                                        kickoff
+                                        f"Auto-picked '{auto_team}' for player '{player.name}' (id={player.id}) - Round {round_obj.round_number}"
+                                    )
+                                    auto_picks_applied += 1
+                                else:
+                                    logger.warning(
+                                        f"Could not find eligible team for auto-pick: player '{player.name}' (id={player.id}) - Round {round_obj.round_number}"
                                     )
                     else:
                         logger.info(
-                            "Round %s: not in auto-pick window yet (now %s, deadline %s)",
-                            round_obj.round_number,
-                            now,
-                            deadline
+                            f"Round {round_obj.round_number}: Deadline not reached yet (deadline={deadline}, now={now})"
                         )
 
                 db.session.commit()
-                logger.info("Auto-pick processing completed")
+                logger.info(f"=== AUTO-PICK JOB COMPLETE: {auto_picks_applied} auto-pick(s) applied ===")
 
             except Exception as e:
                 logger.error(f"Error applying missed picks: {e}")
+                db.session.rollback()
+
+    def round_progression_orchestrator(self):
+        """
+        Orchestrator job that ensures proper round progression.
+
+        This job runs every 10 minutes and:
+        1. Activates pending rounds that have tokens created
+        2. Checks if active rounds are ready to be processed
+        3. Ensures the automation pipeline doesn't stall
+        """
+        with self.app.app_context():
+            try:
+                logger.info("=== ROUND ORCHESTRATOR JOB START ===")
+
+                # Step 1: Check for pending rounds with fixtures and tokens, and activate them
+                pending_rounds = Round.query.filter_by(status='pending').all()
+                logger.info(f"Found {len(pending_rounds)} pending round(s)")
+
+                for round_obj in pending_rounds:
+                    # Check if fixtures exist
+                    fixtures = Fixture.query.filter_by(round_id=round_obj.id).all()
+                    if not fixtures:
+                        logger.info(f"Round {round_obj.round_number}: No fixtures yet, staying pending")
+                        continue
+
+                    # Check if tokens exist for active players
+                    active_players = Player.query.filter_by(status='active').all()
+                    if not active_players:
+                        logger.warning(f"Round {round_obj.round_number}: No active players found")
+                        continue
+
+                    # Count how many tokens exist for this round
+                    token_count = PickToken.query.filter_by(round_id=round_obj.id).count()
+
+                    logger.info(
+                        f"Round {round_obj.round_number}: {len(fixtures)} fixture(s), "
+                        f"{len(active_players)} active player(s), {token_count} token(s)"
+                    )
+
+                    # If tokens exist for all active players, activate the round
+                    if token_count >= len(active_players) and len(active_players) > 0:
+                        round_obj.status = 'active'
+                        logger.info(
+                            f"Round {round_obj.round_number}: ACTIVATED (has {token_count} tokens for {len(active_players)} players)"
+                        )
+                    else:
+                        logger.info(
+                            f"Round {round_obj.round_number}: Not ready to activate "
+                            f"(needs {len(active_players)} tokens, has {token_count})"
+                        )
+
+                # Step 2: Check active rounds for completion readiness
+                active_rounds = Round.query.filter_by(status='active').all()
+                logger.info(f"Found {len(active_rounds)} active round(s)")
+
+                for round_obj in active_rounds:
+                    fixtures = Fixture.query.filter_by(round_id=round_obj.id).all()
+                    completed_fixtures = [f for f in fixtures if f.status == 'completed']
+
+                    logger.info(
+                        f"Round {round_obj.round_number} (active): "
+                        f"{len(completed_fixtures)}/{len(fixtures)} fixtures completed"
+                    )
+
+                    # If all fixtures are completed, the process_eliminations job will handle it
+                    if fixtures and all(f.status == 'completed' for f in fixtures):
+                        logger.info(
+                            f"Round {round_obj.round_number}: All fixtures completed, "
+                            f"waiting for elimination processing"
+                        )
+
+                db.session.commit()
+                logger.info("=== ROUND ORCHESTRATOR JOB COMPLETE ===")
+
+            except Exception as e:
+                logger.error(f"Error in round orchestrator: {e}")
                 db.session.rollback()
 
     def _get_auto_pick_team(self, player, round_obj):
