@@ -342,14 +342,24 @@ class LMSScheduler:
 
                     # Process eliminations
                     eliminated_count = 0
+                    eliminated_player_names = []
+
                     for pick in round_obj.picks:
                         if pick.is_winner == False and not pick.is_eliminated:
                             pick.is_eliminated = True
                             pick.player.status = 'eliminated'
                             eliminated_count += 1
+                            eliminated_player_names.append(f"{pick.player.name}(id={pick.player.id})")
+                            logger.debug(
+                                f"Marked player '{pick.player.name}' (id={pick.player.id}) as eliminated "
+                                f"(Round {round_obj.round_number}, pick={pick.team_picked})"
+                            )
 
                     if eliminated_count > 0:
-                        logger.info(f"Round {round_obj.round_number}: Eliminated {eliminated_count} player(s)")
+                        logger.info(
+                            f"Round {round_obj.round_number}: Eliminated {eliminated_count} player(s): "
+                            f"{', '.join(eliminated_player_names)}"
+                        )
                         total_eliminations += eliminated_count
                     else:
                         logger.info(f"Round {round_obj.round_number}: No new eliminations")
@@ -363,9 +373,16 @@ class LMSScheduler:
                     rounds_processed += 1
 
                 db.session.commit()
+
+                # Verify player statuses were updated
+                active_count = Player.query.filter_by(status='active').count()
+                eliminated_count_db = Player.query.filter_by(status='eliminated').count()
                 logger.info(
                     f"=== ELIMINATION PROCESSING COMPLETE: {rounds_processed} round(s) processed, "
                     f"{total_eliminations} player(s) eliminated ==="
+                )
+                logger.info(
+                    f"Current player status counts: active={active_count}, eliminated={eliminated_count_db}"
                 )
 
             except Exception as e:
@@ -515,11 +532,12 @@ class LMSScheduler:
                     return
 
                 for round_obj in active_rounds:
-                    active_players = Player.query.filter_by(status='active').all()
+                    # Use eligibility check to respect per-round eliminations
+                    eligible_players = self._get_eligible_players_for_round(round_obj)
                     sent_count = 0
                     skipped_missing = 0
 
-                    for player in active_players:
+                    for player in eligible_players:
                         # Get pick token
                         pick_token = PickToken.query.filter_by(
                             player_id=player.id,
@@ -632,14 +650,15 @@ class LMSScheduler:
                 tokens_created = 0
 
                 for round_obj in rounds_needing_tokens:
-                    active_players = Player.query.filter_by(status='active').all()
+                    # Use eligibility check to respect per-round eliminations
+                    eligible_players = self._get_eligible_players_for_round(round_obj)
                     logger.info(
-                        f"Round {round_obj.round_number}: Processing {len(active_players)} active player(s)"
+                        f"Round {round_obj.round_number}: Processing {len(eligible_players)} eligible player(s)"
                     )
 
                     round_tokens_created = 0
 
-                    for player in active_players:
+                    for player in eligible_players:
                         # Check if token exists
                         existing_token = PickToken.query.filter_by(
                             player_id=player.id,
@@ -718,10 +737,10 @@ class LMSScheduler:
                     )
 
                     if now >= deadline:
-                        # Get active players without picks
-                        active_players = Player.query.filter_by(status='active').all()
+                        # Get eligible players without picks
+                        eligible_players = self._get_eligible_players_for_round(round_obj)
 
-                        for player in active_players:
+                        for player in eligible_players:
                             existing_pick = Pick.query.filter_by(
                                 player_id=player.id,
                                 round_id=round_obj.id
@@ -785,10 +804,10 @@ class LMSScheduler:
                         logger.info(f"Round {round_obj.round_number}: No fixtures yet, staying pending")
                         continue
 
-                    # Check if tokens exist for active players
-                    active_players = Player.query.filter_by(status='active').all()
-                    if not active_players:
-                        logger.warning(f"Round {round_obj.round_number}: No active players found")
+                    # Check if tokens exist for eligible players
+                    eligible_players = self._get_eligible_players_for_round(round_obj)
+                    if not eligible_players:
+                        logger.warning(f"Round {round_obj.round_number}: No eligible players found")
                         continue
 
                     # Count how many tokens exist for this round
@@ -796,19 +815,19 @@ class LMSScheduler:
 
                     logger.info(
                         f"Round {round_obj.round_number}: {len(fixtures)} fixture(s), "
-                        f"{len(active_players)} active player(s), {token_count} token(s)"
+                        f"{len(eligible_players)} eligible player(s), {token_count} token(s)"
                     )
 
-                    # If tokens exist for all active players, activate the round
-                    if token_count >= len(active_players) and len(active_players) > 0:
+                    # If tokens exist for all eligible players, activate the round
+                    if token_count >= len(eligible_players) and len(eligible_players) > 0:
                         round_obj.status = 'active'
                         logger.info(
-                            f"Round {round_obj.round_number}: ACTIVATED (has {token_count} tokens for {len(active_players)} players)"
+                            f"Round {round_obj.round_number}: ACTIVATED (has {token_count} tokens for {len(eligible_players)} players)"
                         )
                     else:
                         logger.info(
                             f"Round {round_obj.round_number}: Not ready to activate "
-                            f"(needs {len(active_players)} tokens, has {token_count})"
+                            f"(needs {len(eligible_players)} tokens, has {token_count})"
                         )
 
                 # Step 2: Check active rounds for completion readiness
@@ -975,6 +994,58 @@ class LMSScheduler:
         """Reset game data for a new cycle (optional auto-reset)"""
         # This is optional - admin can manually trigger if preferred
         pass
+
+    def _get_eligible_players_for_round(self, round_obj):
+        """
+        Get eligible players for a round based on survival from previous rounds.
+
+        A player is eligible if:
+        1. Their global status is 'active' (not already globally eliminated/winner)
+        2. They have NOT been eliminated in any previous round of this cycle
+
+        This ensures that even if the elimination job hasn't updated player.status yet,
+        we still respect per-round eliminations when generating tokens/sending messages.
+        """
+        # Start with globally active players
+        all_active_players = Player.query.filter_by(status='active').all()
+
+        if not round_obj:
+            return all_active_players
+
+        cycle_number = round_obj.cycle_number or 1
+
+        # Get all picks from previous rounds in this cycle that resulted in elimination
+        eliminated_player_ids = set()
+
+        # Find all rounds in this cycle before the current round
+        previous_rounds = Round.query.filter(
+            Round.cycle_number == cycle_number,
+            Round.round_number < round_obj.round_number
+        ).all()
+
+        for prev_round in previous_rounds:
+            eliminated_picks = Pick.query.filter_by(
+                round_id=prev_round.id,
+                is_eliminated=True
+            ).all()
+
+            for pick in eliminated_picks:
+                eliminated_player_ids.add(pick.player_id)
+
+        # Filter out eliminated players
+        eligible_players = [
+            player for player in all_active_players
+            if player.id not in eliminated_player_ids
+        ]
+
+        logger.info(
+            f"Eligibility check for Round {round_obj.round_number}: "
+            f"globally_active={len(all_active_players)}, "
+            f"eliminated_in_previous_rounds={len(eliminated_player_ids)}, "
+            f"eligible={len(eligible_players)}"
+        )
+
+        return eligible_players
 
 
 # Create global scheduler instance
