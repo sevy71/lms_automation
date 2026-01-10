@@ -518,7 +518,16 @@ class LMSScheduler:
                 db.session.rollback()
 
     def send_new_round_announcements(self):
-        """Send initial round announcement to all players when new round starts"""
+        """Send initial round announcement to all players when new round starts.
+
+        Only sends to players who:
+        - Are eligible (active, not eliminated in previous rounds of this cycle)
+        - Have a telegram_chat_id
+        - Have NOT already submitted a pick for this round
+
+        This makes the job idempotent - running it multiple times will not
+        re-notify players who have already picked.
+        """
         with self.app.app_context():
             try:
                 logger.info("=== ROUND ANNOUNCEMENT JOB START ===")
@@ -534,10 +543,28 @@ class LMSScheduler:
                 for round_obj in active_rounds:
                     # Use eligibility check to respect per-round eliminations
                     eligible_players = self._get_eligible_players_for_round(round_obj)
-                    sent_count = 0
-                    skipped_missing = 0
+
+                    # Initialize counters for structured logging
+                    eligible_total = len(eligible_players)
+                    already_picked_skipped = 0
+                    skipped_missing_telegram = 0
+                    skipped_no_token = 0
+                    skipped_already_announced = 0
+                    sent = 0
+                    failed = 0
 
                     for player in eligible_players:
+                        # Check if player already has a pick for this round (idempotency check)
+                        if self._player_has_pick_for_round(player.id, round_obj.id):
+                            already_picked_skipped += 1
+                            logger.debug(
+                                "Skipping announcement for %s (player_id=%s): already has pick for round_id=%s",
+                                player.name,
+                                player.id,
+                                round_obj.id
+                            )
+                            continue
+
                         # Get pick token
                         pick_token = PickToken.query.filter_by(
                             player_id=player.id,
@@ -545,6 +572,7 @@ class LMSScheduler:
                         ).first()
 
                         if not pick_token:
+                            skipped_no_token += 1
                             continue
 
                         # Check if we've already sent the initial announcement
@@ -554,72 +582,87 @@ class LMSScheduler:
                             round_id=round_obj.id
                         ).first()
 
-                        # Only send if no reminders exist (meaning this is a brand new round for this player)
-                        if not existing_reminder:
-                            if not (hasattr(player, 'telegram_id') and player.telegram_id):
-                                skipped_missing += 1
-                                logger.warning(
-                                    "Skipping round announcement for %s (id=%s, phone=%s) missing telegram_chat_id",
-                                    player.name,
-                                    player.id,
-                                    player.whatsapp_number or "-"
-                                )
-                                continue
+                        if existing_reminder:
+                            skipped_already_announced += 1
+                            continue
 
-                            # Send initial announcement via Telegram
-                            pick_url = f"{os.environ.get('BASE_URL', 'http://localhost:5000')}/pick/{pick_token.token}"
-
-                            # Get deadline info
-                            if round_obj.first_kickoff_at:
-                                deadline_str = round_obj.first_kickoff_at.strftime('%A %d %B at %H:%M')
-                            else:
-                                deadline_str = "soon"
-
-                            message = f"⚽ NEW ROUND {round_obj.round_number} IS LIVE!\n\n"
-                            message += f"Make your pick before {deadline_str}"
-
-                            sent = self._send_telegram_message(
-                                player.telegram_id,
-                                message,
-                                button_url=pick_url,
-                                button_text="⚽ Make Your Pick"
+                        # Check for telegram_id
+                        if not (hasattr(player, 'telegram_id') and player.telegram_id):
+                            skipped_missing_telegram += 1
+                            logger.warning(
+                                "Skipping round announcement for %s (player_id=%s, phone=%s): missing telegram_chat_id",
+                                player.name,
+                                player.id,
+                                player.whatsapp_number or "-"
                             )
-                            if sent:
-                                sent_count += 1
-                                logger.info(f"Sent new round announcement to {player.name}")
+                            continue
 
-                                # Now schedule the reminders (4-hour and 2-hour)
-                                if round_obj.first_kickoff_at:
-                                    # 4-hour reminder
-                                    reminder_4h = ReminderSchedule(
-                                        player_id=player.id,
-                                        round_id=round_obj.id,
-                                        reminder_type='4_hour',
-                                        scheduled_time=round_obj.first_kickoff_at - timedelta(hours=4),
-                                        is_sent=False
-                                    )
-                                    db.session.add(reminder_4h)
+                        # Send initial announcement via Telegram
+                        pick_url = f"{os.environ.get('BASE_URL', 'http://localhost:5000')}/pick/{pick_token.token}"
 
-                                    # 2-hour reminder
-                                    reminder_2h = ReminderSchedule(
-                                        player_id=player.id,
-                                        round_id=round_obj.id,
-                                        reminder_type='2_hour',
-                                        scheduled_time=round_obj.first_kickoff_at - timedelta(hours=2),
-                                        is_sent=False
-                                    )
-                                    db.session.add(reminder_2h)
-                            else:
-                                logger.warning(
-                                    "Failed to send round announcement to %s (id=%s, phone=%s)",
-                                    player.name,
-                                    player.id,
-                                    player.whatsapp_number or "-"
+                        # Get deadline info
+                        if round_obj.first_kickoff_at:
+                            deadline_str = round_obj.first_kickoff_at.strftime('%A %d %B at %H:%M')
+                        else:
+                            deadline_str = "soon"
+
+                        message = f"⚽ NEW ROUND {round_obj.round_number} IS LIVE!\n\n"
+                        message += f"Make your pick before {deadline_str}"
+
+                        success = self._send_telegram_message(
+                            player.telegram_id,
+                            message,
+                            button_url=pick_url,
+                            button_text="⚽ Make Your Pick"
+                        )
+                        if success:
+                            sent += 1
+                            logger.info(f"Sent new round announcement to {player.name}")
+
+                            # Now schedule the reminders (4-hour and 2-hour)
+                            if round_obj.first_kickoff_at:
+                                # 4-hour reminder
+                                reminder_4h = ReminderSchedule(
+                                    player_id=player.id,
+                                    round_id=round_obj.id,
+                                    reminder_type='4_hour',
+                                    scheduled_time=round_obj.first_kickoff_at - timedelta(hours=4),
+                                    is_sent=False
                                 )
+                                db.session.add(reminder_4h)
 
+                                # 2-hour reminder
+                                reminder_2h = ReminderSchedule(
+                                    player_id=player.id,
+                                    round_id=round_obj.id,
+                                    reminder_type='2_hour',
+                                    scheduled_time=round_obj.first_kickoff_at - timedelta(hours=2),
+                                    is_sent=False
+                                )
+                                db.session.add(reminder_2h)
+                        else:
+                            failed += 1
+                            logger.warning(
+                                "Failed to send round announcement to %s (player_id=%s, phone=%s)",
+                                player.name,
+                                player.id,
+                                player.whatsapp_number or "-"
+                            )
+
+                    # Structured logging summary with all counts
                     logger.info(
-                        f"Round {round_obj.round_number} announcement summary: "
-                        f"sent={sent_count}, skipped_missing_telegram={skipped_missing}"
+                        "Round announcement summary: round_id=%s, round_number=%s, "
+                        "eligible_total=%s, already_picked_skipped=%s, skipped_no_token=%s, "
+                        "skipped_already_announced=%s, skipped_missing_telegram=%s, sent=%s, failed=%s",
+                        round_obj.id,
+                        round_obj.round_number,
+                        eligible_total,
+                        already_picked_skipped,
+                        skipped_no_token,
+                        skipped_already_announced,
+                        skipped_missing_telegram,
+                        sent,
+                        failed
                     )
 
                 db.session.commit()
@@ -1046,6 +1089,26 @@ class LMSScheduler:
         )
 
         return eligible_players
+
+    def _player_has_pick_for_round(self, player_id: int, round_id: int) -> bool:
+        """
+        Check if a player has already submitted a pick for a given round.
+
+        Used to ensure announcements are only sent to players who haven't picked yet,
+        making the announcement job idempotent.
+
+        Args:
+            player_id: The player's database ID
+            round_id: The round's database ID
+
+        Returns:
+            True if a pick exists for this player-round combination, False otherwise
+        """
+        existing_pick = Pick.query.filter_by(
+            player_id=player_id,
+            round_id=round_id
+        ).first()
+        return existing_pick is not None
 
 
 # Create global scheduler instance
