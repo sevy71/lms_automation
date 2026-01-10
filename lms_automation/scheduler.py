@@ -5,6 +5,7 @@ Handles periodic tasks for automated game management
 
 import os
 import logging
+import hashlib
 from datetime import datetime, timedelta, timezone
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
@@ -12,6 +13,7 @@ from flask import Flask
 from lms_automation.models import db, Round, Fixture, Pick, Player, ReminderSchedule, PickToken
 from lms_automation.football_api import FootballDataAPI
 from lms_automation.notifications import NotificationService
+from lms_automation.team_utils import normalize_team_name, teams_match, find_matching_picks_for_team
 import requests
 from typing import Optional
 
@@ -284,95 +286,250 @@ class LMSScheduler:
                 db.session.rollback()
 
     def _update_picks_for_fixture(self, fixture):
-        """Update pick results based on fixture outcome"""
+        """
+        Update pick results based on fixture outcome.
+
+        Uses normalized team name comparison to handle variations like:
+        - "Aston Villa FC" vs "Aston Villa" vs "Villa"
+
+        Competition rule: ONLY a WIN progresses. Draw or loss = eliminated.
+        """
         if fixture.home_score is None or fixture.away_score is None:
+            logger.debug(f"Fixture {fixture.home_team} vs {fixture.away_team}: scores not available yet")
             return
 
-        # Determine winning team
+        # Normalize fixture team names for comparison
+        home_team_canonical = normalize_team_name(fixture.home_team)
+        away_team_canonical = normalize_team_name(fixture.away_team)
+
+        # Get all picks for this round
+        all_picks = Pick.query.filter_by(round_id=fixture.round_id).all()
+
+        # Find picks that match this fixture (either team)
+        home_picks = [p for p in all_picks if normalize_team_name(p.team_picked) == home_team_canonical]
+        away_picks = [p for p in all_picks if normalize_team_name(p.team_picked) == away_team_canonical]
+
+        picks_updated = 0
+
+        # Determine match outcome
         if fixture.home_score > fixture.away_score:
-            winning_team = fixture.home_team
-        elif fixture.away_score > fixture.home_score:
-            winning_team = fixture.away_team
-        else:
-            # Draw - both teams are considered winners for LMS
-            drawn_teams = [fixture.home_team, fixture.away_team]
+            # Home team wins
+            winning_canonical = home_team_canonical
+            losing_canonical = away_team_canonical
+            outcome = 'home_win'
 
-            # Update picks for draws (draws eliminate picks)
-            picks = Pick.query.filter_by(round_id=fixture.round_id).filter(
-                Pick.team_picked.in_(drawn_teams)
-            ).all()
+            for pick in home_picks:
+                if pick.is_winner is None:
+                    pick.is_winner = True
+                    picks_updated += 1
+                    logger.info(
+                        f"PICK RESULT: player_id={pick.player_id} picked '{pick.team_picked}' "
+                        f"-> WIN (home win {fixture.home_score}-{fixture.away_score})"
+                    )
 
-            for pick in picks:
+            for pick in away_picks:
                 if pick.is_winner is None:
                     pick.is_winner = False
-            return
+                    picks_updated += 1
+                    logger.info(
+                        f"PICK RESULT: player_id={pick.player_id} picked '{pick.team_picked}' "
+                        f"-> LOSS (away loss {fixture.away_score}-{fixture.home_score})"
+                    )
 
-        # Update picks for wins/losses
-        picks = Pick.query.filter_by(round_id=fixture.round_id).all()
+        elif fixture.away_score > fixture.home_score:
+            # Away team wins
+            winning_canonical = away_team_canonical
+            losing_canonical = home_team_canonical
+            outcome = 'away_win'
 
-        for pick in picks:
-            if pick.team_picked == winning_team:
-                pick.is_winner = True
-            elif pick.team_picked in [fixture.home_team, fixture.away_team]:
-                pick.is_winner = False
+            for pick in away_picks:
+                if pick.is_winner is None:
+                    pick.is_winner = True
+                    picks_updated += 1
+                    logger.info(
+                        f"PICK RESULT: player_id={pick.player_id} picked '{pick.team_picked}' "
+                        f"-> WIN (away win {fixture.away_score}-{fixture.home_score})"
+                    )
+
+            for pick in home_picks:
+                if pick.is_winner is None:
+                    pick.is_winner = False
+                    picks_updated += 1
+                    logger.info(
+                        f"PICK RESULT: player_id={pick.player_id} picked '{pick.team_picked}' "
+                        f"-> LOSS (home loss {fixture.home_score}-{fixture.away_score})"
+                    )
+
+        else:
+            # DRAW - Competition rule: Draw = ELIMINATION (not a win)
+            outcome = 'draw'
+
+            for pick in home_picks:
+                if pick.is_winner is None:
+                    pick.is_winner = False  # Draw is NOT a win
+                    picks_updated += 1
+                    logger.info(
+                        f"PICK RESULT: player_id={pick.player_id} picked '{pick.team_picked}' "
+                        f"-> ELIMINATED (draw {fixture.home_score}-{fixture.away_score}) - DRAW IS NOT A WIN"
+                    )
+
+            for pick in away_picks:
+                if pick.is_winner is None:
+                    pick.is_winner = False  # Draw is NOT a win
+                    picks_updated += 1
+                    logger.info(
+                        f"PICK RESULT: player_id={pick.player_id} picked '{pick.team_picked}' "
+                        f"-> ELIMINATED (draw {fixture.away_score}-{fixture.home_score}) - DRAW IS NOT A WIN"
+                    )
+
+        logger.info(
+            f"Fixture {fixture.home_team} {fixture.home_score}-{fixture.away_score} {fixture.away_team}: "
+            f"outcome={outcome}, home_picks_count={len(home_picks)}, away_picks_count={len(away_picks)}, "
+            f"picks_updated={picks_updated}"
+        )
 
     def process_eliminations(self):
-        """Process eliminations for completed rounds and check for rollover"""
+        """
+        Process eliminations for completed rounds and check for rollover.
+
+        This job:
+        1. Checks if all fixtures in active rounds are completed
+        2. For each completed round, marks picks with is_winner=False as eliminated
+        3. Updates player.status to 'eliminated' for eliminated picks
+        4. Detects unmatched picks (picks that couldn't be matched to any fixture)
+        5. Checks for winner/rollover conditions
+        """
         with self.app.app_context():
             try:
+                logger.info("=" * 60)
                 logger.info("=== ELIMINATION PROCESSING JOB START ===")
+                logger.info("=" * 60)
 
                 # Get active rounds with all fixtures completed
                 active_rounds = Round.query.filter_by(status='active').all()
-                logger.info(f"Found {len(active_rounds)} active round(s) to check for elimination processing")
+                logger.info(f"Active rounds found: {len(active_rounds)}")
 
                 if not active_rounds:
                     logger.info("No active rounds found")
+                    logger.info("=== ELIMINATION PROCESSING JOB COMPLETE (no rounds) ===")
                     return
 
                 rounds_processed = 0
                 total_eliminations = 0
+                total_winners = 0
+                total_draws = 0
 
                 for round_obj in active_rounds:
+                    logger.info("-" * 40)
+                    logger.info(f"Processing Round {round_obj.round_number} (round_id={round_obj.id})")
+
                     # Check if all fixtures are completed
                     fixtures = Fixture.query.filter_by(round_id=round_obj.id).all()
                     completed_fixtures = [f for f in fixtures if f.status == 'completed']
+                    draw_fixtures = [f for f in completed_fixtures if f.home_score == f.away_score]
 
                     logger.info(
-                        f"Round {round_obj.round_number}: {len(completed_fixtures)}/{len(fixtures)} fixtures completed"
+                        f"  fixtures_total={len(fixtures)}, fixtures_completed={len(completed_fixtures)}, "
+                        f"fixtures_draw={len(draw_fixtures)}"
                     )
 
-                    if not fixtures or not all(f.status == 'completed' for f in fixtures):
-                        logger.info(f"Round {round_obj.round_number}: Not all fixtures completed yet, skipping")
+                    if not fixtures:
+                        logger.warning(f"  Round {round_obj.round_number}: No fixtures found, skipping")
                         continue
 
-                    # Process eliminations
-                    eliminated_count = 0
-                    eliminated_player_names = []
+                    if not all(f.status == 'completed' for f in fixtures):
+                        pending_fixtures = [f for f in fixtures if f.status != 'completed']
+                        logger.info(
+                            f"  Round {round_obj.round_number}: {len(pending_fixtures)} fixture(s) not completed, skipping"
+                        )
+                        for pf in pending_fixtures[:5]:  # Log first 5
+                            logger.info(f"    - {pf.home_team} vs {pf.away_team} (status={pf.status})")
+                        continue
 
-                    for pick in round_obj.picks:
+                    # Build set of all teams in fixtures (normalized)
+                    fixture_teams_canonical = set()
+                    for fx in fixtures:
+                        fixture_teams_canonical.add(normalize_team_name(fx.home_team))
+                        fixture_teams_canonical.add(normalize_team_name(fx.away_team))
+
+                    # Get all picks for this round
+                    picks = Pick.query.filter_by(round_id=round_obj.id).all()
+                    logger.info(f"  picks_total={len(picks)}")
+
+                    # Categorize picks
+                    eliminated_count = 0
+                    winners_count = 0
+                    unmatched_picks = []
+                    eliminated_players = []
+                    winning_players = []
+
+                    for pick in picks:
+                        pick_canonical = normalize_team_name(pick.team_picked)
+
+                        # Check if pick matches any fixture team
+                        if pick_canonical not in fixture_teams_canonical:
+                            unmatched_picks.append({
+                                'pick_id': pick.id,
+                                'player_id': pick.player_id,
+                                'player_name': pick.player.name,
+                                'team_picked': pick.team_picked,
+                                'team_canonical': pick_canonical,
+                            })
+                            # Unmatched pick = cannot win = eliminated
+                            if pick.is_winner is None:
+                                pick.is_winner = False
+                                logger.warning(
+                                    f"  UNMATCHED PICK: player_id={pick.player_id} ({pick.player.name}) "
+                                    f"picked '{pick.team_picked}' (canonical: '{pick_canonical}') "
+                                    f"which doesn't match any fixture team - marking as LOSS"
+                                )
+
+                        # Process elimination based on is_winner status
                         if pick.is_winner == False and not pick.is_eliminated:
                             pick.is_eliminated = True
                             pick.player.status = 'eliminated'
                             eliminated_count += 1
-                            eliminated_player_names.append(f"{pick.player.name}(id={pick.player.id})")
-                            logger.debug(
-                                f"Marked player '{pick.player.name}' (id={pick.player.id}) as eliminated "
-                                f"(Round {round_obj.round_number}, pick={pick.team_picked})"
+                            eliminated_players.append(f"{pick.player.name}(id={pick.player.id}, pick={pick.team_picked})")
+
+                        elif pick.is_winner == True:
+                            winners_count += 1
+                            winning_players.append(f"{pick.player.name}(id={pick.player.id}, pick={pick.team_picked})")
+
+                        elif pick.is_winner is None:
+                            # This shouldn't happen if fixtures are complete and matching works
+                            logger.warning(
+                                f"  PICK NOT EVALUATED: player_id={pick.player_id} ({pick.player.name}) "
+                                f"picked '{pick.team_picked}' still has is_winner=None after fixture completion"
                             )
 
-                    if eliminated_count > 0:
-                        logger.info(
-                            f"Round {round_obj.round_number}: Eliminated {eliminated_count} player(s): "
-                            f"{', '.join(eliminated_player_names)}"
-                        )
-                        total_eliminations += eliminated_count
-                    else:
-                        logger.info(f"Round {round_obj.round_number}: No new eliminations")
+                    # Log summary for this round
+                    logger.info(
+                        f"  ROUND {round_obj.round_number} SUMMARY: "
+                        f"picks_evaluated={len(picks)}, winners={winners_count}, "
+                        f"eliminated={eliminated_count}, unmatched={len(unmatched_picks)}"
+                    )
+
+                    if unmatched_picks:
+                        logger.warning(f"  UNMATCHED PICKS DETAIL:")
+                        for up in unmatched_picks:
+                            logger.warning(
+                                f"    - pick_id={up['pick_id']}, player={up['player_name']}, "
+                                f"team_picked='{up['team_picked']}', canonical='{up['team_canonical']}'"
+                            )
+
+                    if eliminated_players:
+                        logger.info(f"  Eliminated players: {', '.join(eliminated_players)}")
+
+                    if winning_players:
+                        logger.info(f"  Winning players: {', '.join(winning_players)}")
+
+                    total_eliminations += eliminated_count
+                    total_winners += winners_count
+                    total_draws += len(draw_fixtures)
 
                     # Mark round as completed
                     round_obj.status = 'completed'
-                    logger.info(f"Round {round_obj.round_number}: Marked as COMPLETED")
+                    logger.info(f"  Round {round_obj.round_number}: Marked as COMPLETED")
 
                     # Check for game state changes
                     self._check_game_state(round_obj)
@@ -380,19 +537,30 @@ class LMSScheduler:
 
                 db.session.commit()
 
-                # Verify player statuses were updated
+                # Final summary
                 active_count = Player.query.filter_by(status='active').count()
                 eliminated_count_db = Player.query.filter_by(status='eliminated').count()
+                winner_count_db = Player.query.filter_by(status='winner').count()
+
+                logger.info("-" * 40)
                 logger.info(
-                    f"=== ELIMINATION PROCESSING COMPLETE: {rounds_processed} round(s) processed, "
-                    f"{total_eliminations} player(s) eliminated ==="
+                    f"=== ELIMINATION PROCESSING COMPLETE: rounds_processed={rounds_processed}, "
+                    f"total_eliminations={total_eliminations}, total_winners={total_winners}, "
+                    f"total_draw_fixtures={total_draws} ==="
                 )
                 logger.info(
-                    f"Current player status counts: active={active_count}, eliminated={eliminated_count_db}"
+                    f"Player status counts: active={active_count}, eliminated={eliminated_count_db}, "
+                    f"winner={winner_count_db}"
                 )
+                logger.info("=" * 60)
 
             except Exception as e:
+                logger.error("=" * 60)
+                logger.error("=== ELIMINATION PROCESSING JOB FAILED ===")
                 logger.error(f"Error processing eliminations: {e}")
+                import traceback
+                logger.error(f"Traceback:\n{traceback.format_exc()}")
+                logger.error("=" * 60)
                 db.session.rollback()
 
     def _check_game_state(self, completed_round):
@@ -959,29 +1127,83 @@ class LMSScheduler:
                 db.session.rollback()
 
     def _get_auto_pick_team(self, player, round_obj):
-        """Get auto-pick team for a player (simplified version)"""
-        # Get teams in round and teams already used
-        fixtures = Fixture.query.filter_by(round_id=round_obj.id).all()
-        teams_in_round = set()
-        for fixture in fixtures:
-            teams_in_round.add(fixture.home_team)
-            teams_in_round.add(fixture.away_team)
+        """
+        Get auto-pick team for a player.
 
-        # Get teams used by player in this cycle
-        used_teams = set()
+        Selection algorithm:
+        1. Get all teams playing in this round (from fixtures)
+        2. Get teams already used by this player in this cycle (normalized comparison)
+        3. Available = teams in round that haven't been used
+        4. Use deterministic but distributed selection: hash(player_id + round_id) to pick index
+
+        This ensures:
+        - Different players get different teams (distributed)
+        - Same player always gets same team if re-run (deterministic/idempotent)
+        - No fallback to a single team like "Bournemouth" for everyone
+        """
+        # Get teams in round (from fixtures)
+        fixtures = Fixture.query.filter_by(round_id=round_obj.id).all()
+        teams_in_round_raw = set()
+        for fixture in fixtures:
+            teams_in_round_raw.add(fixture.home_team)
+            teams_in_round_raw.add(fixture.away_team)
+
+        # Normalize round teams to canonical names
+        teams_in_round_canonical = {normalize_team_name(t) for t in teams_in_round_raw}
+
+        # Get teams used by player in this cycle (normalized)
+        used_teams_canonical = set()
         picks = Pick.query.filter_by(player_id=player.id).join(Round).filter(
             Round.cycle_number == (round_obj.cycle_number or 1)
         ).all()
         for pick in picks:
-            used_teams.add(pick.team_picked)
+            used_teams_canonical.add(normalize_team_name(pick.team_picked))
 
-        # Available teams
-        available = teams_in_round - used_teams
+        # Available teams (canonical names)
+        available_canonical = teams_in_round_canonical - used_teams_canonical
 
-        if available:
-            # Return first available team alphabetically
-            return sorted(available)[0]
-        return None
+        logger.info(
+            f"  Auto-pick for player_id={player.id} ({player.name}): "
+            f"teams_in_round={len(teams_in_round_canonical)}, "
+            f"teams_used={len(used_teams_canonical)}, "
+            f"available={len(available_canonical)}"
+        )
+
+        if not available_canonical:
+            logger.warning(
+                f"  No available teams for player_id={player.id} ({player.name}) - "
+                f"all {len(teams_in_round_canonical)} teams in round have been used"
+            )
+            return None
+
+        # Sort for deterministic ordering
+        available_sorted = sorted(available_canonical)
+
+        # Use hash to distribute picks across players
+        # Hash of (player_id, round_id) gives a stable but distributed index
+        hash_input = f"{player.id}_{round_obj.id}".encode()
+        hash_value = int(hashlib.md5(hash_input).hexdigest(), 16)
+        index = hash_value % len(available_sorted)
+
+        selected_canonical = available_sorted[index]
+
+        # Map back to the actual fixture team name for storage
+        # (we want to store the same format as fixtures for consistency)
+        selected_fixture_name = None
+        for raw_name in teams_in_round_raw:
+            if normalize_team_name(raw_name) == selected_canonical:
+                selected_fixture_name = raw_name
+                break
+
+        if not selected_fixture_name:
+            selected_fixture_name = selected_canonical
+
+        logger.info(
+            f"  Auto-pick selected: player_id={player.id} -> '{selected_fixture_name}' "
+            f"(canonical: '{selected_canonical}', index={index}/{len(available_sorted)})"
+        )
+
+        return selected_fixture_name
 
     def _send_telegram_message(self, telegram_id, message, button_url=None, button_text="Make Your Pick"):
         """Send message via Telegram bot with optional inline button"""

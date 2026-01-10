@@ -1,70 +1,35 @@
-"""Team-related helpers shared across blueprints."""
+"""Team-related helpers shared across blueprints.
+
+This module re-exports from the centralized team_utils module to maintain
+backwards compatibility while ensuring a single source of truth for team names.
+"""
 
 from __future__ import annotations
 
-TEAM_DISPLAY_NAMES: dict[str, str] = {
-    'arsenal': 'Arsenal',
-    'arsenal fc': 'Arsenal',
-    'aston villa': 'Villa',
-    'aston villa fc': 'Villa',
-    'afc bournemouth': 'Bournmouth',
-    'bournemouth': 'Bournmouth',
-    'bournemouth afc': 'Bournmouth',
-    'brentford': 'Brentford',
-    'brentford fc': 'Brentford',
-    'brighton': 'Brighton',
-    'brighton & hove albion': 'Brighton',
-    'brighton and hove albion': 'Brighton',
-    'brighton hove albion': 'Brighton',
-    'burnley': 'Burnley',
-    'burnley fc': 'Burnley',
-    'chelsea': 'Chelsea',
-    'chelsea fc': 'Chelsea',
-    'crystal palace': 'Palace',
-    'crystal palace fc': 'Palace',
-    'palace': 'Palace',
-    'everton': 'Everton',
-    'everton fc': 'Everton',
-    'fulham': 'Fulham',
-    'fulham fc': 'Fulham',
-    'leeds': 'Leeds',
-    'leeds united': 'Leeds',
-    'leeds united fc': 'Leeds',
-    'liverpool': 'Liverpool',
-    'liverpool fc': 'Liverpool',
-    'manchester city': 'Man City',
-    'manchester city fc': 'Man City',
-    'man city': 'Man City',
-    'manchester united': 'Man UTD',
-    'manchester united fc': 'Man UTD',
-    'man united': 'Man UTD',
-    'newcastle': 'Newcastle',
-    'newcastle united': 'Newcastle',
-    'newcastle united fc': 'Newcastle',
-    'nottingham forest': 'Forest',
-    'nottm forest': 'Forest',
-    'forest': 'Forest',
-    'sunderland': 'Sunderland',
-    'sunderland afc': 'Sunderland',
-    'tottenham': 'Spurs',
-    'tottenham hotspur': 'Spurs',
-    'tottenham hotspur fc': 'Spurs',
-    'spurs': 'Spurs',
-    'west ham': 'West Ham',
-    'west ham united': 'West Ham',
-    'west ham united fc': 'West Ham',
-    'wolverhampton wanderers': 'Wolves',
-    'wolverhampton': 'Wolves',
-    'wolves': 'Wolves',
-}
+# Import from centralized team_utils for consistency
+from lms_automation.team_utils import (
+    display_name,
+    normalize_team_name,
+    teams_match,
+    CANONICAL_TEAMS,
+)
+
+# Backwards compatibility: expose TEAM_DISPLAY_NAMES
+# This is now derived from the centralized module
+from lms_automation.team_utils import _DISPLAY_NAMES, _TEAM_ALIASES
+
+# Build TEAM_DISPLAY_NAMES for backwards compatibility
+# Maps lowercase variants to display names
+TEAM_DISPLAY_NAMES: dict[str, str] = {}
+for alias, canonical in _TEAM_ALIASES.items():
+    display = _DISPLAY_NAMES.get(canonical, canonical)
+    TEAM_DISPLAY_NAMES[alias] = display
 
 
-def display_name(team_name: str | None) -> str:
-    """Return the preferred display label for a team."""
-    if not team_name:
-        return ''
-    trimmed = team_name.strip()
-    return TEAM_DISPLAY_NAMES.get(trimmed.lower(), trimmed)
-
-
-__all__ = ["display_name", "TEAM_DISPLAY_NAMES"]
+__all__ = [
+    "display_name",
+    "normalize_team_name",
+    "teams_match",
+    "TEAM_DISPLAY_NAMES",
+    "CANONICAL_TEAMS",
+]
