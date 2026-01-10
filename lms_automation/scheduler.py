@@ -97,14 +97,17 @@ class LMSScheduler:
             )
 
             # Apply missed picks at round deadline
+            # Use shorter interval (5 min prod, 1 min test) to catch deadlines promptly
+            autopick_interval_minutes = int(os.environ.get('AUTOPICK_INTERVAL_MINUTES', '5'))
             self.scheduler.add_job(
                 func=self.apply_missed_picks,
-                trigger=IntervalTrigger(hours=1),
+                trigger=IntervalTrigger(minutes=autopick_interval_minutes),
                 id='apply_missed_picks',
                 name='Apply auto-picks for players who missed deadline',
                 next_run_time=datetime.now(),
                 replace_existing=True
             )
+            logger.info(f"Auto-pick job configured with {autopick_interval_minutes}-minute interval")
 
             # Orchestrator job - ensures proper round progression
             self.scheduler.add_job(
@@ -118,6 +121,9 @@ class LMSScheduler:
 
             self.scheduler.start()
             logger.info("Scheduler started with all jobs configured")
+
+            # Log all registered jobs for verification
+            self._log_registered_jobs()
 
     def stop(self):
         """Stop the scheduler"""
@@ -732,27 +738,45 @@ class LMSScheduler:
                 db.session.rollback()
 
     def apply_missed_picks(self):
-        """Apply auto-picks for players who missed the deadline"""
+        """Apply auto-picks for players who missed the deadline.
+
+        This job checks all active rounds and creates auto-picks for any player
+        who is eligible but has not submitted a pick after the deadline (1 hour
+        before first kickoff).
+
+        Important: This does NOT require telegram_chat_id or pick tokens.
+        It only requires players.status='active' and no existing pick for the round.
+        """
         with self.app.app_context():
             try:
+                logger.info("=" * 60)
                 logger.info("=== AUTO-PICK JOB START ===")
+                logger.info("=" * 60)
 
                 # Always use UTC for consistency
                 now = datetime.utcnow()
-                logger.info(f"Current time (UTC): {now}")
+                logger.info(f"now_utc = {now.strftime('%Y-%m-%d %H:%M:%S')} UTC")
 
                 active_rounds = Round.query.filter_by(status='active').all()
-                logger.info(f"Found {len(active_rounds)} active round(s) to check for missed picks")
+                logger.info(f"Active rounds found: {len(active_rounds)}")
 
                 if not active_rounds:
-                    logger.info("No active rounds found")
+                    logger.info("No active rounds found, nothing to do")
+                    logger.info("=== AUTO-PICK JOB COMPLETE (no rounds) ===")
                     return
 
-                auto_picks_applied = 0
+                total_auto_picks_applied = 0
 
                 for round_obj in active_rounds:
+                    logger.info("-" * 40)
+                    logger.info(f"Checking Round {round_obj.round_number} (round_id={round_obj.id})")
+
+                    # Determine first kickoff time
                     kickoff = round_obj.first_kickoff_at
+                    kickoff_source = "first_kickoff_at field"
+
                     if not kickoff:
+                        # Fallback: calculate from fixtures
                         fixtures = Fixture.query.filter_by(round_id=round_obj.id).all()
                         kickoff = None
                         for fixture in fixtures:
@@ -760,67 +784,101 @@ class LMSScheduler:
                                 dt = datetime.combine(fixture.date, fixture.time)
                                 if kickoff is None or dt < kickoff:
                                     kickoff = dt
+                        kickoff_source = "calculated from fixtures"
 
                     if not kickoff:
-                        logger.info(
-                            f"Round {round_obj.round_number}: No kickoff time available, skipping auto-picks"
+                        logger.warning(
+                            f"  Round {round_obj.round_number}: No kickoff time available, SKIPPING"
                         )
                         continue
 
-                    # Ensure kickoff is timezone-aware UTC (or convert naive to UTC)
-                    if kickoff.tzinfo is None:
-                        kickoff = kickoff.replace(tzinfo=timezone.utc)
-                    else:
-                        kickoff = kickoff.astimezone(timezone.utc).replace(tzinfo=None)
+                    # Ensure kickoff is naive UTC for comparison
+                    if kickoff.tzinfo is not None:
+                        kickoff = kickoff.replace(tzinfo=None)
 
                     deadline = kickoff - timedelta(hours=1)
 
-                    logger.info(
-                        f"Round {round_obj.round_number}: Kickoff={kickoff} (UTC), Deadline={deadline} (UTC), Now={now} (UTC)"
-                    )
+                    logger.info(f"  first_kickoff_utc = {kickoff.strftime('%Y-%m-%d %H:%M:%S')} ({kickoff_source})")
+                    logger.info(f"  deadline_utc      = {deadline.strftime('%Y-%m-%d %H:%M:%S')} (kickoff - 1 hour)")
+                    logger.info(f"  now_utc           = {now.strftime('%Y-%m-%d %H:%M:%S')}")
 
-                    if now >= deadline:
-                        # Get eligible players without picks
-                        eligible_players = self._get_eligible_players_for_round(round_obj)
+                    deadline_passed = now >= deadline
+                    logger.info(f"  deadline_passed   = {deadline_passed}")
 
-                        for player in eligible_players:
-                            existing_pick = Pick.query.filter_by(
+                    if not deadline_passed:
+                        time_until = deadline - now
+                        logger.info(f"  Deadline not reached. Time remaining: {time_until}")
+                        continue
+
+                    # Get eligible players (status='active', not eliminated in prior rounds)
+                    eligible_players = self._get_eligible_players_for_round(round_obj)
+                    logger.info(f"  eligible_players_count = {len(eligible_players)}")
+
+                    # Find players missing picks
+                    missing_pick_players = []
+                    for player in eligible_players:
+                        existing_pick = Pick.query.filter_by(
+                            player_id=player.id,
+                            round_id=round_obj.id
+                        ).first()
+                        if not existing_pick:
+                            missing_pick_players.append(player)
+
+                    missing_pick_count = len(missing_pick_players)
+                    logger.info(f"  missing_pick_count = {missing_pick_count}")
+
+                    if missing_pick_count == 0:
+                        logger.info(f"  All eligible players have picks. Nothing to auto-pick.")
+                        continue
+
+                    # Log details of players needing auto-picks
+                    logger.info(f"  Players needing auto-pick:")
+                    for p in missing_pick_players:
+                        telegram_status = "has telegram_id" if p.telegram_id else "NO telegram_id"
+                        logger.info(f"    - {p.name} (player_id={p.id}, {telegram_status})")
+
+                    # Apply auto-picks
+                    round_auto_picks = 0
+                    for player in missing_pick_players:
+                        auto_team = self._get_auto_pick_team(player, round_obj)
+
+                        if auto_team:
+                            pick = Pick(
                                 player_id=player.id,
-                                round_id=round_obj.id
-                            ).first()
+                                round_id=round_obj.id,
+                                team_picked=auto_team,
+                                auto_assigned=True,
+                                auto_reason='missed_deadline',
+                                timestamp=now
+                            )
+                            db.session.add(pick)
+                            logger.info(
+                                f"  AUTO-PICK CREATED: player='{player.name}' (id={player.id}) -> "
+                                f"team='{auto_team}' for Round {round_obj.round_number}"
+                            )
+                            round_auto_picks += 1
+                        else:
+                            logger.warning(
+                                f"  FAILED: No eligible team for player '{player.name}' (id={player.id}) - "
+                                f"Round {round_obj.round_number} (all teams may be used)"
+                            )
 
-                            if not existing_pick:
-                                # Apply auto-pick logic (from existing code)
-                                auto_team = self._get_auto_pick_team(player, round_obj)
-
-                                if auto_team:
-                                    pick = Pick(
-                                        player_id=player.id,
-                                        round_id=round_obj.id,
-                                        team_picked=auto_team,
-                                        auto_assigned=True,
-                                        auto_reason='missed_deadline',
-                                        timestamp=now
-                                    )
-                                    db.session.add(pick)
-                                    logger.info(
-                                        f"Auto-picked '{auto_team}' for player '{player.name}' (id={player.id}) - Round {round_obj.round_number}"
-                                    )
-                                    auto_picks_applied += 1
-                                else:
-                                    logger.warning(
-                                        f"Could not find eligible team for auto-pick: player '{player.name}' (id={player.id}) - Round {round_obj.round_number}"
-                                    )
-                    else:
-                        logger.info(
-                            f"Round {round_obj.round_number}: Deadline not reached yet (deadline={deadline}, now={now})"
-                        )
+                    total_auto_picks_applied += round_auto_picks
+                    logger.info(f"  Round {round_obj.round_number} summary: {round_auto_picks} auto-pick(s) created")
 
                 db.session.commit()
-                logger.info(f"=== AUTO-PICK JOB COMPLETE: {auto_picks_applied} auto-pick(s) applied ===")
+                logger.info("-" * 40)
+                logger.info(f"=== AUTO-PICK JOB COMPLETE ===")
+                logger.info(f"autopicks_created_count = {total_auto_picks_applied}")
+                logger.info("=" * 60)
 
             except Exception as e:
+                logger.error("=" * 60)
+                logger.error("=== AUTO-PICK JOB FAILED ===")
                 logger.error(f"Error applying missed picks: {e}")
+                import traceback
+                logger.error(f"Traceback:\n{traceback.format_exc()}")
+                logger.error("=" * 60)
                 db.session.rollback()
 
     def round_progression_orchestrator(self):
@@ -1037,6 +1095,23 @@ class LMSScheduler:
         """Reset game data for a new cycle (optional auto-reset)"""
         # This is optional - admin can manually trigger if preferred
         pass
+
+    def _log_registered_jobs(self):
+        """Log all registered scheduler jobs with their configuration"""
+        logger.info("=" * 60)
+        logger.info("REGISTERED SCHEDULER JOBS:")
+        logger.info("=" * 60)
+        jobs = self.scheduler.get_jobs()
+        for job in jobs:
+            trigger_str = str(job.trigger)
+            next_run = job.next_run_time.strftime('%Y-%m-%d %H:%M:%S %Z') if job.next_run_time else 'None'
+            logger.info(
+                f"  Job ID: {job.id} | Name: {job.name} | "
+                f"Trigger: {trigger_str} | Next Run: {next_run}"
+            )
+        logger.info("=" * 60)
+        logger.info(f"Total jobs registered: {len(jobs)}")
+        logger.info("=" * 60)
 
     def _get_eligible_players_for_round(self, round_obj):
         """
