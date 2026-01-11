@@ -796,30 +796,44 @@ def _earliest_kickoff_for_round(round_obj: Round):
         return None
 
 def _eligible_teams_for_round(round_obj: Round):
-    """Return the set of team names playing in this round."""
+    """Return the set of CANONICAL team names playing in this round.
+
+    All team names are normalized to ensure consistent comparison
+    and alphabetical ordering (e.g., 'AFC Bournemouth' -> 'Bournemouth').
+    """
     teams = set()
     for fx in round_obj.fixtures or []:
         if fx.home_team:
-            teams.add(fx.home_team)
+            teams.add(_normalize_team(fx.home_team))
         if fx.away_team:
-            teams.add(fx.away_team)
+            teams.add(_normalize_team(fx.away_team))
     return teams
 
 def _teams_used_this_cycle(player_id: int, cycle_number: int):
-    """Return a set of team names the player has used in the current cycle."""
+    """Return a set of CANONICAL team names the player has used in the current cycle.
+
+    All team names are normalized to ensure consistent comparison
+    (e.g., if player picked 'AFC Bournemouth', it returns 'Bournemouth').
+    """
     picks = Pick.query.filter_by(player_id=player_id).join(Round).filter(Round.cycle_number == cycle_number).all()
-    return {p.team_picked for p in picks}
+    return {_normalize_team(p.team_picked) for p in picks}
 
 def _opposing_team_from_past_pick(pick: Pick) -> str:
-    """Find the opposing team for a given past pick, using that pick's round fixtures."""
+    """Find the opposing team (CANONICAL name) for a given past pick.
+
+    Uses teams_match() for comparison to handle name variations like
+    'AFC Bournemouth' vs 'Bournemouth'.
+    Returns the CANONICAL opponent team name.
+    """
     try:
         r = pick.round
         fixtures = r.fixtures or []
+        pick_team_canonical = _normalize_team(pick.team_picked)
         for fx in fixtures:
-            if fx.home_team == pick.team_picked:
-                return fx.away_team
-            if fx.away_team == pick.team_picked:
-                return fx.home_team
+            if _normalize_team(fx.home_team) == pick_team_canonical:
+                return _normalize_team(fx.away_team)
+            if _normalize_team(fx.away_team) == pick_team_canonical:
+                return _normalize_team(fx.home_team)
         return None
     except Exception:
         return None
@@ -3539,10 +3553,14 @@ def submit_pick_api():
     try:
         data = request.json
         token = data.get('token')
-        team_picked = data.get('team')
+        team_picked_raw = data.get('team')
 
-        if not token or not team_picked:
+        if not token or not team_picked_raw:
             return jsonify({'success': False, 'error': 'Token and team are required'}), 400
+
+        # Normalize the team name to canonical form
+        # This ensures 'AFC Bournemouth' -> 'Bournemouth', etc.
+        team_picked = _normalize_team(team_picked_raw)
 
         # Find the pick token
         pick_token = PickToken.query.filter_by(token=token).first()
@@ -3561,12 +3579,12 @@ def submit_pick_api():
         player = pick_token.player
         round_obj = pick_token.round
 
-        # Validate team is available
-        teams_in_round = _teams_in_round(round_obj.id)
+        # Validate team is available (both sets are canonical names)
+        teams_in_round = _eligible_teams_for_round(round_obj)
         if team_picked not in teams_in_round:
             return jsonify({'success': False, 'error': f'{team_picked} is not playing in this round'}), 400
 
-        # Check if team already used by player in this cycle
+        # Check if team already used by player in this cycle (both are canonical)
         used_teams = _teams_used_this_cycle(player.id, round_obj.cycle_number or 1)
         if team_picked in used_teams:
             return jsonify({'success': False, 'error': f'You have already used {team_picked} in this cycle'}), 400
@@ -3578,12 +3596,12 @@ def submit_pick_api():
         ).first()
 
         if pick:
-            # Update existing pick
+            # Update existing pick - store CANONICAL name
             pick.team_picked = team_picked
             pick.last_edited_at = datetime.now()
             message = f'Pick updated to {team_picked} for Round {round_obj.round_number}'
         else:
-            # Create new pick
+            # Create new pick - store CANONICAL name
             pick = Pick(
                 player_id=player.id,
                 round_id=round_obj.id,
@@ -4368,6 +4386,213 @@ def admin_test_status():
 
     except Exception as e:
         app.logger.error(f"Error in test_status: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+# --- Team Name Backfill ---
+@app.route('/admin/backfill_team_names', methods=['POST'])
+@admin_required
+def backfill_team_names():
+    """
+    SAFE, IDEMPOTENT backfill to normalize all team names to canonical form.
+
+    This endpoint:
+    1. Scans all fixtures and converts team names to canonical form
+    2. Scans all picks and converts team names to canonical form
+    3. Logs every change made
+    4. Can be run multiple times safely (idempotent)
+
+    Use dry_run=true to preview changes without modifying data.
+
+    Example:
+        POST /admin/backfill_team_names?dry_run=true
+        POST /admin/backfill_team_names
+    """
+    try:
+        dry_run = str(request.args.get('dry_run', 'false')).lower() in ('1', 'true', 'yes', 'y')
+
+        changes = {
+            'fixtures': [],
+            'picks': [],
+            'summary': {
+                'fixtures_scanned': 0,
+                'fixtures_updated': 0,
+                'picks_scanned': 0,
+                'picks_updated': 0
+            }
+        }
+
+        app.logger.info(f"=== TEAM NAME BACKFILL START (dry_run={dry_run}) ===")
+
+        # Step 1: Backfill fixtures
+        all_fixtures = Fixture.query.all()
+        changes['summary']['fixtures_scanned'] = len(all_fixtures)
+
+        for fixture in all_fixtures:
+            home_canonical = _normalize_team(fixture.home_team)
+            away_canonical = _normalize_team(fixture.away_team)
+
+            home_changed = fixture.home_team != home_canonical
+            away_changed = fixture.away_team != away_canonical
+
+            if home_changed or away_changed:
+                change_record = {
+                    'fixture_id': fixture.id,
+                    'round_id': fixture.round_id,
+                    'changes': []
+                }
+
+                if home_changed:
+                    change_record['changes'].append({
+                        'field': 'home_team',
+                        'old': fixture.home_team,
+                        'new': home_canonical
+                    })
+                    app.logger.info(
+                        f"  Fixture {fixture.id}: home_team '{fixture.home_team}' -> '{home_canonical}'"
+                    )
+                    if not dry_run:
+                        fixture.home_team = home_canonical
+
+                if away_changed:
+                    change_record['changes'].append({
+                        'field': 'away_team',
+                        'old': fixture.away_team,
+                        'new': away_canonical
+                    })
+                    app.logger.info(
+                        f"  Fixture {fixture.id}: away_team '{fixture.away_team}' -> '{away_canonical}'"
+                    )
+                    if not dry_run:
+                        fixture.away_team = away_canonical
+
+                changes['fixtures'].append(change_record)
+                changes['summary']['fixtures_updated'] += 1
+
+        # Step 2: Backfill picks
+        all_picks = Pick.query.all()
+        changes['summary']['picks_scanned'] = len(all_picks)
+
+        for pick in all_picks:
+            team_canonical = _normalize_team(pick.team_picked)
+
+            if pick.team_picked != team_canonical:
+                change_record = {
+                    'pick_id': pick.id,
+                    'player_id': pick.player_id,
+                    'round_id': pick.round_id,
+                    'old': pick.team_picked,
+                    'new': team_canonical
+                }
+                changes['picks'].append(change_record)
+                changes['summary']['picks_updated'] += 1
+
+                app.logger.info(
+                    f"  Pick {pick.id} (player={pick.player_id}, round={pick.round_id}): "
+                    f"'{pick.team_picked}' -> '{team_canonical}'"
+                )
+
+                if not dry_run:
+                    pick.team_picked = team_canonical
+
+        # Commit changes
+        if not dry_run:
+            db.session.commit()
+            app.logger.info(
+                f"=== TEAM NAME BACKFILL COMPLETE: "
+                f"{changes['summary']['fixtures_updated']} fixtures, "
+                f"{changes['summary']['picks_updated']} picks updated ==="
+            )
+        else:
+            app.logger.info(
+                f"=== TEAM NAME BACKFILL DRY RUN COMPLETE: "
+                f"WOULD update {changes['summary']['fixtures_updated']} fixtures, "
+                f"{changes['summary']['picks_updated']} picks ==="
+            )
+
+        return jsonify({
+            'success': True,
+            'dry_run': dry_run,
+            'changes': changes
+        })
+
+    except Exception as e:
+        db.session.rollback()
+        app.logger.error(f"Error in backfill_team_names: {str(e)}")
+        import traceback
+        app.logger.error(traceback.format_exc())
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/admin/verify_team_names', methods=['GET'])
+@admin_required
+def verify_team_names():
+    """
+    Verification endpoint to check for any non-canonical team names.
+
+    Returns counts of any fixtures or picks that still have non-canonical names.
+    After a successful backfill, all counts should be zero.
+    """
+    try:
+        # Check fixtures
+        non_canonical_fixtures = []
+        all_fixtures = Fixture.query.all()
+
+        for fixture in all_fixtures:
+            home_canonical = _normalize_team(fixture.home_team)
+            away_canonical = _normalize_team(fixture.away_team)
+
+            if fixture.home_team != home_canonical or fixture.away_team != away_canonical:
+                non_canonical_fixtures.append({
+                    'fixture_id': fixture.id,
+                    'round_id': fixture.round_id,
+                    'home_team': fixture.home_team,
+                    'home_canonical': home_canonical,
+                    'away_team': fixture.away_team,
+                    'away_canonical': away_canonical
+                })
+
+        # Check picks
+        non_canonical_picks = []
+        all_picks = Pick.query.all()
+
+        for pick in all_picks:
+            team_canonical = _normalize_team(pick.team_picked)
+
+            if pick.team_picked != team_canonical:
+                non_canonical_picks.append({
+                    'pick_id': pick.id,
+                    'player_id': pick.player_id,
+                    'round_id': pick.round_id,
+                    'team_picked': pick.team_picked,
+                    'canonical': team_canonical
+                })
+
+        # Specific check for "AFC Bournemouth" (the main bug)
+        afc_bournemouth_fixtures = Fixture.query.filter(
+            (Fixture.home_team == 'AFC Bournemouth') |
+            (Fixture.away_team == 'AFC Bournemouth')
+        ).count()
+
+        afc_bournemouth_picks = Pick.query.filter_by(team_picked='AFC Bournemouth').count()
+
+        return jsonify({
+            'success': True,
+            'verification': {
+                'fixtures_total': len(all_fixtures),
+                'fixtures_non_canonical': len(non_canonical_fixtures),
+                'picks_total': len(all_picks),
+                'picks_non_canonical': len(non_canonical_picks),
+                'afc_bournemouth_fixtures': afc_bournemouth_fixtures,
+                'afc_bournemouth_picks': afc_bournemouth_picks,
+                'all_canonical': len(non_canonical_fixtures) == 0 and len(non_canonical_picks) == 0
+            },
+            'non_canonical_fixtures': non_canonical_fixtures[:20],  # Limit to 20 for response size
+            'non_canonical_picks': non_canonical_picks[:20]
+        })
+
+    except Exception as e:
+        app.logger.error(f"Error in verify_team_names: {str(e)}")
         return jsonify({'success': False, 'error': str(e)}), 500
 
 

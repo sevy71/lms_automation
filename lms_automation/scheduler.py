@@ -1487,6 +1487,11 @@ class LMSScheduler:
         """
         Get auto-pick team for a player who missed the deadline.
 
+        IMPORTANT: All team names are CANONICAL (normalized).
+        This ensures correct alphabetical ordering:
+        - 'Arsenal' comes before 'Bournemouth' (NOT 'AFC Bournemouth')
+        - Consistent, deterministic selection across all players
+
         Selection algorithm (as per game rules):
 
         STEP 1 - ROLLBACK RULE (Primary):
@@ -1503,22 +1508,18 @@ class LMSScheduler:
         - This fallback may assign the same team to multiple players
         - This behavior is explicitly allowed and documented
 
-        Returns tuple: (team_name, auto_reason)
+        Returns tuple: (canonical_team_name, auto_reason)
         - auto_reason: 'rollback_opponent' or 'fallback_alpha_first'
         """
-        # Get teams in round (from fixtures) with their fixture mapping
+        # Get teams in round - normalize to canonical names
         fixtures = Fixture.query.filter_by(round_id=round_obj.id).all()
-        teams_in_round_raw = set()
+        teams_in_round_canonical = set()
 
         for fixture in fixtures:
-            teams_in_round_raw.add(fixture.home_team)
-            teams_in_round_raw.add(fixture.away_team)
-
-        # Normalize round teams to canonical names
-        teams_in_round_canonical = {normalize_team_name(t) for t in teams_in_round_raw}
+            teams_in_round_canonical.add(normalize_team_name(fixture.home_team))
+            teams_in_round_canonical.add(normalize_team_name(fixture.away_team))
 
         # Get teams used by player in this cycle (normalized)
-        # Also get player's picks ordered by round (most recent first) for rollback
         used_teams_canonical = set()
         cycle_picks = Pick.query.filter_by(player_id=player.id).join(Round).filter(
             Round.cycle_number == (round_obj.cycle_number or 1)
@@ -1570,46 +1571,28 @@ class LMSScheduler:
                     break
 
             if opponent_canonical and opponent_canonical in available_canonical:
-                # Found a valid rollback pick!
-                # Map back to fixture name for storage
-                selected_fixture_name = None
-                for raw_name in teams_in_round_raw:
-                    if normalize_team_name(raw_name) == opponent_canonical:
-                        selected_fixture_name = raw_name
-                        break
-
-                if not selected_fixture_name:
-                    selected_fixture_name = opponent_canonical
-
+                # Found a valid rollback pick - return CANONICAL name
                 logger.info(
                     f"  AUTO-PICK ROLLBACK: player_id={player.id} ({player.name}) -> "
-                    f"'{selected_fixture_name}' (opponent of '{historical_pick.team_picked}' "
+                    f"'{opponent_canonical}' (opponent of '{historical_pick.team_picked}' "
                     f"from Round {historical_pick.round.round_number})"
                 )
-                return selected_fixture_name, 'rollback_opponent'
+                return opponent_canonical, 'rollback_opponent'
 
         # STEP 2: ALPHABETICAL FALLBACK
         # No rollback candidate found - use alphabetically first available team
+        # CRITICAL: This sort is on CANONICAL names, so:
+        #   'Arsenal' < 'Bournemouth' (NOT 'AFC Bournemouth')
         available_sorted = sorted(available_canonical)
         selected_canonical = available_sorted[0]  # Alphabetically first
 
-        # Map back to the actual fixture team name for storage
-        selected_fixture_name = None
-        for raw_name in teams_in_round_raw:
-            if normalize_team_name(raw_name) == selected_canonical:
-                selected_fixture_name = raw_name
-                break
-
-        if not selected_fixture_name:
-            selected_fixture_name = selected_canonical
-
         logger.info(
             f"  AUTO-PICK ALPHABETICAL FALLBACK: player_id={player.id} ({player.name}) -> "
-            f"'{selected_fixture_name}' (canonical: '{selected_canonical}', "
-            f"first of {len(available_sorted)} available teams alphabetically)"
+            f"'{selected_canonical}' (first of {len(available_sorted)} available teams alphabetically: "
+            f"{available_sorted[:5]}{'...' if len(available_sorted) > 5 else ''})"
         )
 
-        return selected_fixture_name, 'fallback_alpha_first'
+        return selected_canonical, 'fallback_alpha_first'
 
     def _send_telegram_message(self, telegram_id, message, button_url=None, button_text="Make Your Pick"):
         """Send message via Telegram bot with optional inline button"""

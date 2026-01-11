@@ -135,6 +135,8 @@ _TEAM_ALIASES = {
     'man united': 'Manchester United',
     'man utd': 'Manchester United',
     'man utd fc': 'Manchester United',
+    'manchester utd': 'Manchester United',
+    'manchester utd fc': 'Manchester United',
 
     # Newcastle
     'newcastle': 'Newcastle United',

@@ -4,6 +4,7 @@ import time
 import requests
 from datetime import datetime
 from typing import Dict, List, Optional
+from lms_automation.team_utils import normalize_team_name
 
 logger = logging.getLogger(__name__)
 
@@ -130,9 +131,12 @@ class FootballDataAPI:
                 except ValueError:
                     pass
             
-            # Extract team names
-            home_team = match.get('homeTeam', {}).get('name', 'TBD')
-            away_team = match.get('awayTeam', {}).get('name', 'TBD')
+            # Extract team names and normalize to canonical form
+            # This ensures "AFC Bournemouth" -> "Bournemouth", etc.
+            home_team_raw = match.get('homeTeam', {}).get('name', 'TBD')
+            away_team_raw = match.get('awayTeam', {}).get('name', 'TBD')
+            home_team = normalize_team_name(home_team_raw)
+            away_team = normalize_team_name(away_team_raw)
             
             # Extract scores if available
             score = match.get('score', {})
