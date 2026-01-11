@@ -39,26 +39,26 @@ logger = logging.getLogger(__name__)
 # Use short, consistent names that sort alphabetically as expected
 # "Bournemouth" NOT "AFC Bournemouth" - so B comes after A, not after Z
 CANONICAL_TEAMS = {
-    'Arsenal',
-    'Aston Villa',
-    'Bournemouth',      # Changed from "AFC Bournemouth" for correct alphabetical sort
-    'Brentford',
-    'Brighton',
-    'Chelsea',
-    'Crystal Palace',
-    'Everton',
-    'Fulham',
-    'Ipswich Town',
-    'Leicester City',
-    'Liverpool',
-    'Manchester City',
-    'Manchester United',
-    'Newcastle United',
-    'Nottingham Forest',
-    'Southampton',
-    'Tottenham',
-    'West Ham',
-    'Wolverhampton',
+    "Arsenal",
+    "Aston Villa",
+    "Bournemouth",          # canonical storage (maps from "AFC Bournemouth")
+    "Brentford",
+    "Brighton",
+    "Burnley",
+    "Chelsea",
+    "Crystal Palace",
+    "Everton",
+    "Fulham",
+    "Leeds United",
+    "Liverpool",
+    "Manchester City",
+    "Manchester United",
+    "Newcastle United",
+    "Nottingham Forest",
+    "Sunderland",
+    "Tottenham",
+    "West Ham",
+    "Wolverhampton",
 }
 
 # Map from any known variation to canonical name
@@ -78,6 +78,8 @@ _TEAM_ALIASES = {
     'bournemouth': 'Bournemouth',
     'bournemouth fc': 'Bournemouth',
     'bournemouth afc': 'Bournemouth',
+    "afc bournemouth": "Bournemouth",
+    "afc bournemouth fc": "Bournemouth",
 
     # Brentford
     'brentford': 'Brentford',
@@ -91,6 +93,11 @@ _TEAM_ALIASES = {
     'brighton & hove albion fc': 'Brighton',
     'brighton and hove albion fc': 'Brighton',
     'brighton hove albion': 'Brighton',
+
+    # Burnley
+    "burnley": "Burnley",
+    "burnley fc": "Burnley",
+
 
     # Chelsea
     'chelsea': 'Chelsea',
@@ -109,10 +116,10 @@ _TEAM_ALIASES = {
     'fulham': 'Fulham',
     'fulham fc': 'Fulham',
 
-    # Ipswich
-    'ipswich': 'Ipswich Town',
-    'ipswich town': 'Ipswich Town',
-    'ipswich town fc': 'Ipswich Town',
+    # Leeds
+    "leeds": "Leeds United",
+    "leeds united": "Leeds United",
+    "leeds united fc": "Leeds United",
 
     # Leicester
     'leicester': 'Leicester City',
@@ -149,9 +156,10 @@ _TEAM_ALIASES = {
     'nottm forest': 'Nottingham Forest',
     'forest': 'Nottingham Forest',
 
-    # Southampton
-    'southampton': 'Southampton',
-    'southampton fc': 'Southampton',
+    # Sunderland
+    "sunderland": "Sunderland",
+    "sunderland afc": "Sunderland",
+    "sunderland fc": "Sunderland",
 
     # Tottenham
     'tottenham': 'Tottenham',
@@ -178,18 +186,19 @@ _DISPLAY_NAMES = {
     'Bournemouth': 'Bournemouth',
     'Brentford': 'Brentford',
     'Brighton': 'Brighton',
+    "Burnley": "Burnley",
     'Chelsea': 'Chelsea',
     'Crystal Palace': 'Palace',
     'Everton': 'Everton',
     'Fulham': 'Fulham',
-    'Ipswich Town': 'Ipswich',
+    "Leeds United": "Leeds",
     'Leicester City': 'Leicester',
     'Liverpool': 'Liverpool',
     'Manchester City': 'Man City',
     'Manchester United': 'Man Utd',
     'Newcastle United': 'Newcastle',
     'Nottingham Forest': 'Forest',
-    'Southampton': 'Southampton',
+    "Sunderland": "Sunderland",
     'Tottenham': 'Spurs',
     'West Ham': 'West Ham',
     'Wolverhampton': 'Wolves',
