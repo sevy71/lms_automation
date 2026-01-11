@@ -3,8 +3,13 @@ Team name normalization utilities for LMS automation.
 
 This module provides a SINGLE SOURCE OF TRUTH for team name handling:
 1. normalize_team_name() - Converts any team name variant to a canonical form
-2. CANONICAL_TEAMS - The canonical name for each team
+2. CANONICAL_TEAMS - The canonical name for each team (alphabetically sorted)
 3. display_name() - Converts canonical names to short display names
+
+IMPORTANT: Canonical names are designed for:
+- Consistent comparison (equality checks)
+- Alphabetical ordering (for auto-pick fallback)
+- Storage consistency
 
 Usage:
     from lms_automation.team_utils import normalize_team_name, display_name, teams_match
@@ -19,6 +24,10 @@ Usage:
 
     # Getting display name
     short = display_name("Aston Villa")  # Returns "Villa"
+
+    # Alphabetical ordering for auto-pick fallback
+    sorted_teams = sorted(CANONICAL_TEAMS)
+    # Result: Arsenal, Aston Villa, Bournemouth, Brentford, ...
 """
 
 import logging
@@ -26,10 +35,13 @@ import logging
 logger = logging.getLogger(__name__)
 
 # Canonical team names - these are the "official" names we store
+# IMPORTANT: These are the 20 current Premier League teams (2024-25 season)
+# Use short, consistent names that sort alphabetically as expected
+# "Bournemouth" NOT "AFC Bournemouth" - so B comes after A, not after Z
 CANONICAL_TEAMS = {
     'Arsenal',
     'Aston Villa',
-    'AFC Bournemouth',
+    'Bournemouth',      # Changed from "AFC Bournemouth" for correct alphabetical sort
     'Brentford',
     'Brighton',
     'Chelsea',
@@ -62,10 +74,10 @@ _TEAM_ALIASES = {
     'villa': 'Aston Villa',
 
     # Bournemouth
-    'afc bournemouth': 'AFC Bournemouth',
-    'bournemouth': 'AFC Bournemouth',
-    'bournemouth fc': 'AFC Bournemouth',
-    'bournemouth afc': 'AFC Bournemouth',
+    'afc bournemouth': 'Bournemouth',
+    'bournemouth': 'Bournemouth',
+    'bournemouth fc': 'Bournemouth',
+    'bournemouth afc': 'Bournemouth',
 
     # Brentford
     'brentford': 'Brentford',
@@ -161,7 +173,7 @@ _TEAM_ALIASES = {
 _DISPLAY_NAMES = {
     'Arsenal': 'Arsenal',
     'Aston Villa': 'Villa',
-    'AFC Bournemouth': 'Bournemouth',
+    'Bournemouth': 'Bournemouth',
     'Brentford': 'Brentford',
     'Brighton': 'Brighton',
     'Chelsea': 'Chelsea',

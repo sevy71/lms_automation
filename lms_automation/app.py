@@ -226,6 +226,149 @@ ADMIN_PASSWORD = os.environ.get('ADMIN_PASSWORD', 'admin123')  # Change this!
 ADMIN_WHATSAPP = os.environ.get('ADMIN_WHATSAPP')  # Optional: admin WhatsApp number (e.g., +441234567890)
 
 # --- Helpers ---
+
+def _trigger_round_automation(round_obj):
+    """
+    Immediately generate tokens and send announcements for an active round.
+
+    Called when admin creates a round with status='active' to ensure players
+    receive pick links immediately rather than waiting for scheduler jobs.
+
+    Returns tuple: (tokens_created, announcements_sent)
+    """
+    import requests as http_requests
+
+    tokens_created = 0
+    announcements_sent = 0
+
+    try:
+        # Get eligible players (active players not eliminated in previous rounds of this cycle)
+        cycle_number = round_obj.cycle_number or 1
+        all_active_players = Player.query.filter_by(status='active').all()
+
+        # Find eliminated player IDs from previous rounds in this cycle
+        eliminated_player_ids = set()
+        previous_rounds = Round.query.filter(
+            Round.cycle_number == cycle_number,
+            Round.round_number < round_obj.round_number
+        ).all()
+
+        for prev_round in previous_rounds:
+            eliminated_picks = Pick.query.filter_by(
+                round_id=prev_round.id,
+                is_eliminated=True
+            ).all()
+            for pick in eliminated_picks:
+                eliminated_player_ids.add(pick.player_id)
+
+        eligible_players = [p for p in all_active_players if p.id not in eliminated_player_ids]
+
+        app.logger.info(
+            f"Round {round_obj.round_number} automation: {len(eligible_players)} eligible players"
+        )
+
+        # Generate tokens for eligible players
+        for player in eligible_players:
+            existing_token = PickToken.query.filter_by(
+                player_id=player.id,
+                round_id=round_obj.id
+            ).first()
+
+            if not existing_token:
+                token = PickToken.create_for_player_round(
+                    player.id, round_obj.id, expires_hours=168
+                )
+                db.session.add(token)
+                tokens_created += 1
+
+        db.session.commit()
+
+        # Send announcements via Telegram to eligible players
+        base_url = os.environ.get('BASE_URL', 'http://localhost:5000')
+        bot_token = os.environ.get('TELEGRAM_BOT_TOKEN')
+
+        if not bot_token:
+            app.logger.warning("TELEGRAM_BOT_TOKEN not set, skipping announcements")
+            return tokens_created, announcements_sent
+
+        for player in eligible_players:
+            # Skip players without telegram_id
+            if not (hasattr(player, 'telegram_id') and player.telegram_id):
+                continue
+
+            # Get token for this player
+            pick_token = PickToken.query.filter_by(
+                player_id=player.id,
+                round_id=round_obj.id
+            ).first()
+
+            if not pick_token:
+                continue
+
+            pick_url = f"{base_url}/pick/{pick_token.token}"
+
+            # Format deadline message
+            if round_obj.first_kickoff_at:
+                deadline_str = round_obj.first_kickoff_at.strftime('%A %d %B at %H:%M')
+            else:
+                deadline_str = "soon"
+
+            message = f"⚽ NEW ROUND {round_obj.round_number} IS LIVE!\n\n"
+            message += f"Make your pick before {deadline_str}"
+
+            # Send via Telegram API
+            try:
+                url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+                payload = {
+                    'chat_id': player.telegram_id,
+                    'text': message,
+                    'reply_markup': {
+                        'inline_keyboard': [[
+                            {'text': "⚽ Make Your Pick", 'url': pick_url}
+                        ]]
+                    }
+                }
+                response = http_requests.post(url, json=payload, timeout=10)
+                if response.status_code == 200:
+                    announcements_sent += 1
+                    app.logger.info(f"Sent round announcement to {player.name}")
+
+                    # Schedule reminders for this player (4h and 2h before kickoff)
+                    if round_obj.first_kickoff_at:
+                        reminder_4h = ReminderSchedule(
+                            player_id=player.id,
+                            round_id=round_obj.id,
+                            reminder_type='4_hour',
+                            scheduled_time=round_obj.first_kickoff_at - timedelta(hours=4),
+                            is_sent=False
+                        )
+                        db.session.add(reminder_4h)
+
+                        reminder_2h = ReminderSchedule(
+                            player_id=player.id,
+                            round_id=round_obj.id,
+                            reminder_type='2_hour',
+                            scheduled_time=round_obj.first_kickoff_at - timedelta(hours=2),
+                            is_sent=False
+                        )
+                        db.session.add(reminder_2h)
+
+            except Exception as e:
+                app.logger.warning(f"Failed to send announcement to {player.name}: {e}")
+
+        db.session.commit()
+        app.logger.info(
+            f"Round {round_obj.round_number} automation complete: "
+            f"tokens_created={tokens_created}, announcements_sent={announcements_sent}"
+        )
+
+    except Exception as e:
+        app.logger.error(f"Error in round automation: {e}")
+        db.session.rollback()
+
+    return tokens_created, announcements_sent
+
+
 def team_abbrev(team_name: str) -> str:
     """
     Get abbreviated/display name for a team.
@@ -1128,15 +1271,23 @@ def handle_rounds():
                         new_round.first_kickoff_at = earliest_kickoff
                         if not new_round.end_date:
                             new_round.end_date = earliest_kickoff - timedelta(hours=1)
-                    
+
                     db.session.commit()
-                    
+
+                    # If round is created as 'active', immediately generate tokens and send announcements
+                    tokens_created = 0
+                    announcements_sent = 0
+                    if new_round.status == 'active':
+                        tokens_created, announcements_sent = _trigger_round_automation(new_round)
+
                     return jsonify({
-                        'success': True, 
-                        'id': new_round.id, 
+                        'success': True,
+                        'id': new_round.id,
                         'round_number': new_round.round_number,
                         'pl_matchday': new_round.pl_matchday,
-                        'fixtures_added': len(formatted_fixtures)
+                        'fixtures_added': len(formatted_fixtures),
+                        'tokens_created': tokens_created,
+                        'announcements_sent': announcements_sent
                     })
                 else:
                     # No fixtures from API, create fallback fixtures
@@ -1146,13 +1297,13 @@ def handle_rounds():
                 print(f"API failed, creating fallback fixtures: {fixture_error}")
                 # Create fallback Premier League fixtures for the round
                 fallback_fixtures = [
-                    ("Arsenal", "Chelsea"), ("Liverpool", "Manchester City"), 
+                    ("Arsenal", "Chelsea"), ("Liverpool", "Manchester City"),
                     ("Manchester United", "Tottenham"), ("Newcastle", "Brighton"),
                     ("Aston Villa", "West Ham"), ("Crystal Palace", "Everton"),
                     ("Fulham", "Brentford"), ("Wolves", "Nottingham Forest"),
                     ("Bournemouth", "Sheffield United"), ("Burnley", "Luton Town")
                 ]
-                
+
                 for i, (home_team, away_team) in enumerate(fallback_fixtures):
                     fixture = Fixture(
                         round_id=new_round.id,
@@ -1166,15 +1317,23 @@ def handle_rounds():
                         status='scheduled'
                     )
                     db.session.add(fixture)
-                
+
                 db.session.commit()
-                
+
+                # If round is created as 'active', immediately generate tokens and send announcements
+                tokens_created = 0
+                announcements_sent = 0
+                if new_round.status == 'active':
+                    tokens_created, announcements_sent = _trigger_round_automation(new_round)
+
                 return jsonify({
-                    'success': True, 
-                    'id': new_round.id, 
+                    'success': True,
+                    'id': new_round.id,
                     'round_number': new_round.round_number,
                     'pl_matchday': new_round.pl_matchday,
                     'fixtures_added': len(fallback_fixtures),
+                    'tokens_created': tokens_created,
+                    'announcements_sent': announcements_sent,
                     'warning': f'Football API unavailable: {str(fixture_error)}. Used fallback fixtures.'
                 })
             

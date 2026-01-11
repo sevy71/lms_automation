@@ -121,6 +121,15 @@ class LMSScheduler:
                 replace_existing=True
             )
 
+            # Check if all picks are submitted and publish picks
+            self.scheduler.add_job(
+                func=self.check_all_picks_submitted,
+                trigger=IntervalTrigger(minutes=5),
+                id='check_all_picks',
+                name='Check if all picks submitted and publish',
+                replace_existing=True
+            )
+
             self.scheduler.start()
             logger.info("Scheduler started with all jobs configured")
 
@@ -606,13 +615,18 @@ class LMSScheduler:
             self._send_cycle_complete_notification(active_players, next_cycle)
 
     def send_due_reminders(self):
-        """Send reminders that are due via Telegram only"""
+        """Send reminders that are due via Telegram only.
+
+        IMPORTANT: Only sends reminders to players who have NOT yet submitted a pick.
+        Players who already submitted must never be reminded.
+        """
         with self.app.app_context():
             try:
-                logger.info("Checking for due reminders...")
+                logger.info("=== REMINDER JOB START ===")
 
                 # Get reminders that are due and not sent
-                now = datetime.now()
+                # IMPORTANT: Use UTC for all internal time comparisons
+                now = datetime.utcnow()
                 due_reminders = ReminderSchedule.query.filter(
                     ReminderSchedule.scheduled_time <= now,
                     ReminderSchedule.is_sent == False
@@ -620,10 +634,29 @@ class LMSScheduler:
 
                 sent_count = 0
                 skipped_missing = 0
+                skipped_already_picked = 0
 
                 for reminder in due_reminders:
                     player = reminder.player
                     round_obj = reminder.round
+
+                    # CRITICAL: Check if player already has a pick for this round
+                    # Players who already submitted a pick must NEVER be reminded
+                    existing_pick = Pick.query.filter_by(
+                        player_id=player.id,
+                        round_id=round_obj.id
+                    ).first()
+
+                    if existing_pick:
+                        # Player already picked - mark reminder as sent but don't actually send
+                        reminder.is_sent = True
+                        reminder.sent_at = now
+                        skipped_already_picked += 1
+                        logger.debug(
+                            f"Skipping reminder for {player.name} (player_id={player.id}): "
+                            f"already picked '{existing_pick.team_picked}' for round_id={round_obj.id}"
+                        )
+                        continue
 
                     # Get or create pick token
                     pick_token = PickToken.query.filter_by(
@@ -657,6 +690,10 @@ class LMSScheduler:
                         )
                         if telegram_sent:
                             sent_count += 1
+                            logger.info(
+                                f"Sent {reminder.reminder_type} reminder to {player.name} "
+                                f"(player_id={player.id}) for Round {round_obj.round_number}"
+                            )
                         else:
                             logger.warning(
                                 "Failed to send Telegram reminder to %s (id=%s, phone=%s)",
@@ -675,17 +712,15 @@ class LMSScheduler:
 
                     # Mark as sent
                     reminder.is_sent = True
-                    reminder.sent_at = datetime.now()
+                    reminder.sent_at = now
 
                 db.session.commit()
 
-                if due_reminders:
-                    logger.info(
-                        "Reminder send summary: sent=%s skipped_missing_telegram=%s total_due=%s",
-                        sent_count,
-                        skipped_missing,
-                        len(due_reminders)
-                    )
+                logger.info(
+                    f"=== REMINDER JOB COMPLETE: sent={sent_count}, "
+                    f"skipped_already_picked={skipped_already_picked}, "
+                    f"skipped_missing_telegram={skipped_missing}, total_due={len(due_reminders)} ==="
+                )
 
             except Exception as e:
                 logger.error(f"Error sending reminders: {e}")
@@ -1008,7 +1043,7 @@ class LMSScheduler:
                     # Apply auto-picks
                     round_auto_picks = 0
                     for player in missing_pick_players:
-                        auto_team = self._get_auto_pick_team(player, round_obj)
+                        auto_team, auto_reason = self._get_auto_pick_team(player, round_obj)
 
                         if auto_team:
                             pick = Pick(
@@ -1016,13 +1051,13 @@ class LMSScheduler:
                                 round_id=round_obj.id,
                                 team_picked=auto_team,
                                 auto_assigned=True,
-                                auto_reason='missed_deadline',
+                                auto_reason=auto_reason,  # 'rollback_opponent' or 'fallback_alpha_first'
                                 timestamp=now
                             )
                             db.session.add(pick)
                             logger.info(
                                 f"  AUTO-PICK CREATED: player='{player.name}' (id={player.id}) -> "
-                                f"team='{auto_team}' for Round {round_obj.round_number}"
+                                f"team='{auto_team}' reason='{auto_reason}' for Round {round_obj.round_number}"
                             )
                             round_auto_picks += 1
                         else:
@@ -1126,24 +1161,125 @@ class LMSScheduler:
                 logger.error(f"Error in round orchestrator: {e}")
                 db.session.rollback()
 
+    def check_all_picks_submitted(self):
+        """
+        Check if all eligible players have submitted picks for active rounds.
+
+        When all picks are submitted:
+        1. Mark the round as "picks_locked" (prevents further edits)
+        2. Publish picks so everyone can see who picked what
+
+        This enables early visibility when players are eager to see picks.
+        """
+        with self.app.app_context():
+            try:
+                logger.info("=== ALL PICKS CHECK JOB START ===")
+
+                active_rounds = Round.query.filter_by(status='active').all()
+
+                for round_obj in active_rounds:
+                    # Get eligible players for this round
+                    eligible_players = self._get_eligible_players_for_round(round_obj)
+                    eligible_count = len(eligible_players)
+
+                    if eligible_count == 0:
+                        continue
+
+                    # Count picks submitted for this round
+                    picks_count = Pick.query.filter_by(round_id=round_obj.id).count()
+
+                    logger.info(
+                        f"Round {round_obj.round_number}: picks={picks_count}/{eligible_count} eligible"
+                    )
+
+                    # Check if all eligible players have picks
+                    if picks_count >= eligible_count:
+                        # All picks are in! Notify everyone
+                        logger.info(
+                            f"Round {round_obj.round_number}: ALL PICKS SUBMITTED! "
+                            f"({picks_count} picks from {eligible_count} eligible players)"
+                        )
+
+                        # Send notification that picks are now visible
+                        self._send_picks_published_notification(round_obj)
+
+                logger.info("=== ALL PICKS CHECK JOB COMPLETE ===")
+
+            except Exception as e:
+                logger.error(f"Error checking all picks: {e}")
+                db.session.rollback()
+
+    def _send_picks_published_notification(self, round_obj):
+        """
+        Send notification that all picks are in and visible.
+        Only sends once per round (idempotent).
+        """
+        # Use special_note to track if we've already sent this notification
+        if round_obj.special_note and 'picks_published' in round_obj.special_note:
+            logger.debug(f"Round {round_obj.round_number}: picks already published, skipping notification")
+            return
+
+        # Get all picks for this round
+        picks = Pick.query.filter_by(round_id=round_obj.id).all()
+
+        # Build message showing all picks
+        picks_summary = []
+        for pick in picks:
+            player_name = pick.player.name if pick.player else f"Player {pick.player_id}"
+            team = normalize_team_name(pick.team_picked)
+            auto_tag = " (auto)" if pick.auto_assigned else ""
+            picks_summary.append(f"• {player_name}: {team}{auto_tag}")
+
+        message = f"📋 ROUND {round_obj.round_number} PICKS ARE IN!\n\n"
+        message += "All players have submitted. Here are the picks:\n\n"
+        message += "\n".join(sorted(picks_summary))
+
+        # Send to all players with telegram_id
+        players = Player.query.filter(Player.telegram_id.isnot(None)).all()
+        sent_count = 0
+
+        for player in players:
+            if self._send_telegram_message(player.telegram_id, message):
+                sent_count += 1
+
+        logger.info(
+            f"Round {round_obj.round_number}: Sent picks published notification to {sent_count} players"
+        )
+
+        # Mark as published to prevent duplicate notifications
+        if round_obj.special_note:
+            round_obj.special_note += "; picks_published"
+        else:
+            round_obj.special_note = "picks_published"
+        db.session.commit()
+
     def _get_auto_pick_team(self, player, round_obj):
         """
-        Get auto-pick team for a player.
+        Get auto-pick team for a player who missed the deadline.
 
-        Selection algorithm:
-        1. Get all teams playing in this round (from fixtures)
-        2. Get teams already used by this player in this cycle (normalized comparison)
-        3. Available = teams in round that haven't been used
-        4. Use deterministic but distributed selection: hash(player_id + round_id) to pick index
+        Selection algorithm (as per game rules):
 
-        This ensures:
-        - Different players get different teams (distributed)
-        - Same player always gets same team if re-run (deterministic/idempotent)
-        - No fallback to a single team like "Bournemouth" for everyone
+        STEP 1 - ROLLBACK RULE (Primary):
+        - Walk the player's past picks from most recent → oldest
+        - Find the opposing team from that historical fixture
+        - If that opposing team is:
+          - eligible in the current round (playing this matchday)
+          - not already used by the player in this cycle
+        → assign it
+
+        STEP 2 - ALPHABETICAL FALLBACK (Secondary):
+        - If rollback fails, choose the alphabetically first eligible team
+        - Based on canonical short team names
+        - This fallback may assign the same team to multiple players
+        - This behavior is explicitly allowed and documented
+
+        Returns tuple: (team_name, auto_reason)
+        - auto_reason: 'rollback_opponent' or 'fallback_alpha_first'
         """
-        # Get teams in round (from fixtures)
+        # Get teams in round (from fixtures) with their fixture mapping
         fixtures = Fixture.query.filter_by(round_id=round_obj.id).all()
         teams_in_round_raw = set()
+
         for fixture in fixtures:
             teams_in_round_raw.add(fixture.home_team)
             teams_in_round_raw.add(fixture.away_team)
@@ -1152,11 +1288,13 @@ class LMSScheduler:
         teams_in_round_canonical = {normalize_team_name(t) for t in teams_in_round_raw}
 
         # Get teams used by player in this cycle (normalized)
+        # Also get player's picks ordered by round (most recent first) for rollback
         used_teams_canonical = set()
-        picks = Pick.query.filter_by(player_id=player.id).join(Round).filter(
+        cycle_picks = Pick.query.filter_by(player_id=player.id).join(Round).filter(
             Round.cycle_number == (round_obj.cycle_number or 1)
-        ).all()
-        for pick in picks:
+        ).order_by(Round.round_number.desc()).all()
+
+        for pick in cycle_picks:
             used_teams_canonical.add(normalize_team_name(pick.team_picked))
 
         # Available teams (canonical names)
@@ -1174,21 +1312,58 @@ class LMSScheduler:
                 f"  No available teams for player_id={player.id} ({player.name}) - "
                 f"all {len(teams_in_round_canonical)} teams in round have been used"
             )
-            return None
+            return None, None
 
-        # Sort for deterministic ordering
+        # STEP 1: ROLLBACK RULE
+        # Walk through player's historical picks (most recent first across ALL cycles)
+        # Find an opponent team that is eligible in current round
+        all_historical_picks = Pick.query.filter_by(player_id=player.id).join(Round).order_by(
+            Round.round_number.desc()
+        ).all()
+
+        for historical_pick in all_historical_picks:
+            historical_team_canonical = normalize_team_name(historical_pick.team_picked)
+
+            # Find the fixture from that historical round to identify opponent
+            historical_fixtures = Fixture.query.filter_by(round_id=historical_pick.round_id).all()
+            opponent_canonical = None
+
+            for hf in historical_fixtures:
+                home_canonical = normalize_team_name(hf.home_team)
+                away_canonical = normalize_team_name(hf.away_team)
+
+                if home_canonical == historical_team_canonical:
+                    opponent_canonical = away_canonical
+                    break
+                elif away_canonical == historical_team_canonical:
+                    opponent_canonical = home_canonical
+                    break
+
+            if opponent_canonical and opponent_canonical in available_canonical:
+                # Found a valid rollback pick!
+                # Map back to fixture name for storage
+                selected_fixture_name = None
+                for raw_name in teams_in_round_raw:
+                    if normalize_team_name(raw_name) == opponent_canonical:
+                        selected_fixture_name = raw_name
+                        break
+
+                if not selected_fixture_name:
+                    selected_fixture_name = opponent_canonical
+
+                logger.info(
+                    f"  AUTO-PICK ROLLBACK: player_id={player.id} ({player.name}) -> "
+                    f"'{selected_fixture_name}' (opponent of '{historical_pick.team_picked}' "
+                    f"from Round {historical_pick.round.round_number})"
+                )
+                return selected_fixture_name, 'rollback_opponent'
+
+        # STEP 2: ALPHABETICAL FALLBACK
+        # No rollback candidate found - use alphabetically first available team
         available_sorted = sorted(available_canonical)
-
-        # Use hash to distribute picks across players
-        # Hash of (player_id, round_id) gives a stable but distributed index
-        hash_input = f"{player.id}_{round_obj.id}".encode()
-        hash_value = int(hashlib.md5(hash_input).hexdigest(), 16)
-        index = hash_value % len(available_sorted)
-
-        selected_canonical = available_sorted[index]
+        selected_canonical = available_sorted[0]  # Alphabetically first
 
         # Map back to the actual fixture team name for storage
-        # (we want to store the same format as fixtures for consistency)
         selected_fixture_name = None
         for raw_name in teams_in_round_raw:
             if normalize_team_name(raw_name) == selected_canonical:
@@ -1199,11 +1374,12 @@ class LMSScheduler:
             selected_fixture_name = selected_canonical
 
         logger.info(
-            f"  Auto-pick selected: player_id={player.id} -> '{selected_fixture_name}' "
-            f"(canonical: '{selected_canonical}', index={index}/{len(available_sorted)})"
+            f"  AUTO-PICK ALPHABETICAL FALLBACK: player_id={player.id} ({player.name}) -> "
+            f"'{selected_fixture_name}' (canonical: '{selected_canonical}', "
+            f"first of {len(available_sorted)} available teams alphabetically)"
         )
 
-        return selected_fixture_name
+        return selected_fixture_name, 'fallback_alpha_first'
 
     def _send_telegram_message(self, telegram_id, message, button_url=None, button_text="Make Your Pick"):
         """Send message via Telegram bot with optional inline button"""
