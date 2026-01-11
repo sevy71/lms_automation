@@ -553,6 +553,14 @@ class LMSScheduler:
                     # This is an invariant violation - if you lost, you MUST be eliminated
                     self._enforce_elimination_invariant(round_obj)
 
+                    # LEAN & CLEAN: Send round results to all participants
+                    self._send_round_results_notification(
+                        round_obj,
+                        winners_count=winners_count,
+                        eliminated_count=eliminated_count,
+                        draw_count=len(draw_fixtures)
+                    )
+
                     # Check for game state changes
                     self._check_game_state(round_obj)
                     rounds_processed += 1
@@ -739,8 +747,10 @@ class LMSScheduler:
     def send_due_reminders(self):
         """Send reminders that are due via Telegram only.
 
-        IMPORTANT: Only sends reminders to players who have NOT yet submitted a pick.
-        Players who already submitted must never be reminded.
+        LEAN & CLEAN POLICY:
+        - Only send to ACTIVE players
+        - Only send to players who have NOT yet submitted a pick
+        - Never remind eliminated players
         """
         with self.app.app_context():
             try:
@@ -757,10 +767,23 @@ class LMSScheduler:
                 sent_count = 0
                 skipped_missing = 0
                 skipped_already_picked = 0
+                skipped_not_active = 0
 
                 for reminder in due_reminders:
                     player = reminder.player
                     round_obj = reminder.round
+
+                    # LEAN & CLEAN: Only send to ACTIVE players
+                    # Eliminated players must never receive reminders
+                    if player.status != 'active':
+                        reminder.is_sent = True
+                        reminder.sent_at = now
+                        skipped_not_active += 1
+                        logger.debug(
+                            f"Skipping reminder for {player.name} (player_id={player.id}): "
+                            f"status={player.status} (not active)"
+                        )
+                        continue
 
                     # CRITICAL: Check if player already has a pick for this round
                     # Players who already submitted a pick must NEVER be reminded
@@ -840,7 +863,7 @@ class LMSScheduler:
 
                 logger.info(
                     f"=== REMINDER JOB COMPLETE: sent={sent_count}, "
-                    f"skipped_already_picked={skipped_already_picked}, "
+                    f"skipped_not_active={skipped_not_active}, skipped_already_picked={skipped_already_picked}, "
                     f"skipped_missing_telegram={skipped_missing}, total_due={len(due_reminders)} ==="
                 )
 
@@ -881,10 +904,20 @@ class LMSScheduler:
                     skipped_missing_telegram = 0
                     skipped_no_token = 0
                     skipped_already_announced = 0
+                    skipped_not_active = 0
                     sent = 0
                     failed = 0
 
                     for player in eligible_players:
+                        # LEAN & CLEAN: Only send to ACTIVE players (defensive check)
+                        if player.status != 'active':
+                            skipped_not_active += 1
+                            logger.debug(
+                                "Skipping announcement for %s (player_id=%s): status=%s (not active)",
+                                player.name, player.id, player.status
+                            )
+                            continue
+
                         # Check if player already has a pick for this round (idempotency check)
                         if self._player_has_pick_for_round(player.id, round_obj.id):
                             already_picked_skipped += 1
@@ -983,11 +1016,12 @@ class LMSScheduler:
                     # Structured logging summary with all counts
                     logger.info(
                         "Round announcement summary: round_id=%s, round_number=%s, "
-                        "eligible_total=%s, already_picked_skipped=%s, skipped_no_token=%s, "
+                        "eligible_total=%s, skipped_not_active=%s, already_picked_skipped=%s, skipped_no_token=%s, "
                         "skipped_already_announced=%s, skipped_missing_telegram=%s, sent=%s, failed=%s",
                         round_obj.id,
                         round_obj.round_number,
                         eligible_total,
+                        skipped_not_active,
                         already_picked_skipped,
                         skipped_no_token,
                         skipped_already_announced,
@@ -1333,39 +1367,54 @@ class LMSScheduler:
 
     def _send_picks_published_notification(self, round_obj):
         """
-        Send notification that all picks are in and visible.
-        Only sends once per round (idempotent).
+        LEAN & CLEAN: Send notification that all picks are locked.
+
+        - Only sends to ACTIVE players (not eliminated)
+        - Uses short message + link to picks grid (no long bullet list)
+        - Idempotent: only sends once per round
         """
         # Use special_note to track if we've already sent this notification
         if round_obj.special_note and 'picks_published' in round_obj.special_note:
             logger.debug(f"Round {round_obj.round_number}: picks already published, skipping notification")
             return
 
-        # Get all picks for this round
-        picks = Pick.query.filter_by(round_id=round_obj.id).all()
+        # Get count of picks for context
+        picks_count = Pick.query.filter_by(round_id=round_obj.id).count()
+        auto_pick_count = Pick.query.filter_by(round_id=round_obj.id, auto_assigned=True).count()
 
-        # Build message showing all picks
-        picks_summary = []
-        for pick in picks:
-            player_name = pick.player.name if pick.player else f"Player {pick.player_id}"
-            team = normalize_team_name(pick.team_picked)
-            auto_tag = " (auto)" if pick.auto_assigned else ""
-            picks_summary.append(f"• {player_name}: {team}{auto_tag}")
+        # Build short message with link (no long bullet list)
+        picks_grid_url = self._get_picks_grid_url()
+        message = f"📋 Round {round_obj.round_number} picks locked!\n\n"
+        message += f"{picks_count} picks submitted"
+        if auto_pick_count > 0:
+            message += f" ({auto_pick_count} auto-picks)"
+        message += "."
 
-        message = f"📋 ROUND {round_obj.round_number} PICKS ARE IN!\n\n"
-        message += "All players have submitted. Here are the picks:\n\n"
-        message += "\n".join(sorted(picks_summary))
+        # LEAN & CLEAN: Only send to ACTIVE players
+        active_players = Player.query.filter(
+            Player.status == 'active',
+            Player.telegram_id.isnot(None)
+        ).all()
 
-        # Send to all players with telegram_id
-        players = Player.query.filter(Player.telegram_id.isnot(None)).all()
         sent_count = 0
+        skipped_not_active = 0
 
-        for player in players:
-            if self._send_telegram_message(player.telegram_id, message):
+        for player in active_players:
+            if self._send_telegram_message(
+                player.telegram_id,
+                message,
+                button_url=picks_grid_url,
+                button_text="📊 View Picks Grid"
+            ):
                 sent_count += 1
 
+        # Log how many non-active players were NOT sent to (for transparency)
+        all_with_telegram = Player.query.filter(Player.telegram_id.isnot(None)).count()
+        skipped_not_active = all_with_telegram - len(active_players)
+
         logger.info(
-            f"Round {round_obj.round_number}: Sent picks published notification to {sent_count} players"
+            f"Round {round_obj.round_number}: Sent picks-locked notification to {sent_count} ACTIVE players "
+            f"(skipped_not_active={skipped_not_active})"
         )
 
         # Mark as published to prevent duplicate notifications
@@ -1374,6 +1423,65 @@ class LMSScheduler:
         else:
             round_obj.special_note = "picks_published"
         db.session.commit()
+
+    def _send_round_results_notification(self, round_obj, winners_count, eliminated_count, draw_count):
+        """
+        LEAN & CLEAN: Send round results notification.
+
+        - Sends to EVERYONE who PARTICIPATED in the round (has a pick)
+        - Includes: round number, winners, eliminated, draws, link to results
+        - This is the transparency message for round completion
+        - Idempotent: only sends once per round
+        """
+        # Use special_note to track if we've already sent this notification
+        if round_obj.special_note and 'results_sent' in round_obj.special_note:
+            logger.debug(f"Round {round_obj.round_number}: results already sent, skipping notification")
+            return
+
+        # Get all players who participated in this round (have a pick)
+        picks = Pick.query.filter_by(round_id=round_obj.id).all()
+        participant_ids = {pick.player_id for pick in picks}
+
+        # Build short message with link
+        picks_grid_url = self._get_picks_grid_url()
+        message = f"🏁 Round {round_obj.round_number} results!\n\n"
+        message += f"✅ {winners_count} survived\n"
+        message += f"❌ {eliminated_count} eliminated"
+        if draw_count > 0:
+            message += f"\n🤝 {draw_count} draw fixture(s)"
+        message += "\n\nGood luck next round!"
+
+        # Send to everyone who participated (regardless of current status)
+        sent_count = 0
+        skipped_no_telegram = 0
+
+        for player_id in participant_ids:
+            player = Player.query.get(player_id)
+            if not player:
+                continue
+
+            if not player.telegram_id:
+                skipped_no_telegram += 1
+                continue
+
+            if self._send_telegram_message(
+                player.telegram_id,
+                message,
+                button_url=picks_grid_url,
+                button_text="📊 View Results"
+            ):
+                sent_count += 1
+
+        logger.info(
+            f"Round {round_obj.round_number}: Sent results notification to {sent_count} participants "
+            f"(skipped_no_telegram={skipped_no_telegram}, total_participants={len(participant_ids)})"
+        )
+
+        # Mark as sent to prevent duplicate notifications
+        if round_obj.special_note:
+            round_obj.special_note += "; results_sent"
+        else:
+            round_obj.special_note = "results_sent"
 
     def _get_auto_pick_team(self, player, round_obj):
         """
@@ -1533,82 +1641,93 @@ class LMSScheduler:
             return False
 
     def _send_winner_notification(self, winner):
-        """Send winner announcement to all players"""
-        message = f"🏆 GAME OVER! {winner.name} has won the Last Man Standing competition! 🎉"
+        """
+        LEAN & CLEAN: Send winner announcement to ALL players (active + eliminated).
+        Short message + link.
+        """
+        picks_grid_url = self._get_picks_grid_url()
+        message = f"🏆 WINNER!\n\n{winner.name} has won the Last Man Standing competition! 🎉"
 
-        # Send to all players
+        # Send to ALL players (regardless of status)
         players = Player.query.all()
         sent_count = 0
         skipped_missing = 0
         for player in players:
             if hasattr(player, 'telegram_id') and player.telegram_id:
-                if self._send_telegram_message(player.telegram_id, message):
+                if self._send_telegram_message(
+                    player.telegram_id,
+                    message,
+                    button_url=picks_grid_url,
+                    button_text="📊 View Final Grid"
+                ):
                     sent_count += 1
             else:
                 skipped_missing += 1
-                logger.warning(
-                    "Skipping winner announcement for %s (id=%s, phone=%s) missing telegram_chat_id",
-                    player.name,
-                    player.id,
-                    player.whatsapp_number or "-"
-                )
         logger.info(
-            "Winner announcement summary: sent=%s skipped_missing_telegram=%s",
+            "Winner announcement: sent=%s, skipped_no_telegram=%s, total_players=%s",
             sent_count,
-            skipped_missing
+            skipped_missing,
+            len(players)
         )
 
     def _send_rollover_notification(self, new_cycle):
-        """Send rollover notification to all players"""
-        message = f"🔄 ALL PLAYERS ELIMINATED! Starting fresh with Cycle {new_cycle}. All players are back in the game!"
+        """
+        LEAN & CLEAN: Send rollover notification to ALL players (active + eliminated).
+        Short message + link.
+        """
+        picks_grid_url = self._get_picks_grid_url()
+        message = f"🔄 ROLLOVER!\n\nAll players eliminated. Starting Cycle {new_cycle}.\nEveryone is back in!"
 
-        # Send to all players
+        # Send to ALL players (regardless of status)
         players = Player.query.all()
         sent_count = 0
         skipped_missing = 0
         for player in players:
             if hasattr(player, 'telegram_id') and player.telegram_id:
-                if self._send_telegram_message(player.telegram_id, message):
+                if self._send_telegram_message(
+                    player.telegram_id,
+                    message,
+                    button_url=picks_grid_url,
+                    button_text="📊 View Grid"
+                ):
                     sent_count += 1
             else:
                 skipped_missing += 1
-                logger.warning(
-                    "Skipping rollover announcement for %s (id=%s, phone=%s) missing telegram_chat_id",
-                    player.name,
-                    player.id,
-                    player.whatsapp_number or "-"
-                )
         logger.info(
-            "Rollover announcement summary: sent=%s skipped_missing_telegram=%s",
+            "Rollover announcement: sent=%s, skipped_no_telegram=%s, total_players=%s",
             sent_count,
-            skipped_missing
+            skipped_missing,
+            len(players)
         )
 
     def _send_cycle_complete_notification(self, survivors, new_cycle):
-        """Send cycle completion notification"""
-        survivor_names = ', '.join([p.name for p in survivors])
-        message = f"📊 Cycle complete! {len(survivors)} survivors advance to Cycle {new_cycle}: {survivor_names}"
+        """
+        LEAN & CLEAN: Send cycle completion to ALL players (active + eliminated).
+        Short message + link.
+        """
+        picks_grid_url = self._get_picks_grid_url()
+        message = f"📊 Cycle Complete!\n\n{len(survivors)} survivor(s) advance to Cycle {new_cycle}."
 
-        # Send to all players
+        # Send to ALL players (regardless of status)
         players = Player.query.all()
         sent_count = 0
         skipped_missing = 0
         for player in players:
             if hasattr(player, 'telegram_id') and player.telegram_id:
-                if self._send_telegram_message(player.telegram_id, message):
+                if self._send_telegram_message(
+                    player.telegram_id,
+                    message,
+                    button_url=picks_grid_url,
+                    button_text="📊 View Grid"
+                ):
                     sent_count += 1
             else:
                 skipped_missing += 1
-                logger.warning(
-                    "Skipping cycle announcement for %s (id=%s, phone=%s) missing telegram_chat_id",
-                    player.name,
-                    player.id,
-                    player.whatsapp_number or "-"
-                )
         logger.info(
-            "Cycle completion summary: sent=%s skipped_missing_telegram=%s",
+            "Cycle complete announcement: sent=%s, skipped_no_telegram=%s, total_players=%s",
             sent_count,
-            skipped_missing
+            skipped_missing,
+            len(players)
         )
 
     def _reset_game_for_new_cycle(self):
@@ -1704,6 +1823,39 @@ class LMSScheduler:
             round_id=round_id
         ).first()
         return existing_pick is not None
+
+    # ==================== LEAN & CLEAN MESSAGING HELPERS ====================
+
+    def _is_player_active(self, player_id: int) -> bool:
+        """
+        Check if a player has status='active'.
+
+        Args:
+            player_id: The player's database ID
+
+        Returns:
+            True if player.status == 'active', False otherwise
+        """
+        player = Player.query.get(player_id)
+        return player is not None and player.status == 'active'
+
+    def _player_participated_in_round(self, player_id: int, round_id: int) -> bool:
+        """
+        Check if a player participated in a round (i.e., has a pick for that round).
+
+        Args:
+            player_id: The player's database ID
+            round_id: The round's database ID
+
+        Returns:
+            True if the player has a pick for this round, False otherwise
+        """
+        return self._player_has_pick_for_round(player_id, round_id)
+
+    def _get_picks_grid_url(self) -> str:
+        """Get the URL to the picks grid page."""
+        base_url = os.environ.get('BASE_URL', 'http://localhost:5000').rstrip('/')
+        return f"{base_url}/picks-grid"
 
 
 # Create global scheduler instance
