@@ -130,6 +130,15 @@ class LMSScheduler:
                 replace_existing=True
             )
 
+            # Global invariant enforcement - catches any historical violations
+            self.scheduler.add_job(
+                func=self.enforce_global_elimination_invariant,
+                trigger=IntervalTrigger(hours=1),
+                id='enforce_invariant',
+                name='Enforce elimination invariant across all picks',
+                replace_existing=True
+            )
+
             self.scheduler.start()
             logger.info("Scheduler started with all jobs configured")
 
@@ -540,6 +549,10 @@ class LMSScheduler:
                     round_obj.status = 'completed'
                     logger.info(f"  Round {round_obj.round_number}: Marked as COMPLETED")
 
+                    # SAFEGUARD: Ensure no picks have is_winner=False AND is_eliminated=False
+                    # This is an invariant violation - if you lost, you MUST be eliminated
+                    self._enforce_elimination_invariant(round_obj)
+
                     # Check for game state changes
                     self._check_game_state(round_obj)
                     rounds_processed += 1
@@ -613,6 +626,115 @@ class LMSScheduler:
 
             # Send cycle complete notification
             self._send_cycle_complete_notification(active_players, next_cycle)
+
+    def _enforce_elimination_invariant(self, round_obj):
+        """
+        SAFEGUARD: Enforce the invariant that is_winner=False MUST mean is_eliminated=True.
+
+        This function:
+        1. Finds any picks where is_winner=False AND is_eliminated=False (invariant violation)
+        2. Logs loudly if any are found
+        3. Auto-corrects by setting is_eliminated=True and player.status='eliminated'
+
+        This should never happen if the code is correct, but this safeguard ensures
+        data integrity even if there's a bug elsewhere.
+        """
+        # Find picks that violate the invariant
+        violating_picks = Pick.query.filter_by(
+            round_id=round_obj.id,
+            is_winner=False,
+            is_eliminated=False
+        ).all()
+
+        if not violating_picks:
+            logger.debug(f"  Round {round_obj.round_number}: Elimination invariant OK (0 violations)")
+            return
+
+        # LOUDLY log the violation
+        logger.error("=" * 60)
+        logger.error("!!! ELIMINATION INVARIANT VIOLATION DETECTED !!!")
+        logger.error(f"Round {round_obj.round_number}: Found {len(violating_picks)} picks with is_winner=False AND is_eliminated=False")
+        logger.error("This should NEVER happen. Auto-correcting now...")
+        logger.error("=" * 60)
+
+        # Auto-correct each violation
+        corrected_count = 0
+        for pick in violating_picks:
+            player = pick.player
+            logger.error(
+                f"  AUTO-CORRECTING: pick_id={pick.id}, player='{player.name}' (id={player.id}), "
+                f"team='{pick.team_picked}' -> setting is_eliminated=True, player.status='eliminated'"
+            )
+
+            # Fix the pick
+            pick.is_eliminated = True
+
+            # Fix the player status
+            if player.status != 'eliminated':
+                player.status = 'eliminated'
+
+            corrected_count += 1
+
+        logger.error(f"  Auto-corrected {corrected_count} invariant violations for Round {round_obj.round_number}")
+        logger.error("=" * 60)
+
+    def enforce_global_elimination_invariant(self):
+        """
+        GLOBAL SAFEGUARD: Periodically scan ALL picks for invariant violations.
+
+        Invariant: is_winner=False MUST mean is_eliminated=True
+
+        This catches any historical violations that might have slipped through,
+        ensuring data integrity across the entire database.
+        """
+        with self.app.app_context():
+            try:
+                # Find ALL picks that violate the invariant (across all rounds)
+                violating_picks = Pick.query.filter_by(
+                    is_winner=False,
+                    is_eliminated=False
+                ).all()
+
+                if not violating_picks:
+                    logger.debug("Global elimination invariant check: OK (0 violations)")
+                    return
+
+                # LOUDLY log the violation
+                logger.error("=" * 60)
+                logger.error("!!! GLOBAL ELIMINATION INVARIANT VIOLATION DETECTED !!!")
+                logger.error(f"Found {len(violating_picks)} picks with is_winner=False AND is_eliminated=False")
+                logger.error("Auto-correcting now...")
+                logger.error("=" * 60)
+
+                # Auto-correct each violation
+                corrected_count = 0
+                for pick in violating_picks:
+                    player = pick.player
+                    round_obj = pick.round
+
+                    logger.error(
+                        f"  AUTO-CORRECTING: pick_id={pick.id}, round={round_obj.round_number}, "
+                        f"player='{player.name}' (id={player.id}), team='{pick.team_picked}' "
+                        f"-> setting is_eliminated=True, player.status='eliminated'"
+                    )
+
+                    # Fix the pick
+                    pick.is_eliminated = True
+
+                    # Fix the player status
+                    if player.status != 'eliminated':
+                        player.status = 'eliminated'
+
+                    corrected_count += 1
+
+                db.session.commit()
+
+                logger.error(f"Global invariant enforcement: Auto-corrected {corrected_count} violations")
+                logger.error("=" * 60)
+
+            except Exception as e:
+                logger.error(f"Error in global invariant enforcement: {e}")
+                db.session.rollback()
 
     def send_due_reminders(self):
         """Send reminders that are due via Telegram only.
