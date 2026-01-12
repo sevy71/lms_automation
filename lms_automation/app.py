@@ -980,75 +980,91 @@ def handle_player_by_id(player_id):
 @admin_required
 def handle_rounds():
     if request.method == 'GET':
-        rounds = Round.query.all()
+        rounds = Round.query.order_by(Round.id.asc()).all()
         return jsonify([{
             'id': r.id,
             'round_number': r.round_number,
+            'cycle_number': r.cycle_number,  # ✅ NEW
             'status': r.status,
+            'pl_matchday': r.pl_matchday,    # ✅ nice to include too
             'start_date': r.start_date.isoformat() if r.start_date else None,
-            'end_date': r.end_date.isoformat() if r.end_date else None
+            'end_date': r.end_date.isoformat() if r.end_date else None,
+            'first_kickoff_at': r.first_kickoff_at.isoformat() if r.first_kickoff_at else None,
+            'special_note': r.special_note
         } for r in rounds])
-    
+
     elif request.method == 'POST':
         try:
             data = request.get_json()
-            
+
             if not data or not data.get('round_number'):
                 return jsonify({'success': False, 'error': 'Round number is required'}), 400
-            
+
             round_number = data['round_number']
-            
-            # Check if round number already exists
-            existing_round = Round.query.filter_by(round_number=round_number).first()
+
+            # Get PL matchday
+            pl_matchday = data.get('pl_matchday')
+            if not pl_matchday:
+                return jsonify({'success': False, 'error': 'Premier League matchday is required'}), 400
+
+            # ✅ Determine cycle_number
+            cycle_number = data.get('cycle_number')
+            if cycle_number is None:
+                # Default to current/latest cycle in DB (prevents accidentally creating cycle 1 rounds)
+                cycle_number = db.session.query(db.func.max(Round.cycle_number)).scalar() or 1
+
+            # ✅ Check if round already exists *within the same cycle*
+            existing_round = Round.query.filter_by(
+                round_number=round_number,
+                cycle_number=cycle_number
+            ).first()
             if existing_round:
-                return jsonify({'success': False, 'error': f'Round {round_number} already exists'}), 400
-            
+                return jsonify({
+                    'success': False,
+                    'error': f'Round {round_number} already exists in cycle {cycle_number}'
+                }), 400
+
             # Parse dates if provided
             start_date = None
             end_date = None
-            
+
             if data.get('start_date'):
                 try:
                     start_date = datetime.fromisoformat(data['start_date'].replace('T', ' '))
                 except ValueError:
                     return jsonify({'success': False, 'error': 'Invalid start date format'}), 400
-            
+
             if data.get('end_date'):
                 try:
                     end_date = datetime.fromisoformat(data['end_date'].replace('T', ' '))
                 except ValueError:
                     return jsonify({'success': False, 'error': 'Invalid end date format'}), 400
-            
+
             # Validate date logic
             if start_date and end_date and start_date >= end_date:
                 return jsonify({'success': False, 'error': 'End date must be after start date'}), 400
-            
-            # Get PL matchday
-            pl_matchday = data.get('pl_matchday')
-            if not pl_matchday:
-                return jsonify({'success': False, 'error': 'Premier League matchday is required'}), 400
-            
-            # Create new round
+
+            # ✅ Create new round (cycle_number now set)
             new_round = Round(
                 round_number=round_number,
+                cycle_number=cycle_number,
                 pl_matchday=pl_matchday,
                 start_date=start_date,
                 end_date=end_date,
                 status=data.get('status', 'pending')
             )
-            
+
             db.session.add(new_round)
             db.session.flush()  # Get the ID before committing
-            
+
             # Fetch and populate fixtures
             try:
                 from football_api import FootballDataAPI
                 api = FootballDataAPI()
                 fixtures_data = api.get_premier_league_fixtures(pl_matchday)
                 formatted_fixtures = api.format_fixtures_for_db(fixtures_data, pl_matchday)
-                
+
                 if formatted_fixtures:
-                    # Create fixture records from API data
                     earliest_kickoff = None
                     for fixture_data in formatted_fixtures:
                         fixture = Fixture(
@@ -1063,7 +1079,7 @@ def handle_rounds():
                             status=fixture_data['status']
                         )
                         db.session.add(fixture)
-                        # Track earliest kickoff if date and time present
+
                         try:
                             if fixture_data['date'] and fixture_data['time']:
                                 dt = datetime.combine(fixture_data['date'], fixture_data['time'])
@@ -1071,33 +1087,34 @@ def handle_rounds():
                                     earliest_kickoff = dt
                         except Exception:
                             pass
+
                     if earliest_kickoff:
                         new_round.first_kickoff_at = earliest_kickoff
-                    
+
                     db.session.commit()
-                    
+
                     return jsonify({
-                        'success': True, 
-                        'id': new_round.id, 
+                        'success': True,
+                        'id': new_round.id,
                         'round_number': new_round.round_number,
+                        'cycle_number': new_round.cycle_number,  # ✅ NEW
                         'pl_matchday': new_round.pl_matchday,
                         'fixtures_added': len(formatted_fixtures)
                     })
                 else:
-                    # No fixtures from API, create fallback fixtures
                     raise Exception("No fixtures returned from API")
-                
+
             except Exception as fixture_error:
                 print(f"API failed, creating fallback fixtures: {fixture_error}")
-                # Create fallback Premier League fixtures for the round
+
                 fallback_fixtures = [
-                    ("Arsenal", "Chelsea"), ("Liverpool", "Manchester City"), 
+                    ("Arsenal", "Chelsea"), ("Liverpool", "Manchester City"),
                     ("Manchester United", "Tottenham"), ("Newcastle", "Brighton"),
                     ("Aston Villa", "West Ham"), ("Crystal Palace", "Everton"),
                     ("Fulham", "Brentford"), ("Wolves", "Nottingham Forest"),
                     ("Bournemouth", "Sheffield United"), ("Burnley", "Luton Town")
                 ]
-                
+
                 for i, (home_team, away_team) in enumerate(fallback_fixtures):
                     fixture = Fixture(
                         round_id=new_round.id,
@@ -1111,18 +1128,19 @@ def handle_rounds():
                         status='scheduled'
                     )
                     db.session.add(fixture)
-                
+
                 db.session.commit()
-                
+
                 return jsonify({
-                    'success': True, 
-                    'id': new_round.id, 
+                    'success': True,
+                    'id': new_round.id,
                     'round_number': new_round.round_number,
+                    'cycle_number': new_round.cycle_number,  # ✅ NEW
                     'pl_matchday': new_round.pl_matchday,
                     'fixtures_added': len(fallback_fixtures),
                     'warning': f'Round created with fallback fixtures (API failed): {str(fixture_error)}'
                 })
-            
+
         except Exception as e:
             db.session.rollback()
             return jsonify({'success': False, 'error': str(e)}), 500
