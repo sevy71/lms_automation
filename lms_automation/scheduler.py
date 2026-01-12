@@ -63,14 +63,17 @@ class LMSScheduler:
                 replace_existing=True
             )
 
-            # Process eliminations every hour
+            # Process eliminations (hourly prod, faster in test)
+            elim_interval_minutes = int(os.environ.get('ELIMINATION_INTERVAL_MINUTES', '60'))
             self.scheduler.add_job(
                 func=self.process_eliminations,
-                trigger=IntervalTrigger(hours=1),
+                trigger=IntervalTrigger(minutes=elim_interval_minutes),
                 id='process_eliminations',
                 name='Process eliminations and check for rollover',
+                next_run_time=datetime.now(),  # run immediately on boot (handy for testing)
                 replace_existing=True
             )
+            logger.info(f"Eliminations job configured with {elim_interval_minutes}-minute interval")
 
             # Send reminders every 15 minutes
             self.scheduler.add_job(
