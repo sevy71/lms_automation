@@ -14,6 +14,7 @@ from lms_automation.models import db, Round, Fixture, Pick, Player, ReminderSche
 from lms_automation.football_api import FootballDataAPI
 from lms_automation.notifications import NotificationService
 from lms_automation.team_utils import normalize_team_name, teams_match, find_matching_picks_for_team
+from lms_automation.eligibility import get_eligible_players_for_round
 import requests
 from typing import Optional
 
@@ -2042,56 +2043,8 @@ class LMSScheduler:
         logger.info("=" * 60)
 
     def _get_eligible_players_for_round(self, round_obj):
-        """
-        Get eligible players for a round based on survival from previous rounds.
-
-        A player is eligible if:
-        1. Their global status is 'active' (not already globally eliminated/winner)
-        2. They have NOT been eliminated in any previous round of this cycle
-
-        This ensures that even if the elimination job hasn't updated player.status yet,
-        we still respect per-round eliminations when generating tokens/sending messages.
-        """
-        # Start with globally active players
-        all_active_players = Player.query.filter_by(status='active').all()
-
-        if not round_obj:
-            return all_active_players
-
-        cycle_number = round_obj.cycle_number or 1
-
-        # Get all picks from previous rounds in this cycle that resulted in elimination
-        eliminated_player_ids = set()
-
-        # Find all rounds in this cycle before the current round
-        previous_rounds = Round.query.filter(
-            Round.cycle_number == cycle_number,
-            Round.round_number < round_obj.round_number
-        ).all()
-
-        for prev_round in previous_rounds:
-            eliminated_picks = Pick.query.filter_by(
-                round_id=prev_round.id,
-                is_eliminated=True
-            ).all()
-
-            for pick in eliminated_picks:
-                eliminated_player_ids.add(pick.player_id)
-
-        # Filter out eliminated players
-        eligible_players = [
-            player for player in all_active_players
-            if player.id not in eliminated_player_ids
-        ]
-
-        logger.info(
-            f"Eligibility check for Round {round_obj.round_number}: "
-            f"globally_active={len(all_active_players)}, "
-            f"eliminated_in_previous_rounds={len(eliminated_player_ids)}, "
-            f"eligible={len(eligible_players)}"
-        )
-
-        return eligible_players
+        """Delegate to canonical eligibility function in eligibility.py."""
+        return get_eligible_players_for_round(round_obj)
 
     def _player_has_pick_for_round(self, player_id: int, round_id: int) -> bool:
         """

@@ -1,18 +1,19 @@
 import os
+print("BOOT __file__ =", __file__)
+print("BOOT lines    =", sum(1 for _ in open(__file__, "r", encoding="utf-8")))
+print("BOOT commit   =", os.environ.get("RAILWAY_GIT_COMMIT_SHA") or os.environ.get("GIT_COMMIT"))
+
 from flask import Flask, render_template, request, jsonify, session, redirect, url_for, flash
 from flask_migrate import Migrate
+import os
 import sys
 from dotenv import load_dotenv
 from datetime import datetime, timedelta, timezone
 import urllib.parse
 from functools import wraps
-import random
 from io import BytesIO
 
 load_dotenv()
-
-# Import team utilities for consistent team name handling
-from lms_automation.team_utils import normalize_team_name as _normalize_team, display_name as _display_team, teams_match
 
 package_root = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.dirname(package_root)
@@ -42,9 +43,6 @@ def to_local(dt: datetime) -> datetime:
     except Exception:
         return dt
 
-def _football_season() -> str | None:
-    return os.environ.get('FOOTBALL_SEASON') or os.environ.get('SEASON')
-
 # --- Database configuration ---
 database_uri = os.environ.get('DATABASE_PUBLIC_URL') or os.environ.get('DATABASE_URL')
 if database_uri:
@@ -52,8 +50,10 @@ if database_uri:
     app.config['SQLALCHEMY_DATABASE_URI'] = database_uri.replace('postgres://', 'postgresql://')
     print("Using DATABASE_PUBLIC_URL" if os.environ.get('DATABASE_PUBLIC_URL') else "Using DATABASE_URL")
 else:
-    app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///instance/lms.db'
-    print("Using local SQLite database.")
+    app.config['SQLALCHEMY_DATABASE_URI'] = (
+        'sqlite:////Users/antoniosirignanonew/Projects/LMS2_telegram_experiment/instance/lms.db'
+    )
+    print("Using local SQLite database (absolute path).")
 
 print(f"Database URI set to: {app.config['SQLALCHEMY_DATABASE_URI']}")
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
@@ -62,10 +62,13 @@ app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 from lms_automation.extensions import db
 from lms_automation.models import Player, Round, Fixture, Pick, PickToken, ReminderSchedule
 from lms_automation.telegram_service import telegram_service
+from lms_automation.eligibility import get_eligible_players_for_round
 
 
 # Initialize db with app
 db.init_app(app)
+
+with app.app_context():
 
 migrate = Migrate(app, db)
 
@@ -226,155 +229,68 @@ ADMIN_PASSWORD = os.environ.get('ADMIN_PASSWORD', 'admin123')  # Change this!
 ADMIN_WHATSAPP = os.environ.get('ADMIN_WHATSAPP')  # Optional: admin WhatsApp number (e.g., +441234567890)
 
 # --- Helpers ---
-
-def _trigger_round_automation(round_obj):
-    """
-    Immediately generate tokens and send announcements for an active round.
-
-    Called when admin creates a round with status='active' to ensure players
-    receive pick links immediately rather than waiting for scheduler jobs.
-
-    Returns tuple: (tokens_created, announcements_sent)
-    """
-    import requests as http_requests
-
-    tokens_created = 0
-    announcements_sent = 0
-
-    try:
-        # Get eligible players (active players not eliminated in previous rounds of this cycle)
-        cycle_number = round_obj.cycle_number or 1
-        all_active_players = Player.query.filter_by(status='active').all()
-
-        # Find eliminated player IDs from previous rounds in this cycle
-        eliminated_player_ids = set()
-        previous_rounds = Round.query.filter(
-            Round.cycle_number == cycle_number,
-            Round.round_number < round_obj.round_number
-        ).all()
-
-        for prev_round in previous_rounds:
-            eliminated_picks = Pick.query.filter_by(
-                round_id=prev_round.id,
-                is_eliminated=True
-            ).all()
-            for pick in eliminated_picks:
-                eliminated_player_ids.add(pick.player_id)
-
-        eligible_players = [p for p in all_active_players if p.id not in eliminated_player_ids]
-
-        app.logger.info(
-            f"Round {round_obj.round_number} automation: {len(eligible_players)} eligible players"
-        )
-
-        # Generate tokens for eligible players
-        for player in eligible_players:
-            existing_token = PickToken.query.filter_by(
-                player_id=player.id,
-                round_id=round_obj.id
-            ).first()
-
-            if not existing_token:
-                token = PickToken.create_for_player_round(
-                    player.id, round_obj.id, expires_hours=168
-                )
-                db.session.add(token)
-                tokens_created += 1
-
-        db.session.commit()
-
-        # Send announcements via Telegram to eligible players
-        base_url = os.environ.get('BASE_URL', 'http://localhost:5000')
-        bot_token = os.environ.get('TELEGRAM_BOT_TOKEN')
-
-        if not bot_token:
-            app.logger.warning("TELEGRAM_BOT_TOKEN not set, skipping announcements")
-            return tokens_created, announcements_sent
-
-        for player in eligible_players:
-            # Skip players without telegram_id
-            if not (hasattr(player, 'telegram_id') and player.telegram_id):
-                continue
-
-            # Get token for this player
-            pick_token = PickToken.query.filter_by(
-                player_id=player.id,
-                round_id=round_obj.id
-            ).first()
-
-            if not pick_token:
-                continue
-
-            pick_url = f"{base_url}/pick/{pick_token.token}"
-
-            # Format deadline message
-            if round_obj.first_kickoff_at:
-                deadline_str = round_obj.first_kickoff_at.strftime('%A %d %B at %H:%M')
-            else:
-                deadline_str = "soon"
-
-            message = f"⚽ NEW ROUND {round_obj.round_number} IS LIVE!\n\n"
-            message += f"Make your pick before {deadline_str}"
-
-            # Send via Telegram API
-            try:
-                url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-                payload = {
-                    'chat_id': player.telegram_id,
-                    'text': message,
-                    'reply_markup': {
-                        'inline_keyboard': [[
-                            {'text': "⚽ Make Your Pick", 'url': pick_url}
-                        ]]
-                    }
-                }
-                response = http_requests.post(url, json=payload, timeout=10)
-                if response.status_code == 200:
-                    announcements_sent += 1
-                    app.logger.info(f"Sent round announcement to {player.name}")
-
-                    # Schedule reminders for this player (4h and 2h before kickoff)
-                    if round_obj.first_kickoff_at:
-                        reminder_4h = ReminderSchedule(
-                            player_id=player.id,
-                            round_id=round_obj.id,
-                            reminder_type='4_hour',
-                            scheduled_time=round_obj.first_kickoff_at - timedelta(hours=4),
-                            is_sent=False
-                        )
-                        db.session.add(reminder_4h)
-
-                        reminder_2h = ReminderSchedule(
-                            player_id=player.id,
-                            round_id=round_obj.id,
-                            reminder_type='2_hour',
-                            scheduled_time=round_obj.first_kickoff_at - timedelta(hours=2),
-                            is_sent=False
-                        )
-                        db.session.add(reminder_2h)
-
-            except Exception as e:
-                app.logger.warning(f"Failed to send announcement to {player.name}: {e}")
-
-        db.session.commit()
-        app.logger.info(
-            f"Round {round_obj.round_number} automation complete: "
-            f"tokens_created={tokens_created}, announcements_sent={announcements_sent}"
-        )
-
-    except Exception as e:
-        app.logger.error(f"Error in round automation: {e}")
-        db.session.rollback()
-
-    return tokens_created, announcements_sent
-
-
 def team_abbrev(team_name: str) -> str:
-    """
-    Get abbreviated/display name for a team.
-    Uses centralized team_utils for consistency across the application.
-    """
-    return _display_team(team_name)
+    if not team_name:
+        return ''
+
+    name = team_name.strip()
+    key = name.lower()
+    mapping = {
+        'arsenal': 'Arsenal',
+        'arsenal fc': 'Arsenal',
+        'aston villa': 'Villa',
+        'aston villa fc': 'Villa',
+        'afc bournemouth': 'Bournmouth',
+        'bournemouth': 'Bournmouth',
+        'bournemouth afc': 'Bournmouth',
+        'brentford': 'Brentford',
+        'brentford fc': 'Brentford',
+        'brighton': 'Brighton',
+        'brighton & hove albion': 'Brighton',
+        'brighton and hove albion': 'Brighton',
+        'brighton hove albion': 'Brighton',
+        'burnley': 'Burnley',
+        'burnley fc': 'Burnley',
+        'chelsea': 'Chelsea',
+        'chelsea fc': 'Chelsea',
+        'crystal palace': 'Palace',
+        'crystal palace fc': 'Palace',
+        'palace': 'Palace',
+        'everton': 'Everton',
+        'everton fc': 'Everton',
+        'fulham': 'Fulham',
+        'fulham fc': 'Fulham',
+        'leeds': 'Leeds',
+        'leeds united': 'Leeds',
+        'leeds united fc': 'Leeds',
+        'liverpool': 'Liverpool',
+        'liverpool fc': 'Liverpool',
+        'manchester city': 'Man City',
+        'manchester city fc': 'Man City',
+        'man city': 'Man City',
+        'manchester united': 'Man UTD',
+        'manchester united fc': 'Man UTD',
+        'man united': 'Man UTD',
+        'newcastle': 'Newcastle',
+        'newcastle united': 'Newcastle',
+        'newcastle united fc': 'Newcastle',
+        'nottingham forest': 'Forest',
+        'nottm forest': 'Forest',
+        'forest': 'Forest',
+        'sunderland': 'Sunderland',
+        'sunderland afc': 'Sunderland',
+        'tottenham': 'Spurs',
+        'tottenham hotspur': 'Spurs',
+        'tottenham hotspur fc': 'Spurs',
+        'spurs': 'Spurs',
+        'west ham': 'West Ham',
+        'west ham united': 'West Ham',
+        'west ham united fc': 'West Ham',
+        'wolverhampton wanderers': 'Wolves',
+        'wolverhampton': 'Wolves',
+        'wolves': 'Wolves'
+    }
+    return mapping.get(key, name)
 
 def generate_picks_grid_xlsx():
     """Generate XLSX file for picks grid. Returns BytesIO object."""
@@ -496,118 +412,6 @@ def admin_logout():
     flash('You have been logged out', 'info')
     return redirect(url_for('index'))
 
-def _get_tony_player():
-    player = Player.query.filter_by(name="Tony").first()
-    if not player:
-        player = Player.query.filter_by(whatsapp_number="07545851594").first()
-    return player
-
-def _telegram_field_name():
-    if hasattr(Player, "telegram_id"):
-        return "telegram_id"
-    if hasattr(Player, "telegram_chat_id"):
-        return "telegram_chat_id"
-    return None
-
-@app.route('/admin/link-telegram')
-@admin_required
-def link_tony_telegram():
-    player = _get_tony_player()
-    if not player:
-        return "Tony not found (name or whatsapp_number).", 404
-
-    field_name = _telegram_field_name()
-    if not field_name:
-        return "No telegram field found on Player model.", 500
-
-    setattr(player, field_name, 441421387)
-    db.session.commit()
-    return "Linked Tony to 441421387"
-
-@app.route('/admin/whoami-telegram')
-@admin_required
-def whoami_telegram():
-    player = _get_tony_player()
-    if not player:
-        return "Tony not found (name or whatsapp_number).", 404
-
-    field_name = _telegram_field_name()
-    if not field_name:
-        return "No telegram field found on Player model.", 500
-
-    value = getattr(player, field_name)
-    return str(value) if value else "not set"
-
-@app.route('/admin/seed-random-picks')
-@admin_required
-def seed_random_picks():
-    try:
-        round_id = request.args.get('round_id', type=int)
-        if not round_id:
-            return jsonify({'error': 'round_id is required'}), 400
-
-        count = request.args.get('count', default=25, type=int)
-        only_missing = str(request.args.get('only_missing', '1')).lower() in ('1', 'true', 'yes', 'y')
-
-        round_obj = Round.query.get_or_404(round_id)
-        fixtures = Fixture.query.filter_by(round_id=round_id).all()
-        if not fixtures:
-            return jsonify({
-                'round_id': round_id,
-                'created': 0,
-                'skipped_existing': 0,
-                'skipped_no_fixtures': count
-            })
-
-        teams_in_round = _eligible_teams_for_round(round_obj)
-        players = Player.query.order_by(Player.id).all()
-
-        created = 0
-        skipped_existing = 0
-
-        for player in players:
-            if created >= count:
-                break
-            existing_pick = Pick.query.filter_by(player_id=player.id, round_id=round_id).first()
-            if existing_pick:
-                if only_missing:
-                    skipped_existing += 1
-                    continue
-
-            used_teams = _teams_used_this_cycle(player.id, round_obj.cycle_number or 1)
-            available = list(teams_in_round - used_teams)
-            if available:
-                team_picked = random.choice(sorted(available))
-            else:
-                team_picked = random.choice(sorted(teams_in_round))
-
-            pick = Pick(
-                player_id=player.id,
-                round_id=round_id,
-                team_picked=team_picked,
-                timestamp=datetime.utcnow()
-            )
-            db.session.add(pick)
-            created += 1
-            app.logger.info(
-                "Seeded pick: player=%s id=%s team=%s round=%s",
-                player.name,
-                player.id,
-                team_picked,
-                round_id
-            )
-
-        db.session.commit()
-        return jsonify({
-            'round_id': round_id,
-            'created': created,
-            'skipped_existing': skipped_existing,
-            'skipped_no_fixtures': 0
-        })
-    except Exception as e:
-        db.session.rollback()
-        return jsonify({'error': str(e)}), 500
-
 @app.route('/admin/change-password', methods=['POST'])
 @admin_required
 def change_admin_password():
@@ -726,7 +530,8 @@ def current_round_picks_status():
                 'admin_whatsapp_link': None
             })
 
-        active_players = Player.query.filter_by(status='active').all()
+        # Use canonical eligibility to respect cycle-based eliminations
+        active_players = get_eligible_players_for_round(round_obj)
         active_ids = [p.id for p in active_players]
 
         if not active_ids:
@@ -796,44 +601,30 @@ def _earliest_kickoff_for_round(round_obj: Round):
         return None
 
 def _eligible_teams_for_round(round_obj: Round):
-    """Return the set of CANONICAL team names playing in this round.
-
-    All team names are normalized to ensure consistent comparison
-    and alphabetical ordering (e.g., 'AFC Bournemouth' -> 'Bournemouth').
-    """
+    """Return the set of team names playing in this round."""
     teams = set()
     for fx in round_obj.fixtures or []:
         if fx.home_team:
-            teams.add(_normalize_team(fx.home_team))
+            teams.add(fx.home_team)
         if fx.away_team:
-            teams.add(_normalize_team(fx.away_team))
+            teams.add(fx.away_team)
     return teams
 
 def _teams_used_this_cycle(player_id: int, cycle_number: int):
-    """Return a set of CANONICAL team names the player has used in the current cycle.
-
-    All team names are normalized to ensure consistent comparison
-    (e.g., if player picked 'AFC Bournemouth', it returns 'Bournemouth').
-    """
+    """Return a set of team names the player has used in the current cycle."""
     picks = Pick.query.filter_by(player_id=player_id).join(Round).filter(Round.cycle_number == cycle_number).all()
-    return {_normalize_team(p.team_picked) for p in picks}
+    return {p.team_picked for p in picks}
 
 def _opposing_team_from_past_pick(pick: Pick) -> str:
-    """Find the opposing team (CANONICAL name) for a given past pick.
-
-    Uses teams_match() for comparison to handle name variations like
-    'AFC Bournemouth' vs 'Bournemouth'.
-    Returns the CANONICAL opponent team name.
-    """
+    """Find the opposing team for a given past pick, using that pick's round fixtures."""
     try:
         r = pick.round
         fixtures = r.fixtures or []
-        pick_team_canonical = _normalize_team(pick.team_picked)
         for fx in fixtures:
-            if _normalize_team(fx.home_team) == pick_team_canonical:
-                return _normalize_team(fx.away_team)
-            if _normalize_team(fx.away_team) == pick_team_canonical:
-                return _normalize_team(fx.home_team)
+            if fx.home_team == pick.team_picked:
+                return fx.away_team
+            if fx.away_team == pick.team_picked:
+                return fx.home_team
         return None
     except Exception:
         return None
@@ -867,7 +658,8 @@ def apply_missed_picks(round_id):
 
         # Build sets
         eligible_teams = _eligible_teams_for_round(round_obj)
-        active_players = Player.query.filter_by(status='active').all()
+        # Use canonical eligibility to respect cycle-based eliminations
+        active_players = get_eligible_players_for_round(round_obj)
         applied = []
         skipped = []
 
@@ -932,7 +724,8 @@ def send_picks():
     if not current_round:
         return "No active round found", 404
 
-    active_players = Player.query.filter_by(status='active').all()
+    # Use canonical eligibility to respect cycle-based eliminations
+    active_players = get_eligible_players_for_round(current_round)
 
     sent_count = 0
     skipped_missing = 0
@@ -1249,12 +1042,9 @@ def handle_rounds():
             
             # Fetch and populate fixtures
             try:
-                from lms_automation.football_api import FootballDataAPI
+                from football_api import FootballDataAPI
                 api = FootballDataAPI()
-                fixtures_data = api.get_premier_league_fixtures(
-                    matchday=pl_matchday,
-                    season=_football_season()
-                )
+                fixtures_data = api.get_premier_league_fixtures(pl_matchday)
                 formatted_fixtures = api.format_fixtures_for_db(fixtures_data, pl_matchday)
                 
                 if formatted_fixtures:
@@ -1283,25 +1073,15 @@ def handle_rounds():
                             pass
                     if earliest_kickoff:
                         new_round.first_kickoff_at = earliest_kickoff
-                        if not new_round.end_date:
-                            new_round.end_date = earliest_kickoff - timedelta(hours=1)
-
+                    
                     db.session.commit()
-
-                    # If round is created as 'active', immediately generate tokens and send announcements
-                    tokens_created = 0
-                    announcements_sent = 0
-                    if new_round.status == 'active':
-                        tokens_created, announcements_sent = _trigger_round_automation(new_round)
-
+                    
                     return jsonify({
-                        'success': True,
-                        'id': new_round.id,
+                        'success': True, 
+                        'id': new_round.id, 
                         'round_number': new_round.round_number,
                         'pl_matchday': new_round.pl_matchday,
-                        'fixtures_added': len(formatted_fixtures),
-                        'tokens_created': tokens_created,
-                        'announcements_sent': announcements_sent
+                        'fixtures_added': len(formatted_fixtures)
                     })
                 else:
                     # No fixtures from API, create fallback fixtures
@@ -1311,13 +1091,13 @@ def handle_rounds():
                 print(f"API failed, creating fallback fixtures: {fixture_error}")
                 # Create fallback Premier League fixtures for the round
                 fallback_fixtures = [
-                    ("Arsenal", "Chelsea"), ("Liverpool", "Manchester City"),
+                    ("Arsenal", "Chelsea"), ("Liverpool", "Manchester City"), 
                     ("Manchester United", "Tottenham"), ("Newcastle", "Brighton"),
                     ("Aston Villa", "West Ham"), ("Crystal Palace", "Everton"),
                     ("Fulham", "Brentford"), ("Wolves", "Nottingham Forest"),
                     ("Bournemouth", "Sheffield United"), ("Burnley", "Luton Town")
                 ]
-
+                
                 for i, (home_team, away_team) in enumerate(fallback_fixtures):
                     fixture = Fixture(
                         round_id=new_round.id,
@@ -1331,24 +1111,16 @@ def handle_rounds():
                         status='scheduled'
                     )
                     db.session.add(fixture)
-
+                
                 db.session.commit()
-
-                # If round is created as 'active', immediately generate tokens and send announcements
-                tokens_created = 0
-                announcements_sent = 0
-                if new_round.status == 'active':
-                    tokens_created, announcements_sent = _trigger_round_automation(new_round)
-
+                
                 return jsonify({
-                    'success': True,
-                    'id': new_round.id,
+                    'success': True, 
+                    'id': new_round.id, 
                     'round_number': new_round.round_number,
                     'pl_matchday': new_round.pl_matchday,
                     'fixtures_added': len(fallback_fixtures),
-                    'tokens_created': tokens_created,
-                    'announcements_sent': announcements_sent,
-                    'warning': f'Football API unavailable: {str(fixture_error)}. Used fallback fixtures.'
+                    'warning': f'Round created with fallback fixtures (API failed): {str(fixture_error)}'
                 })
             
         except Exception as e:
@@ -1393,19 +1165,17 @@ def get_available_matchdays():
         
         # Optional: Try to get real data from API if available
         try:
-            from lms_automation.football_api import FootballDataAPI
+            from football_api import FootballDataAPI
             api = FootballDataAPI()
             print("Attempting to get real matchday data from API...")
-            fixtures_data = api.get_premier_league_fixtures(season=_football_season())
-            matches = fixtures_data.get('matches', []) if fixtures_data else []
-            if not matches:
-                raise Exception("Football API returned no matches")
-            if matches:
-                print(f"Got {len(matches)} matches from API")
+            
+            fixtures_data = api.get_premier_league_fixtures(season='2025')
+            if fixtures_data and fixtures_data.get('matches'):
+                print(f"Got {len(fixtures_data['matches'])} matches from API")
                 
                 # Extract real matchdays
                 real_matchdays = set()
-                for match in matches:
+                for match in fixtures_data.get('matches', []):
                     if match.get('matchday'):
                         real_matchdays.add(match['matchday'])
                 
@@ -1414,7 +1184,7 @@ def get_available_matchdays():
                     # Replace fallback with real data
                     matchday_data = []
                     for matchday in sorted(real_matchdays):
-                        fixture_count = len([m for m in matches if m.get('matchday') == matchday])
+                        fixture_count = len([m for m in fixtures_data['matches'] if m.get('matchday') == matchday])
                         matchday_data.append({
                             'matchday': matchday,
                             'fixture_count': fixture_count,
@@ -1426,12 +1196,6 @@ def get_available_matchdays():
             
         except Exception as api_error:
             print(f"API failed (using fallback): {api_error}")
-            return jsonify({
-                'success': True,
-                'matchdays': matchday_data,
-                'source': 'fallback',
-                'warning': f'Football API unavailable: {str(api_error)}'
-            })
         
         # Return fallback data
         print("Using fallback matchday data")
@@ -1464,19 +1228,13 @@ def get_matchday_info(matchday):
         
         # Try to get real API data to enhance the info
         try:
-            from lms_automation.football_api import FootballDataAPI
+            from football_api import FootballDataAPI
             api = FootballDataAPI()
             print(f"Attempting to get real data for matchday {matchday}")
-
-            fixtures_data = api.get_premier_league_fixtures(
-                matchday=matchday,
-                season=_football_season()
-            )
-            matches = fixtures_data.get('matches', []) if fixtures_data else []
-
-            if not matches:
-                raise Exception("Football API returned no matches")
-
+            
+            fixtures_data = api.get_premier_league_fixtures(matchday=matchday, season='2025')
+            matches = fixtures_data.get('matches', [])
+            
             if matches:
                 print(f"Got {len(matches)} matches for matchday {matchday}")
                 
@@ -1502,12 +1260,6 @@ def get_matchday_info(matchday):
             
         except Exception as api_error:
             print(f"API failed for matchday {matchday}: {api_error}")
-            return jsonify({
-                'success': True,
-                'info': info,
-                'source': 'fallback',
-                'warning': f'Football API unavailable: {str(api_error)}'
-            })
         
         # Return fallback info
         print(f"Using fallback data for matchday {matchday}")
@@ -1630,12 +1382,9 @@ def add_fixtures_to_round(round_id):
         
         # Try to get fixtures from API
         try:
-            from lms_automation.football_api import FootballDataAPI
+            from football_api import FootballDataAPI
             api = FootballDataAPI()
-            fixtures_data = api.get_premier_league_fixtures(
-                matchday=round_obj.pl_matchday,
-                season=_football_season()
-            )
+            fixtures_data = api.get_premier_league_fixtures(round_obj.pl_matchday)
             formatted_fixtures = api.format_fixtures_for_db(fixtures_data, round_obj.pl_matchday)
             
             if formatted_fixtures:
@@ -1705,7 +1454,7 @@ def add_fixtures_to_round(round_id):
                 'success': True,
                 'fixtures_added': len(fallback_fixtures),
                 'source': 'fallback',
-                'warning': f'Football API unavailable: {str(api_error)}. Used fallback fixtures.'
+                'warning': f'Used fallback fixtures due to API error: {str(api_error)}'
             })
         
     except Exception as e:
@@ -1772,50 +1521,36 @@ def auto_populate_results(round_id):
             return jsonify({'success': False, 'error': 'No fixtures found for this round'}), 400
         
         # Get updated results from API
-        from lms_automation.football_api import FootballDataAPI
+        from football_api import FootballDataAPI
         api = FootballDataAPI()
-        fixtures_data = api.get_premier_league_fixtures(
-            matchday=round_obj.pl_matchday,
-            season=_football_season()
-        )
+        fixtures_data = api.get_premier_league_fixtures(round_obj.pl_matchday)
         
         if not fixtures_data or not fixtures_data.get('matches'):
             return jsonify({'success': False, 'error': 'Unable to fetch results from football API'}), 500
         
         updated_count = 0
         api_matches = fixtures_data['matches']
-        matches_by_id = {
-            str(m.get('id')): m for m in api_matches if m.get('id') is not None
-        }
         
         # Update fixtures with API results
         for fixture in fixtures:
-            api_match = None
-            if fixture.event_id:
-                api_match = matches_by_id.get(str(fixture.event_id))
-
-            if not api_match:
-                for candidate in api_matches:
-                    if (candidate.get('homeTeam', {}).get('name') == fixture.home_team and
-                        candidate.get('awayTeam', {}).get('name') == fixture.away_team):
-                        api_match = candidate
-                        break
-
-            if not api_match:
-                continue
-
-            # Check if match is finished and has scores
-            if api_match.get('status') == 'FINISHED':
-                score = api_match.get('score', {})
-                full_time = score.get('fullTime', {})
-                home_score = full_time.get('home')
-                away_score = full_time.get('away')
-
-                if home_score is not None and away_score is not None:
-                    fixture.home_score = home_score
-                    fixture.away_score = away_score
-                    fixture.status = 'completed'
-                    updated_count += 1
+            # Find matching API fixture by team names
+            for api_match in api_matches:
+                if (api_match.get('homeTeam', {}).get('name') == fixture.home_team and 
+                    api_match.get('awayTeam', {}).get('name') == fixture.away_team):
+                    
+                    # Check if match is finished and has scores
+                    if api_match.get('status') == 'FINISHED':
+                        score = api_match.get('score', {})
+                        full_time = score.get('fullTime', {})
+                        home_score = full_time.get('home')
+                        away_score = full_time.get('away')
+                        
+                        if home_score is not None and away_score is not None:
+                            fixture.home_score = home_score
+                            fixture.away_score = away_score
+                            fixture.status = 'completed'
+                            updated_count += 1
+                    break
         
         if updated_count > 0:
             db.session.commit()
@@ -1828,7 +1563,7 @@ def auto_populate_results(round_id):
         
     except Exception as e:
         db.session.rollback()
-        return jsonify({'success': False, 'error': f'Football API unavailable: {str(e)}'}), 502
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 @app.route('/api/players/<int:player_id>/status', methods=['PUT'])
 @admin_required
@@ -2854,13 +2589,27 @@ def make_pick(token):
     previous_picks = Pick.query.filter_by(player_id=player.id).all()
     used_teams = [pick.team_picked for pick in previous_picks]
     
-    # Use centralized team normalization for consistent matching
+    # Create a normalized team matching function to handle name variations
+    def normalize_team_name(team_name):
+        """Normalize team names for comparison"""
+        if not team_name:
+            return ""
+        # Remove common suffixes and normalize
+        normalized = team_name.lower()
+        normalized = normalized.replace(' fc', '').replace(' afc', '').replace(' united fc', '')
+        normalized = normalized.replace('tottenham hotspur', 'spurs').replace('nottingham forest', 'forest')
+        normalized = normalized.replace('wolverhampton wanderers', 'wolves')
+        normalized = normalized.replace('brighton & hove albion', 'brighton')
+        normalized = normalized.replace('afc bournemouth', 'bournemouth')
+        normalized = normalized.replace('west ham united', 'west ham')
+        return normalized.strip()
+    
     # Create a set of normalized used team names for faster lookup
-    normalized_used_teams = {_normalize_team(team) for team in used_teams}
-
-    # Function to check if a team is already used (using normalized comparison)
+    normalized_used_teams = {normalize_team_name(team) for team in used_teams}
+    
+    # Function to check if a team is already used
     def is_team_used(fixture_team_name):
-        return _normalize_team(fixture_team_name) in normalized_used_teams
+        return normalize_team_name(fixture_team_name) in normalized_used_teams
     
     # Debug logging for team availability
     all_teams = []
@@ -3553,14 +3302,10 @@ def submit_pick_api():
     try:
         data = request.json
         token = data.get('token')
-        team_picked_raw = data.get('team')
+        team_picked = data.get('team')
 
-        if not token or not team_picked_raw:
+        if not token or not team_picked:
             return jsonify({'success': False, 'error': 'Token and team are required'}), 400
-
-        # Normalize the team name to canonical form
-        # This ensures 'AFC Bournemouth' -> 'Bournemouth', etc.
-        team_picked = _normalize_team(team_picked_raw)
 
         # Find the pick token
         pick_token = PickToken.query.filter_by(token=token).first()
@@ -3579,12 +3324,12 @@ def submit_pick_api():
         player = pick_token.player
         round_obj = pick_token.round
 
-        # Validate team is available (both sets are canonical names)
-        teams_in_round = _eligible_teams_for_round(round_obj)
+        # Validate team is available
+        teams_in_round = _teams_in_round(round_obj.id)
         if team_picked not in teams_in_round:
             return jsonify({'success': False, 'error': f'{team_picked} is not playing in this round'}), 400
 
-        # Check if team already used by player in this cycle (both are canonical)
+        # Check if team already used by player in this cycle
         used_teams = _teams_used_this_cycle(player.id, round_obj.cycle_number or 1)
         if team_picked in used_teams:
             return jsonify({'success': False, 'error': f'You have already used {team_picked} in this cycle'}), 400
@@ -3596,12 +3341,12 @@ def submit_pick_api():
         ).first()
 
         if pick:
-            # Update existing pick - store CANONICAL name
+            # Update existing pick
             pick.team_picked = team_picked
             pick.last_edited_at = datetime.now()
             message = f'Pick updated to {team_picked} for Round {round_obj.round_number}'
         else:
-            # Create new pick - store CANONICAL name
+            # Create new pick
             pick = Pick(
                 player_id=player.id,
                 round_id=round_obj.id,
@@ -3729,13 +3474,14 @@ def start_new_cycle():
 @app.route('/api/automation/generate-tokens/<int:round_id>', methods=['POST'])
 @admin_required
 def generate_tokens_for_round(round_id):
-    """Generate pick tokens for all active players for a specific round"""
+    """Generate pick tokens for all eligible players for a specific round"""
     try:
         round_obj = Round.query.get(round_id)
         if not round_obj:
             return jsonify({'success': False, 'error': 'Round not found'}), 404
 
-        active_players = Player.query.filter_by(status='active').all()
+        # Use canonical eligibility to respect cycle-based eliminations
+        active_players = get_eligible_players_for_round(round_obj)
         tokens_created = []
 
         for player in active_players:
@@ -3772,835 +3518,11 @@ def generate_tokens_for_round(round_id):
         app.logger.error(f"Error in generate_tokens_for_round: {str(e)}")
         return jsonify({'success': False, 'error': str(e)}), 500
 
-# --- Test/Debug Admin Endpoints ---
-# These endpoints allow rapid testing with completed matchdays
-# Protected by ENABLE_TEST_ENDPOINTS + ADMIN_TEST_TOKEN for production safety
-
-import secrets
-
-def _test_endpoints_enabled():
-    """Check if test endpoints are enabled via env var."""
-    return os.environ.get('ENABLE_TEST_ENDPOINTS', 'false').lower() == 'true'
-
-def _validate_test_token():
-    """
-    Validate the X-Admin-Test-Token header against ADMIN_TEST_TOKEN env var.
-    Returns (is_valid, error_response) tuple.
-    """
-    expected_token = os.environ.get('ADMIN_TEST_TOKEN', '')
-    provided_token = request.headers.get('X-Admin-Test-Token', '')
-
-    if not expected_token:
-        return False, (jsonify({'error': 'ADMIN_TEST_TOKEN not configured'}), 500)
-
-    if not provided_token:
-        return False, (jsonify({'error': 'Missing X-Admin-Test-Token header'}), 403)
-
-    # Use constant-time comparison to prevent timing attacks
-    if not secrets.compare_digest(expected_token, provided_token):
-        return False, (jsonify({'error': 'Invalid token'}), 403)
-
-    return True, None
-
-def test_endpoint_guard(f):
-    """
-    Decorator that guards test endpoints:
-    - Returns 404 if ENABLE_TEST_ENDPOINTS != 'true'
-    - Returns 403 if X-Admin-Test-Token is missing or invalid
-    - Never logs the token value
-    """
-    @wraps(f)
-    def decorated_function(*args, **kwargs):
-        # Check if test endpoints are enabled
-        if not _test_endpoints_enabled():
-            return jsonify({'error': 'Not found'}), 404
-
-        # Validate token
-        is_valid, error_response = _validate_test_token()
-        if not is_valid:
-            app.logger.warning(f"Test endpoint auth failed for {request.endpoint} from {request.remote_addr}")
-            return error_response
-
-        return f(*args, **kwargs)
-    return decorated_function
-
-
-@app.route('/admin/sync_matchday_to_round', methods=['POST'])
-@test_endpoint_guard
-def admin_sync_matchday_to_round():
-    """
-    Sync a specific matchday from Football-Data API into a chosen round.
-
-    This allows testing with completed matchdays (e.g., matchday 20 or 21).
-
-    Headers:
-        X-Admin-Test-Token: <ADMIN_TEST_TOKEN value>
-
-    Body: {
-        "round_id": <int>,
-        "matchday": <int>,
-        "force": <bool>  # Optional: if true, deletes existing fixtures first
-    }
-
-    It will:
-    - Fetch matches for that matchday from Football-Data API
-    - By default, refuse if fixtures already exist (409 Conflict)
-    - If force=true, delete existing fixtures and re-sync
-    - Upsert fixtures into the specified round
-    - Set round.first_kickoff_at from MIN(date+time)
-    - Mark fixture status/scores from API response
-    - Return detailed verification info
-    """
-    from lms_automation.football_api import FootballDataAPI
-
-    try:
-        data = request.get_json() or {}
-        round_id = data.get('round_id')
-        matchday = data.get('matchday')
-        force = data.get('force', False)
-
-        if not round_id or not matchday:
-            return jsonify({
-                'success': False,
-                'error': 'Both round_id and matchday are required'
-            }), 400
-
-        round_obj = Round.query.get(round_id)
-        if not round_obj:
-            return jsonify({
-                'success': False,
-                'error': f'Round {round_id} not found'
-            }), 404
-
-        # Check for existing fixtures
-        existing_fixtures = Fixture.query.filter_by(round_id=round_id).all()
-        if existing_fixtures and not force:
-            return jsonify({
-                'success': False,
-                'error': f'Round {round_id} already has {len(existing_fixtures)} fixtures. Use "force": true to overwrite.',
-                'existing_fixture_count': len(existing_fixtures)
-            }), 409
-
-        # If force=true and fixtures exist, delete them
-        deleted_count = 0
-        if existing_fixtures and force:
-            for fx in existing_fixtures:
-                db.session.delete(fx)
-            deleted_count = len(existing_fixtures)
-            app.logger.info(f"Force mode: deleted {deleted_count} existing fixtures for round {round_id}")
-
-        # Initialize API
-        api = FootballDataAPI()
-        season = os.environ.get('FOOTBALL_SEASON') or os.environ.get('SEASON')
-
-        app.logger.info(f"=== SYNC MATCHDAY {matchday} TO ROUND {round_id} ===")
-        app.logger.info(f"Season: {season}, Force: {force}")
-
-        # Fetch fixtures from API
-        fixtures_data = api.get_premier_league_fixtures(matchday=matchday, season=season)
-
-        if not fixtures_data or 'matches' not in fixtures_data:
-            return jsonify({
-                'success': False,
-                'error': f'No data returned for matchday {matchday}'
-            }), 400
-
-        matches = fixtures_data.get('matches', [])
-        app.logger.info(f"Fetched {len(matches)} matches from API")
-
-        # Count API status breakdown
-        api_status_counts = {}
-        for match in matches:
-            status = match.get('status', 'UNKNOWN')
-            api_status_counts[status] = api_status_counts.get(status, 0) + 1
-
-        created_count = 0
-        updated_count = 0
-        earliest_kickoff = None
-        latest_kickoff = None
-
-        for match in matches:
-            if match.get('matchday') != matchday:
-                continue
-
-            # Parse match date/time
-            match_date = None
-            match_time = None
-            kickoff_dt = None
-
-            if match.get('utcDate'):
-                try:
-                    dt = datetime.fromisoformat(match['utcDate'].replace('Z', '+00:00'))
-                    match_date = dt.date()
-                    match_time = dt.time()
-                    kickoff_dt = dt.replace(tzinfo=None)  # Store as naive UTC
-
-                    if earliest_kickoff is None or kickoff_dt < earliest_kickoff:
-                        earliest_kickoff = kickoff_dt
-                    if latest_kickoff is None or kickoff_dt > latest_kickoff:
-                        latest_kickoff = kickoff_dt
-                except ValueError as e:
-                    app.logger.warning(f"Failed to parse date: {match.get('utcDate')}: {e}")
-
-            # Extract team names
-            home_team = match.get('homeTeam', {}).get('name', 'TBD')
-            away_team = match.get('awayTeam', {}).get('name', 'TBD')
-            event_id = str(match.get('id')) if match.get('id') else None
-
-            # Extract scores
-            score = match.get('score', {})
-            full_time = score.get('fullTime', {})
-            home_score = full_time.get('home')
-            away_score = full_time.get('away')
-
-            # Map status
-            status_map = {
-                'SCHEDULED': 'scheduled',
-                'TIMED': 'scheduled',
-                'LIVE': 'live',
-                'IN_PLAY': 'live',
-                'PAUSED': 'live',
-                'FINISHED': 'completed',
-                'POSTPONED': 'postponed',
-                'SUSPENDED': 'postponed',
-                'CANCELLED': 'postponed'
-            }
-            fixture_status = status_map.get(match.get('status'), 'scheduled')
-
-            # Try to find existing fixture (only relevant if not force-deleted)
-            fixture = None
-            if not force:
-                if event_id:
-                    fixture = Fixture.query.filter_by(round_id=round_id, event_id=event_id).first()
-                if not fixture:
-                    fixture = Fixture.query.filter_by(
-                        round_id=round_id,
-                        home_team=home_team,
-                        away_team=away_team
-                    ).first()
-
-            if fixture:
-                # Update existing
-                fixture.event_id = event_id or fixture.event_id
-                fixture.date = match_date
-                fixture.time = match_time
-                fixture.home_score = home_score
-                fixture.away_score = away_score
-                fixture.status = fixture_status
-                updated_count += 1
-                app.logger.info(
-                    f"  Updated: {home_team} {home_score}-{away_score} {away_team} (status={fixture_status})"
-                )
-            else:
-                # Create new
-                fixture = Fixture(
-                    round_id=round_id,
-                    event_id=event_id,
-                    home_team=home_team,
-                    away_team=away_team,
-                    date=match_date,
-                    time=match_time,
-                    home_score=home_score,
-                    away_score=away_score,
-                    status=fixture_status
-                )
-                db.session.add(fixture)
-                created_count += 1
-                app.logger.info(
-                    f"  Created: {home_team} {home_score}-{away_score} {away_team} (status={fixture_status})"
-                )
-
-        # Update round metadata
-        if earliest_kickoff:
-            round_obj.first_kickoff_at = earliest_kickoff
-            round_obj.pl_matchday = matchday
-            app.logger.info(f"  Set round.first_kickoff_at = {earliest_kickoff}")
-            app.logger.info(f"  Set round.pl_matchday = {matchday}")
-
-        db.session.commit()
-
-        # Build response with detailed verification info
-        date_range = None
-        if earliest_kickoff and latest_kickoff:
-            date_range = f"{earliest_kickoff.strftime('%Y-%m-%d %H:%M')} to {latest_kickoff.strftime('%Y-%m-%d %H:%M')}"
-
-        result = {
-            'success': True,
-            'request': {
-                'round_id': round_id,
-                'matchday': matchday,
-                'season': season,
-                'force': force
-            },
-            'api_response': {
-                'matches_returned': len(matches),
-                'status_breakdown': api_status_counts
-            },
-            'changes': {
-                'fixtures_deleted': deleted_count,
-                'fixtures_created': created_count,
-                'fixtures_updated': updated_count,
-                'total_fixtures': created_count + updated_count
-            },
-            'round_state': {
-                'round_number': round_obj.round_number,
-                'pl_matchday': round_obj.pl_matchday,
-                'first_kickoff_at': round_obj.first_kickoff_at.isoformat() if round_obj.first_kickoff_at else None,
-                'status': round_obj.status
-            },
-            'date_range': date_range
-        }
-
-        app.logger.info(f"=== SYNC COMPLETE: deleted={deleted_count}, created={created_count}, updated={updated_count} ===")
-
-        return jsonify(result)
-
-    except Exception as e:
-        db.session.rollback()
-        app.logger.error(f"Error in sync_matchday_to_round: {str(e)}")
-        import traceback
-        app.logger.error(traceback.format_exc())
-        return jsonify({'success': False, 'error': str(e)}), 500
-
-
-@app.route('/admin/process_round_now', methods=['POST'])
-@test_endpoint_guard
-def admin_process_round_now():
-    """
-    Process a round immediately: update fixture results, evaluate picks, update player status.
-
-    Headers:
-        X-Admin-Test-Token: <ADMIN_TEST_TOKEN value>
-
-    Query params:
-        round_id=<int>  (required)
-        dry_run=true    (optional) - preview changes without applying
-
-    This runs:
-    1. Update fixture results (marks is_winner for each pick based on fixture outcomes)
-    2. Evaluate picks (winner/eliminated, draws eliminate)
-    3. Update players.status
-    4. Log summary counts
-
-    Idempotent: Running twice produces the same result. Tracks already-evaluated vs newly-evaluated picks.
-
-    Does NOT change round.status to 'completed' - that's intentional for testing.
-    """
-    from lms_automation.team_utils import normalize_team_name
-
-    try:
-        round_id = request.args.get('round_id', type=int)
-        dry_run = request.args.get('dry_run', 'false').lower() == 'true'
-
-        if not round_id:
-            # Also check JSON body
-            data = request.get_json() or {}
-            round_id = data.get('round_id')
-            if data.get('dry_run'):
-                dry_run = True
-
-        if not round_id:
-            return jsonify({
-                'success': False,
-                'error': 'round_id is required (query param or JSON body)'
-            }), 400
-
-        round_obj = Round.query.get(round_id)
-        if not round_obj:
-            return jsonify({
-                'success': False,
-                'error': f'Round {round_id} not found'
-            }), 404
-
-        mode_str = "DRY RUN" if dry_run else "LIVE"
-        app.logger.info("=" * 60)
-        app.logger.info(f"=== PROCESS ROUND NOW [{mode_str}]: Round {round_obj.round_number} (id={round_id}) ===")
-        app.logger.info("=" * 60)
-
-        # Step 1: Get all fixtures for this round
-        fixtures = Fixture.query.filter_by(round_id=round_id).all()
-        app.logger.info(f"Fixtures in round: {len(fixtures)}")
-
-        completed_fixtures = [f for f in fixtures if f.status == 'completed']
-        draw_fixtures = [f for f in completed_fixtures if f.home_score == f.away_score]
-
-        app.logger.info(f"  Completed: {len(completed_fixtures)}, Draws: {len(draw_fixtures)}")
-
-        # Step 2: Evaluate picks for each completed fixture
-        # Track newly evaluated vs already evaluated for idempotency
-        picks_newly_evaluated = 0
-        picks_already_evaluated = 0
-        picks_won = 0
-        picks_lost = 0
-        picks_draw_eliminated = 0
-        unmatched_picks = []
-
-        # Build canonical team set from fixtures
-        fixture_teams_canonical = set()
-        for fx in fixtures:
-            fixture_teams_canonical.add(normalize_team_name(fx.home_team))
-            fixture_teams_canonical.add(normalize_team_name(fx.away_team))
-
-        # Get all picks for this round once
-        all_round_picks = Pick.query.filter_by(round_id=round_id).all()
-
-        for fixture in completed_fixtures:
-            if fixture.home_score is None or fixture.away_score is None:
-                app.logger.warning(f"  Skipping fixture {fixture.home_team} vs {fixture.away_team}: no scores")
-                continue
-
-            home_canonical = normalize_team_name(fixture.home_team)
-            away_canonical = normalize_team_name(fixture.away_team)
-
-            # Find matching picks
-            home_picks = [p for p in all_round_picks if normalize_team_name(p.team_picked) == home_canonical]
-            away_picks = [p for p in all_round_picks if normalize_team_name(p.team_picked) == away_canonical]
-
-            # Count already evaluated
-            home_already = len([p for p in home_picks if p.is_winner is not None])
-            away_already = len([p for p in away_picks if p.is_winner is not None])
-            picks_already_evaluated += home_already + away_already
-
-            # Determine outcome
-            if fixture.home_score > fixture.away_score:
-                # Home win
-                for pick in home_picks:
-                    if pick.is_winner is None:
-                        if not dry_run:
-                            pick.is_winner = True
-                        picks_won += 1
-                        picks_newly_evaluated += 1
-                for pick in away_picks:
-                    if pick.is_winner is None:
-                        if not dry_run:
-                            pick.is_winner = False
-                        picks_lost += 1
-                        picks_newly_evaluated += 1
-                app.logger.info(
-                    f"  {fixture.home_team} {fixture.home_score}-{fixture.away_score} {fixture.away_team}: "
-                    f"HOME WIN - {len(home_picks)} home picks ({home_already} already eval), "
-                    f"{len(away_picks)} away picks ({away_already} already eval)"
-                )
-
-            elif fixture.away_score > fixture.home_score:
-                # Away win
-                for pick in away_picks:
-                    if pick.is_winner is None:
-                        if not dry_run:
-                            pick.is_winner = True
-                        picks_won += 1
-                        picks_newly_evaluated += 1
-                for pick in home_picks:
-                    if pick.is_winner is None:
-                        if not dry_run:
-                            pick.is_winner = False
-                        picks_lost += 1
-                        picks_newly_evaluated += 1
-                app.logger.info(
-                    f"  {fixture.home_team} {fixture.home_score}-{fixture.away_score} {fixture.away_team}: "
-                    f"AWAY WIN - {len(away_picks)} away picks ({away_already} already eval), "
-                    f"{len(home_picks)} home picks ({home_already} already eval)"
-                )
-
-            else:
-                # DRAW - both teams eliminated
-                for pick in home_picks + away_picks:
-                    if pick.is_winner is None:
-                        if not dry_run:
-                            pick.is_winner = False
-                        picks_draw_eliminated += 1
-                        picks_newly_evaluated += 1
-                app.logger.info(
-                    f"  {fixture.home_team} {fixture.home_score}-{fixture.away_score} {fixture.away_team}: "
-                    f"DRAW - {len(home_picks) + len(away_picks)} picks (DRAW IS NOT A WIN)"
-                )
-
-        # Step 3: Check for unmatched picks
-        for pick in all_round_picks:
-            pick_canonical = normalize_team_name(pick.team_picked)
-            if pick_canonical not in fixture_teams_canonical:
-                unmatched_picks.append({
-                    'pick_id': pick.id,
-                    'player_id': pick.player_id,
-                    'player_name': pick.player.name,
-                    'team_picked': pick.team_picked,
-                    'canonical': pick_canonical
-                })
-                if pick.is_winner is None:
-                    if not dry_run:
-                        pick.is_winner = False
-                    picks_newly_evaluated += 1
-                    app.logger.warning(
-                        f"  UNMATCHED: {pick.player.name} picked '{pick.team_picked}' - not in fixtures, marking as LOSS"
-                    )
-
-        # Step 4: Set is_eliminated and update player.status
-        eliminated_count = 0
-        eliminated_players = []
-        would_eliminate_players = []  # For dry run
-
-        for pick in all_round_picks:
-            if pick.is_winner == False and not pick.is_eliminated:
-                if not dry_run:
-                    pick.is_eliminated = True
-                eliminated_count += 1
-
-                # Update player status
-                if pick.player.status != 'eliminated':
-                    player_info = {'id': pick.player.id, 'name': pick.player.name, 'team_picked': pick.team_picked}
-                    if not dry_run:
-                        pick.player.status = 'eliminated'
-                        eliminated_players.append(f"{pick.player.name}(id={pick.player.id})")
-                    else:
-                        would_eliminate_players.append(player_info)
-            elif pick.is_winner is None and not dry_run:
-                # Check picks that WOULD be eliminated in dry run
-                pass
-
-        if not dry_run:
-            db.session.commit()
-
-        # Final counts
-        active_count = Player.query.filter_by(status='active').count()
-        eliminated_total = Player.query.filter_by(status='eliminated').count()
-        winner_count = Player.query.filter_by(status='winner').count()
-
-        app.logger.info("-" * 40)
-        app.logger.info(f"=== PROCESS ROUND SUMMARY [{mode_str}] ===")
-        app.logger.info(f"  Picks newly evaluated: {picks_newly_evaluated}")
-        app.logger.info(f"  Picks already evaluated: {picks_already_evaluated}")
-        app.logger.info(f"  Picks won: {picks_won}")
-        app.logger.info(f"  Picks lost (non-draw): {picks_lost}")
-        app.logger.info(f"  Picks draw-eliminated: {picks_draw_eliminated}")
-        app.logger.info(f"  Unmatched picks: {len(unmatched_picks)}")
-        app.logger.info(f"  Players eliminated this round: {eliminated_count}")
-        if eliminated_players:
-            app.logger.info(f"  Eliminated: {', '.join(eliminated_players)}")
-        if would_eliminate_players:
-            app.logger.info(f"  Would eliminate: {[p['name'] for p in would_eliminate_players]}")
-        app.logger.info(f"  Player totals: active={active_count}, eliminated={eliminated_total}, winner={winner_count}")
-        app.logger.info("=" * 60)
-
-        result = {
-            'success': True,
-            'dry_run': dry_run,
-            'round_id': round_id,
-            'round_number': round_obj.round_number,
-            'fixtures_total': len(fixtures),
-            'fixtures_completed': len(completed_fixtures),
-            'fixtures_draw': len(draw_fixtures),
-            'picks_total': len(all_round_picks),
-            'picks_newly_evaluated': picks_newly_evaluated,
-            'picks_already_evaluated': picks_already_evaluated,
-            'picks_won': picks_won,
-            'picks_lost': picks_lost,
-            'picks_draw_eliminated': picks_draw_eliminated,
-            'unmatched_picks': unmatched_picks,
-            'players_eliminated_this_round': eliminated_count,
-            'eliminated_players': eliminated_players if not dry_run else [],
-            'would_eliminate_players': would_eliminate_players if dry_run else [],
-            'player_totals': {
-                'active': active_count,
-                'eliminated': eliminated_total,
-                'winner': winner_count
-            }
-        }
-
-        return jsonify(result)
-
-    except Exception as e:
-        db.session.rollback()
-        app.logger.error(f"Error in process_round_now: {str(e)}")
-        import traceback
-        app.logger.error(traceback.format_exc())
-        return jsonify({'success': False, 'error': str(e)}), 500
-
-
-@app.route('/admin/test_status', methods=['GET'])
-@test_endpoint_guard
-def admin_test_status():
-    """
-    Get current test status: rounds, fixtures, picks, player counts.
-
-    Headers:
-        X-Admin-Test-Token: <ADMIN_TEST_TOKEN value>
-
-    Useful for verifying state after sync/process operations.
-    """
-    try:
-        rounds = Round.query.order_by(Round.round_number).all()
-
-        rounds_data = []
-        for r in rounds:
-            fixtures = Fixture.query.filter_by(round_id=r.id).all()
-            picks = Pick.query.filter_by(round_id=r.id).all()
-
-            completed_fixtures = [f for f in fixtures if f.status == 'completed']
-            draws = [f for f in completed_fixtures if f.home_score == f.away_score]
-
-            # Status breakdown
-            fixture_statuses = {}
-            for f in fixtures:
-                fixture_statuses[f.status] = fixture_statuses.get(f.status, 0) + 1
-
-            picks_won = len([p for p in picks if p.is_winner == True])
-            picks_lost = len([p for p in picks if p.is_winner == False])
-            picks_pending = len([p for p in picks if p.is_winner is None])
-            picks_eliminated = len([p for p in picks if p.is_eliminated])
-
-            rounds_data.append({
-                'round_id': r.id,
-                'round_number': r.round_number,
-                'pl_matchday': r.pl_matchday,
-                'status': r.status,
-                'first_kickoff_at': r.first_kickoff_at.isoformat() if r.first_kickoff_at else None,
-                'fixtures_total': len(fixtures),
-                'fixtures_completed': len(completed_fixtures),
-                'fixtures_draw': len(draws),
-                'fixture_status_breakdown': fixture_statuses,
-                'picks_total': len(picks),
-                'picks_won': picks_won,
-                'picks_lost': picks_lost,
-                'picks_pending': picks_pending,
-                'picks_eliminated': picks_eliminated
-            })
-
-        players_active = Player.query.filter_by(status='active').count()
-        players_eliminated = Player.query.filter_by(status='eliminated').count()
-        players_winner = Player.query.filter_by(status='winner').count()
-
-        return jsonify({
-            'success': True,
-            'rounds': rounds_data,
-            'players': {
-                'active': players_active,
-                'eliminated': players_eliminated,
-                'winner': players_winner,
-                'total': players_active + players_eliminated + players_winner
-            },
-            'env': {
-                'ENABLE_TEST_ENDPOINTS': os.environ.get('ENABLE_TEST_ENDPOINTS', 'false'),
-                'FOOTBALL_SEASON': os.environ.get('FOOTBALL_SEASON') or os.environ.get('SEASON')
-            }
-        })
-
-    except Exception as e:
-        app.logger.error(f"Error in test_status: {str(e)}")
-        return jsonify({'success': False, 'error': str(e)}), 500
-
-
-# --- Team Name Backfill ---
-@app.route('/admin/backfill_team_names', methods=['POST'])
-@admin_required
-def backfill_team_names():
-    """
-    SAFE, IDEMPOTENT backfill to normalize all team names to canonical form.
-
-    This endpoint:
-    1. Scans all fixtures and converts team names to canonical form
-    2. Scans all picks and converts team names to canonical form
-    3. Logs every change made
-    4. Can be run multiple times safely (idempotent)
-
-    Use dry_run=true to preview changes without modifying data.
-
-    Example:
-        POST /admin/backfill_team_names?dry_run=true
-        POST /admin/backfill_team_names
-    """
-    try:
-        dry_run = str(request.args.get('dry_run', 'false')).lower() in ('1', 'true', 'yes', 'y')
-
-        changes = {
-            'fixtures': [],
-            'picks': [],
-            'summary': {
-                'fixtures_scanned': 0,
-                'fixtures_updated': 0,
-                'picks_scanned': 0,
-                'picks_updated': 0
-            }
-        }
-
-        app.logger.info(f"=== TEAM NAME BACKFILL START (dry_run={dry_run}) ===")
-
-        # Step 1: Backfill fixtures
-        all_fixtures = Fixture.query.all()
-        changes['summary']['fixtures_scanned'] = len(all_fixtures)
-
-        for fixture in all_fixtures:
-            home_canonical = _normalize_team(fixture.home_team)
-            away_canonical = _normalize_team(fixture.away_team)
-
-            home_changed = fixture.home_team != home_canonical
-            away_changed = fixture.away_team != away_canonical
-
-            if home_changed or away_changed:
-                change_record = {
-                    'fixture_id': fixture.id,
-                    'round_id': fixture.round_id,
-                    'changes': []
-                }
-
-                if home_changed:
-                    change_record['changes'].append({
-                        'field': 'home_team',
-                        'old': fixture.home_team,
-                        'new': home_canonical
-                    })
-                    app.logger.info(
-                        f"  Fixture {fixture.id}: home_team '{fixture.home_team}' -> '{home_canonical}'"
-                    )
-                    if not dry_run:
-                        fixture.home_team = home_canonical
-
-                if away_changed:
-                    change_record['changes'].append({
-                        'field': 'away_team',
-                        'old': fixture.away_team,
-                        'new': away_canonical
-                    })
-                    app.logger.info(
-                        f"  Fixture {fixture.id}: away_team '{fixture.away_team}' -> '{away_canonical}'"
-                    )
-                    if not dry_run:
-                        fixture.away_team = away_canonical
-
-                changes['fixtures'].append(change_record)
-                changes['summary']['fixtures_updated'] += 1
-
-        # Step 2: Backfill picks
-        all_picks = Pick.query.all()
-        changes['summary']['picks_scanned'] = len(all_picks)
-
-        for pick in all_picks:
-            team_canonical = _normalize_team(pick.team_picked)
-
-            if pick.team_picked != team_canonical:
-                change_record = {
-                    'pick_id': pick.id,
-                    'player_id': pick.player_id,
-                    'round_id': pick.round_id,
-                    'old': pick.team_picked,
-                    'new': team_canonical
-                }
-                changes['picks'].append(change_record)
-                changes['summary']['picks_updated'] += 1
-
-                app.logger.info(
-                    f"  Pick {pick.id} (player={pick.player_id}, round={pick.round_id}): "
-                    f"'{pick.team_picked}' -> '{team_canonical}'"
-                )
-
-                if not dry_run:
-                    pick.team_picked = team_canonical
-
-        # Commit changes
-        if not dry_run:
-            db.session.commit()
-            app.logger.info(
-                f"=== TEAM NAME BACKFILL COMPLETE: "
-                f"{changes['summary']['fixtures_updated']} fixtures, "
-                f"{changes['summary']['picks_updated']} picks updated ==="
-            )
-        else:
-            app.logger.info(
-                f"=== TEAM NAME BACKFILL DRY RUN COMPLETE: "
-                f"WOULD update {changes['summary']['fixtures_updated']} fixtures, "
-                f"{changes['summary']['picks_updated']} picks ==="
-            )
-
-        return jsonify({
-            'success': True,
-            'dry_run': dry_run,
-            'changes': changes
-        })
-
-    except Exception as e:
-        db.session.rollback()
-        app.logger.error(f"Error in backfill_team_names: {str(e)}")
-        import traceback
-        app.logger.error(traceback.format_exc())
-        return jsonify({'success': False, 'error': str(e)}), 500
-
-
-@app.route('/admin/verify_team_names', methods=['GET'])
-@admin_required
-def verify_team_names():
-    """
-    Verification endpoint to check for any non-canonical team names.
-
-    Returns counts of any fixtures or picks that still have non-canonical names.
-    After a successful backfill, all counts should be zero.
-    """
-    try:
-        # Check fixtures
-        non_canonical_fixtures = []
-        all_fixtures = Fixture.query.all()
-
-        for fixture in all_fixtures:
-            home_canonical = _normalize_team(fixture.home_team)
-            away_canonical = _normalize_team(fixture.away_team)
-
-            if fixture.home_team != home_canonical or fixture.away_team != away_canonical:
-                non_canonical_fixtures.append({
-                    'fixture_id': fixture.id,
-                    'round_id': fixture.round_id,
-                    'home_team': fixture.home_team,
-                    'home_canonical': home_canonical,
-                    'away_team': fixture.away_team,
-                    'away_canonical': away_canonical
-                })
-
-        # Check picks
-        non_canonical_picks = []
-        all_picks = Pick.query.all()
-
-        for pick in all_picks:
-            team_canonical = _normalize_team(pick.team_picked)
-
-            if pick.team_picked != team_canonical:
-                non_canonical_picks.append({
-                    'pick_id': pick.id,
-                    'player_id': pick.player_id,
-                    'round_id': pick.round_id,
-                    'team_picked': pick.team_picked,
-                    'canonical': team_canonical
-                })
-
-        # Specific check for "AFC Bournemouth" (the main bug)
-        afc_bournemouth_fixtures = Fixture.query.filter(
-            (Fixture.home_team == 'AFC Bournemouth') |
-            (Fixture.away_team == 'AFC Bournemouth')
-        ).count()
-
-        afc_bournemouth_picks = Pick.query.filter_by(team_picked='AFC Bournemouth').count()
-
-        return jsonify({
-            'success': True,
-            'verification': {
-                'fixtures_total': len(all_fixtures),
-                'fixtures_non_canonical': len(non_canonical_fixtures),
-                'picks_total': len(all_picks),
-                'picks_non_canonical': len(non_canonical_picks),
-                'afc_bournemouth_fixtures': afc_bournemouth_fixtures,
-                'afc_bournemouth_picks': afc_bournemouth_picks,
-                'all_canonical': len(non_canonical_fixtures) == 0 and len(non_canonical_picks) == 0
-            },
-            'non_canonical_fixtures': non_canonical_fixtures[:20],  # Limit to 20 for response size
-            'non_canonical_picks': non_canonical_picks[:20]
-        })
-
-    except Exception as e:
-        app.logger.error(f"Error in verify_team_names: {str(e)}")
-        return jsonify({'success': False, 'error': str(e)}), 500
-
-
 # --- Public pages ---
 @app.route('/rules')
 def rules():
     return render_template('rules.html')
 
 if __name__ == '__main__':
-    port = int(os.getenv('PORT', 5000))
+    port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
