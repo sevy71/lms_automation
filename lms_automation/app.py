@@ -70,7 +70,7 @@ db.init_app(app)
 
 with app.app_context():
 
-migrate = Migrate(app, db)
+    migrate = Migrate(app, db)
 
 # --- Game policy configuration ---
 # Postponement policy thresholds (minutes)
