@@ -464,6 +464,15 @@ class LMSScheduler:
                             logger.info(f"    - {pf.home_team} vs {pf.away_team} (status={pf.status})")
                         continue
 
+                    # CRITICAL FIX: Ensure all completed fixtures have had their picks evaluated.
+                    # This handles the race condition where sync_fixtures marks fixtures as 'completed'
+                    # (with scores from API) but doesn't evaluate picks, and process_eliminations
+                    # runs before update_fixture_results has a chance to evaluate them.
+                    # Without this fix, we'd send "0 survived / 0 eliminated" notifications.
+                    for fixture in completed_fixtures:
+                        if fixture.home_score is not None and fixture.away_score is not None:
+                            self._update_picks_for_fixture(fixture)
+
                     # Build set of all teams in fixtures (normalized)
                     fixture_teams_canonical = set()
                     for fx in fixtures:
