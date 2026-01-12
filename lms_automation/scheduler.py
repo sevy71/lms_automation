@@ -617,12 +617,19 @@ class LMSScheduler:
             # Reset all players to active for new cycle
             Player.query.update({'status': 'active'}, synchronize_session=False)
 
-            # Update cycle number for next round
+            # Calculate next cycle
             next_cycle = (completed_round.cycle_number or 1) + 1
             logger.info(f"Starting Cycle {next_cycle} after all players eliminated")
 
             # Send rollover notification
             self._send_rollover_notification(next_cycle)
+
+            # Create the next round for the new cycle and trigger automation
+            new_round = self._create_rollover_round(completed_round, next_cycle)
+            if new_round:
+                # Commit round+fixtures first, THEN trigger automation (telegram outside txn)
+                db.session.commit()
+                self._trigger_rollover_automation(new_round)
 
         # Check for end of cycle (Round 20 with 2+ survivors)
         elif completed_round.round_number == 20 and len(active_players) >= 2:
@@ -634,6 +641,296 @@ class LMSScheduler:
 
             # Send cycle complete notification
             self._send_cycle_complete_notification(active_players, next_cycle)
+
+    def _create_rollover_round(self, completed_round, next_cycle):
+        """
+        Create a new pending round for the next cycle after rollover.
+
+        Idempotency: Uses special_note marker 'rollover_seeded_cycle_{n}' to prevent
+        duplicate round creation if this runs multiple times.
+
+        Returns the new Round object if created, None if already exists or on error.
+        """
+        rollover_marker = f"rollover_seeded_cycle_{next_cycle}"
+
+        # Idempotency check: see if any round already has this marker (NULL-safe)
+        existing_rollover = Round.query.filter(
+            Round.special_note.isnot(None),
+            Round.special_note.contains(rollover_marker)
+        ).first()
+
+        if existing_rollover:
+            logger.info(
+                f"ROLLOVER: Round for Cycle {next_cycle} already seeded "
+                f"(round_id={existing_rollover.id}), skipping creation"
+            )
+            return None
+
+        try:
+            # Determine next round_number (global increment)
+            max_round_number = db.session.query(db.func.max(Round.round_number)).scalar() or 0
+            next_round_number = max_round_number + 1
+
+            # Determine next matchday (cap at 38, don't wrap)
+            current_matchday = completed_round.pl_matchday or 1
+            next_matchday = min(current_matchday + 1, 38)
+            if next_matchday == 38 and current_matchday == 38:
+                logger.warning(
+                    f"ROLLOVER: End of season (matchday 38), using matchday 38 again"
+                )
+
+            # Create the round
+            new_round = Round(
+                round_number=next_round_number,
+                pl_matchday=next_matchday,
+                cycle_number=next_cycle,
+                status='pending'
+            )
+
+            # Append rollover marker to special_note (preserve existing content)
+            if new_round.special_note:
+                new_round.special_note += f"; {rollover_marker}"
+            else:
+                new_round.special_note = rollover_marker
+
+            db.session.add(new_round)
+            db.session.flush()  # Get ID for fixture creation
+
+            logger.info(
+                f"ROLLOVER: Creating round_id={new_round.id}, round_number={next_round_number}, "
+                f"cycle={next_cycle}, matchday={next_matchday}"
+            )
+
+            # Populate fixtures using existing API logic (same as sync_fixtures)
+            fixtures_created = self._populate_fixtures_for_rollover_round(new_round)
+
+            if fixtures_created == 0:
+                logger.warning(
+                    f"ROLLOVER: Round {next_round_number} created but no fixtures "
+                    f"available for matchday {next_matchday}"
+                )
+            else:
+                logger.info(
+                    f"ROLLOVER: Created {fixtures_created} fixtures for round {next_round_number}"
+                )
+
+            return new_round
+
+        except Exception as e:
+            logger.error(f"ROLLOVER: Error creating round: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            db.session.rollback()
+            return None
+
+    def _populate_fixtures_for_rollover_round(self, round_obj):
+        """
+        Fetch and populate fixtures for a rollover round.
+        Reuses the same API logic as sync_fixtures.
+        """
+        try:
+            api = self._get_api()
+            if not api:
+                logger.warning("ROLLOVER: Football API unavailable")
+                return 0
+
+            season = os.environ.get('FOOTBALL_SEASON') or os.environ.get('SEASON')
+            fixtures_data = api.get_premier_league_fixtures(
+                matchday=round_obj.pl_matchday,
+                season=season
+            )
+            formatted = api.format_fixtures_for_db(fixtures_data, round_obj.pl_matchday)
+
+            if not formatted:
+                return 0
+
+            earliest_kickoff = None
+            for fx in formatted:
+                fixture = Fixture(
+                    round_id=round_obj.id,
+                    event_id=fx.get('event_id'),
+                    home_team=fx['home_team'],
+                    away_team=fx['away_team'],
+                    date=fx.get('date'),
+                    time=fx.get('time'),
+                    home_score=fx.get('home_score'),
+                    away_score=fx.get('away_score'),
+                    status=fx.get('status', 'scheduled')
+                )
+                db.session.add(fixture)
+
+                # Track earliest kickoff for first_kickoff_at
+                if fx.get('date') and fx.get('time'):
+                    dt = datetime.combine(fx['date'], fx['time'])
+                    if earliest_kickoff is None or dt < earliest_kickoff:
+                        earliest_kickoff = dt
+
+            if earliest_kickoff:
+                round_obj.first_kickoff_at = earliest_kickoff
+
+            return len(formatted)
+
+        except Exception as e:
+            logger.error(f"ROLLOVER: Error populating fixtures: {e}")
+            return 0
+
+    def _trigger_rollover_automation(self, round_obj):
+        """
+        Trigger the full automation pipeline for a rollover round.
+
+        IMPORTANT: This is called AFTER db.session.commit() so the round+fixtures
+        are already persisted. Telegram messages happen outside the DB transaction.
+
+        Reuses existing job logic (not duplicating):
+        1. Token generation (same logic as generate_round_tokens)
+        2. Round activation (same logic as round_progression_orchestrator)
+        3. Announcements (calls send_new_round_announcements directly)
+        """
+        logger.info(f"=== ROLLOVER AUTOMATION START (round {round_obj.round_number}) ===")
+
+        # Step 1: Generate tokens (reuse logic from generate_round_tokens)
+        eligible_players = self._get_eligible_players_for_round(round_obj)
+        tokens_created = 0
+
+        for player in eligible_players:
+            existing_token = PickToken.query.filter_by(
+                player_id=player.id,
+                round_id=round_obj.id
+            ).first()
+
+            if not existing_token:
+                token = PickToken.create_for_player_round(
+                    player.id, round_obj.id, expires_hours=168
+                )
+                db.session.add(token)
+                tokens_created += 1
+
+        db.session.commit()
+        logger.info(f"ROLLOVER: Generated {tokens_created} tokens")
+
+        # Step 2: Activate round if ready (reuse logic from orchestrator)
+        fixtures = Fixture.query.filter_by(round_id=round_obj.id).all()
+        token_count = PickToken.query.filter_by(round_id=round_obj.id).count()
+
+        activated = False
+        if fixtures and token_count >= len(eligible_players) and len(eligible_players) > 0:
+            round_obj.status = 'active'
+            db.session.commit()
+            activated = True
+            logger.info(
+                f"ROLLOVER: Round {round_obj.round_number} ACTIVATED "
+                f"({len(fixtures)} fixtures, {token_count} tokens)"
+            )
+        else:
+            logger.warning(
+                f"ROLLOVER: Round {round_obj.round_number} NOT activated "
+                f"(fixtures={len(fixtures)}, tokens={token_count}, eligible={len(eligible_players)})"
+            )
+
+        # Step 3: Send announcements using EXISTING function
+        # This function is idempotent (skips already-announced players via ReminderSchedule)
+        # and handles all the telegram sending + reminder scheduling
+        if activated:
+            # Call the existing announcement job directly (it uses app context internally)
+            # Since we're already in app context, call the inner logic
+            self._send_rollover_announcements_for_round(round_obj)
+
+        logger.info(
+            f"ROLLOVER: Complete - tokens_created={tokens_created}, activated={activated}"
+        )
+        logger.info(f"=== ROLLOVER AUTOMATION END ===")
+
+    def _send_rollover_announcements_for_round(self, round_obj):
+        """
+        Send announcements for a specific rollover round.
+
+        Reuses the same logic as send_new_round_announcements but for a single round.
+        This avoids duplicating the announcement/reminder logic.
+        """
+        eligible_players = self._get_eligible_players_for_round(round_obj)
+
+        sent = 0
+        skipped_no_token = 0
+        skipped_no_telegram = 0
+        skipped_already_announced = 0
+
+        for player in eligible_players:
+            if player.status != 'active':
+                continue
+
+            # Skip if already has a pick
+            if self._player_has_pick_for_round(player.id, round_obj.id):
+                continue
+
+            pick_token = PickToken.query.filter_by(
+                player_id=player.id,
+                round_id=round_obj.id
+            ).first()
+
+            if not pick_token:
+                skipped_no_token += 1
+                continue
+
+            # Skip if already announced (reminder exists = already notified)
+            existing_reminder = ReminderSchedule.query.filter_by(
+                player_id=player.id,
+                round_id=round_obj.id
+            ).first()
+            if existing_reminder:
+                skipped_already_announced += 1
+                continue
+
+            if not (hasattr(player, 'telegram_id') and player.telegram_id):
+                skipped_no_telegram += 1
+                continue
+
+            # Build announcement message
+            pick_url = f"{os.environ.get('BASE_URL', 'http://localhost:5000')}/pick/{pick_token.token}"
+
+            if round_obj.first_kickoff_at:
+                deadline_str = round_obj.first_kickoff_at.strftime('%A %d %B at %H:%M')
+            else:
+                deadline_str = "soon"
+
+            message = f"🔄 CYCLE {round_obj.cycle_number} - ROUND {round_obj.round_number} IS LIVE!\n\n"
+            message += f"Everyone's back in! Make your pick before {deadline_str}"
+
+            success = self._send_telegram_message(
+                player.telegram_id,
+                message,
+                button_url=pick_url,
+                button_text="⚽ Make Your Pick"
+            )
+
+            if success:
+                sent += 1
+
+                # Schedule reminders (same logic as send_new_round_announcements)
+                if round_obj.first_kickoff_at:
+                    reminder_4h = ReminderSchedule(
+                        player_id=player.id,
+                        round_id=round_obj.id,
+                        reminder_type='4_hour',
+                        scheduled_time=round_obj.first_kickoff_at - timedelta(hours=4),
+                        is_sent=False
+                    )
+                    db.session.add(reminder_4h)
+
+                    reminder_2h = ReminderSchedule(
+                        player_id=player.id,
+                        round_id=round_obj.id,
+                        reminder_type='2_hour',
+                        scheduled_time=round_obj.first_kickoff_at - timedelta(hours=2),
+                        is_sent=False
+                    )
+                    db.session.add(reminder_2h)
+
+        db.session.commit()
+
+        logger.info(
+            f"ROLLOVER: Announcements sent={sent}, skipped_no_token={skipped_no_token}, "
+            f"skipped_no_telegram={skipped_no_telegram}, skipped_already_announced={skipped_already_announced}"
+        )
 
     def _enforce_elimination_invariant(self, round_obj):
         """
