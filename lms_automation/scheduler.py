@@ -1,6 +1,54 @@
 """
 Background Scheduler for LMS Automation
 Handles periodic tasks for automated game management
+
+ROUND STATE MACHINE
+===================
+
+States:
+-------
+- pending      : Round created, awaiting fixtures/tokens/activation
+- active       : Round accepting picks; players can submit/edit picks
+- picks_locked : All picks in OR deadline passed + autopick applied; no more edits
+                 (tracked via special_note containing 'picks_locked')
+- completed    : All fixtures finished AND eliminations processed
+
+Transitions:
+------------
+pending -> active:
+  WHEN: fixtures exist AND tokens generated for all eligible players
+  BY: round_progression_orchestrator job
+
+active -> picks_locked:
+  WHEN: (picks_count == eligible_players_count) OR (deadline_passed AND autopick_applied)
+  BY: check_all_picks_submitted OR apply_missed_picks (sets marker in special_note)
+  NOTE: This is a logical state tracked via special_note='picks_locked'
+
+picks_locked -> completed:
+  WHEN: ALL of:
+    a) all fixtures have status='completed'
+    b) picks exist for every eligible player (manual or auto)
+    c) eliminations have been processed (is_winner evaluated for all picks)
+  BY: process_eliminations job
+
+completed -> (next round pending):
+  WHEN: round completed AND next round created
+  BY: rollover logic OR admin creating new round
+
+CRITICAL INVARIANTS:
+--------------------
+1. NEVER mark round completed if picks_count == 0 for eligible players
+2. NEVER mark round completed if picks_count < eligible_count AND deadline not passed
+3. NEVER mark round completed if any fixture is still scheduled/live/postponed
+4. is_winner=False MUST always mean is_eliminated=True (enforced by invariant job)
+5. Auto-picks MUST be applied before eliminations if deadline has passed
+
+IDEMPOTENCY RULES:
+------------------
+- apply_missed_picks: Only insert if no pick exists for (player_id, round_id)
+- process_eliminations: Only set is_eliminated=True if is_winner=False AND not already eliminated
+- check_all_picks_submitted: Only send notification once (check special_note)
+- Notifications: All use special_note markers to prevent duplicate sends
 """
 
 import os
@@ -41,70 +89,95 @@ class LMSScheduler:
             return None
 
     def start(self):
-        """Start the scheduler with all jobs"""
+        """Start the scheduler with all jobs.
+
+        FAST INTERVALS with GUARDS:
+        - Most jobs run every 1-2 minutes for responsiveness
+        - Internal guards prevent collisions and ensure correct sequencing
+        - Jobs are idempotent: running twice won't cause issues
+        """
         if not self.scheduler.running:
             # Schedule jobs
 
-            # Check for fixture updates every 30 minutes
+            # Check for fixture updates every 5 minutes (was 30)
+            # Guard: Only updates fixtures that have changed
+            fixture_interval = int(os.environ.get('FIXTURE_UPDATE_INTERVAL_MINUTES', '5'))
             self.scheduler.add_job(
                 func=self.update_fixture_results,
-                trigger=IntervalTrigger(minutes=30),
+                trigger=IntervalTrigger(minutes=fixture_interval),
                 id='update_fixtures',
                 name='Update fixture results from Football API',
                 replace_existing=True
             )
+            logger.info(f"Fixture updates job configured with {fixture_interval}-minute interval")
 
-            # Sync fixtures every 60 minutes
+            # Sync fixtures every 30 minutes (was 60)
+            # Guard: Only syncs fixtures that are missing or changed
+            sync_interval = int(os.environ.get('FIXTURE_SYNC_INTERVAL_MINUTES', '30'))
             self.scheduler.add_job(
                 func=self.sync_fixtures,
-                trigger=IntervalTrigger(minutes=60),
+                trigger=IntervalTrigger(minutes=sync_interval),
                 id='sync_fixtures',
                 name='Sync fixtures from Football API',
                 replace_existing=True
             )
+            logger.info(f"Fixture sync job configured with {sync_interval}-minute interval")
 
-            # Process eliminations (hourly prod, faster in test)
-            elim_interval_minutes = int(os.environ.get('ELIMINATION_INTERVAL_MINUTES', '60'))
+            # Process eliminations every 2 minutes (fast but guarded)
+            # GUARDS: Won't complete round unless ALL conditions met:
+            #   1. All fixtures completed
+            #   2. Picks exist for eligible players (or deadline passed + autopick ran)
+            elim_interval_minutes = int(os.environ.get('ELIMINATION_INTERVAL_MINUTES', '2'))
             self.scheduler.add_job(
                 func=self.process_eliminations,
                 trigger=IntervalTrigger(minutes=elim_interval_minutes),
                 id='process_eliminations',
                 name='Process eliminations and check for rollover',
-                next_run_time=datetime.now(),  # run immediately on boot (handy for testing)
+                next_run_time=datetime.now(),  # run immediately on boot
                 replace_existing=True
             )
-            logger.info(f"Eliminations job configured with {elim_interval_minutes}-minute interval")
+            logger.info(f"Eliminations job configured with {elim_interval_minutes}-minute interval (guarded)")
 
-            # Send reminders every 15 minutes
+            # Send reminders every 5 minutes (was 15)
+            # Guard: Uses is_sent flag to prevent duplicates
+            reminder_interval = int(os.environ.get('REMINDER_INTERVAL_MINUTES', '5'))
             self.scheduler.add_job(
                 func=self.send_due_reminders,
-                trigger=IntervalTrigger(minutes=15),
+                trigger=IntervalTrigger(minutes=reminder_interval),
                 id='send_reminders',
                 name='Send due reminders via Telegram',
                 replace_existing=True
             )
+            logger.info(f"Reminders job configured with {reminder_interval}-minute interval")
 
-            # Generate tokens for new rounds every hour
+            # Generate tokens for new rounds every 10 minutes (was 1 hour)
+            # Guard: Only creates tokens if they don't exist
+            token_interval = int(os.environ.get('TOKEN_GENERATION_INTERVAL_MINUTES', '10'))
             self.scheduler.add_job(
                 func=self.generate_round_tokens,
-                trigger=IntervalTrigger(hours=1),
+                trigger=IntervalTrigger(minutes=token_interval),
                 id='generate_tokens',
                 name='Generate pick tokens for active rounds',
+                next_run_time=datetime.now(),
                 replace_existing=True
             )
+            logger.info(f"Token generation job configured with {token_interval}-minute interval")
 
-            # Send initial round announcements every 30 minutes
+            # Send initial round announcements every 10 minutes (was 30)
+            # Guard: Uses special_note to prevent duplicate sends
+            announcement_interval = int(os.environ.get('ANNOUNCEMENT_INTERVAL_MINUTES', '10'))
             self.scheduler.add_job(
                 func=self.send_new_round_announcements,
-                trigger=IntervalTrigger(minutes=30),
+                trigger=IntervalTrigger(minutes=announcement_interval),
                 id='send_round_announcements',
                 name='Send new round announcements to players via Telegram',
                 replace_existing=True
             )
+            logger.info(f"Announcements job configured with {announcement_interval}-minute interval")
 
-            # Apply missed picks at round deadline
-            # Use shorter interval (5 min prod, 1 min test) to catch deadlines promptly
-            autopick_interval_minutes = int(os.environ.get('AUTOPICK_INTERVAL_MINUTES', '5'))
+            # Apply missed picks every 2 minutes (fast, catches deadlines promptly)
+            # Guard: Only inserts if no existing pick for (player_id, round_id)
+            autopick_interval_minutes = int(os.environ.get('AUTOPICK_INTERVAL_MINUTES', '2'))
             self.scheduler.add_job(
                 func=self.apply_missed_picks,
                 trigger=IntervalTrigger(minutes=autopick_interval_minutes),
@@ -115,33 +188,42 @@ class LMSScheduler:
             )
             logger.info(f"Auto-pick job configured with {autopick_interval_minutes}-minute interval")
 
-            # Orchestrator job - ensures proper round progression
+            # Orchestrator job - ensures proper round progression every 5 minutes (was 10)
+            # Guard: Only activates rounds that meet all criteria
+            orchestrator_interval = int(os.environ.get('ORCHESTRATOR_INTERVAL_MINUTES', '5'))
             self.scheduler.add_job(
                 func=self.round_progression_orchestrator,
-                trigger=IntervalTrigger(minutes=10),
+                trigger=IntervalTrigger(minutes=orchestrator_interval),
                 id='round_orchestrator',
                 name='Orchestrate round progression (activate pending rounds with tokens)',
                 next_run_time=datetime.now(),
                 replace_existing=True
             )
+            logger.info(f"Orchestrator job configured with {orchestrator_interval}-minute interval")
 
-            # Check if all picks are submitted and publish picks
+            # Check if all picks are submitted every 2 minutes (was 5)
+            # Guard: Uses special_note to prevent duplicate notifications
+            picks_check_interval = int(os.environ.get('PICKS_CHECK_INTERVAL_MINUTES', '2'))
             self.scheduler.add_job(
                 func=self.check_all_picks_submitted,
-                trigger=IntervalTrigger(minutes=5),
+                trigger=IntervalTrigger(minutes=picks_check_interval),
                 id='check_all_picks',
                 name='Check if all picks submitted and publish',
                 replace_existing=True
             )
+            logger.info(f"Picks check job configured with {picks_check_interval}-minute interval")
 
-            # Global invariant enforcement - catches any historical violations
+            # Global invariant enforcement every 30 minutes (was 1 hour)
+            # Guard: Only corrects actual violations
+            invariant_interval = int(os.environ.get('INVARIANT_CHECK_INTERVAL_MINUTES', '30'))
             self.scheduler.add_job(
                 func=self.enforce_global_elimination_invariant,
-                trigger=IntervalTrigger(hours=1),
+                trigger=IntervalTrigger(minutes=invariant_interval),
                 id='enforce_invariant',
                 name='Enforce elimination invariant across all picks',
                 replace_existing=True
             )
+            logger.info(f"Invariant enforcement job configured with {invariant_interval}-minute interval")
 
             self.scheduler.start()
             logger.info("Scheduler started with all jobs configured")
@@ -414,18 +496,29 @@ class LMSScheduler:
         """
         Process eliminations for completed rounds and check for rollover.
 
+        STATE MACHINE GUARDS (NON-NEGOTIABLE):
+        A round is ONLY marked completed when ALL of these are true:
+          a) fixtures exist for that round
+          b) all fixtures are completed (status='completed')
+          c) picks exist for every eligible player OR deadline passed AND autopick has run
+          d) all picks have been evaluated (is_winner is not None)
+
         This job:
         1. Checks if all fixtures in active rounds are completed
-        2. For each completed round, marks picks with is_winner=False as eliminated
-        3. Updates player.status to 'eliminated' for eliminated picks
-        4. Detects unmatched picks (picks that couldn't be matched to any fixture)
-        5. Checks for winner/rollover conditions
+        2. Validates picks exist for eligible players (or deadline passed)
+        3. For each completed round, marks picks with is_winner=False as eliminated
+        4. Updates player.status to 'eliminated' for eliminated picks
+        5. Detects unmatched picks (picks that couldn't be matched to any fixture)
+        6. Only then marks the round as completed
+        7. Checks for winner/rollover conditions
         """
         with self.app.app_context():
             try:
                 logger.info("=" * 60)
                 logger.info("=== ELIMINATION PROCESSING JOB START ===")
                 logger.info("=" * 60)
+
+                now = datetime.utcnow()
 
                 # Get active rounds with all fixtures completed
                 active_rounds = Round.query.filter_by(status='active').all()
@@ -445,8 +538,13 @@ class LMSScheduler:
                     logger.info("-" * 40)
                     logger.info(f"Processing Round {round_obj.round_number} (round_id={round_obj.id})")
 
-                    # Check if all fixtures are completed
+                    # ======== GUARD 1: Check fixtures exist ========
                     fixtures = Fixture.query.filter_by(round_id=round_obj.id).all()
+                    if not fixtures:
+                        logger.warning(f"  GUARD BLOCK: Round {round_obj.round_number} has no fixtures, skipping")
+                        continue
+
+                    # ======== GUARD 2: Check all fixtures completed ========
                     completed_fixtures = [f for f in fixtures if f.status == 'completed']
                     draw_fixtures = [f for f in completed_fixtures if f.home_score == f.away_score]
 
@@ -455,24 +553,71 @@ class LMSScheduler:
                         f"fixtures_draw={len(draw_fixtures)}"
                     )
 
-                    if not fixtures:
-                        logger.warning(f"  Round {round_obj.round_number}: No fixtures found, skipping")
-                        continue
-
                     if not all(f.status == 'completed' for f in fixtures):
                         pending_fixtures = [f for f in fixtures if f.status != 'completed']
                         logger.info(
-                            f"  Round {round_obj.round_number}: {len(pending_fixtures)} fixture(s) not completed, skipping"
+                            f"  GUARD BLOCK: Round {round_obj.round_number} has {len(pending_fixtures)} fixture(s) not completed"
                         )
                         for pf in pending_fixtures[:5]:  # Log first 5
                             logger.info(f"    - {pf.home_team} vs {pf.away_team} (status={pf.status})")
                         continue
 
-                    # CRITICAL FIX: Ensure all completed fixtures have had their picks evaluated.
+                    # ======== GUARD 3: Check picks exist for eligible players ========
+                    eligible_players = self._get_eligible_players_for_round(round_obj)
+                    eligible_count = len(eligible_players)
+                    picks = Pick.query.filter_by(round_id=round_obj.id).all()
+                    picks_count = len(picks)
+
+                    logger.info(f"  eligible_players={eligible_count}, picks_count={picks_count}")
+
+                    # Determine deadline
+                    kickoff = round_obj.first_kickoff_at
+                    if not kickoff:
+                        # Fallback: calculate from fixtures
+                        for fixture in fixtures:
+                            if fixture.date and fixture.time:
+                                dt = datetime.combine(fixture.date, fixture.time)
+                                if kickoff is None or dt < kickoff:
+                                    kickoff = dt
+
+                    deadline = kickoff - timedelta(hours=1) if kickoff else None
+                    deadline_passed = deadline and now >= deadline
+
+                    logger.info(f"  deadline={'passed' if deadline_passed else 'not_passed'} (kickoff={kickoff}, deadline={deadline})")
+
+                    # CRITICAL GUARD: Don't complete round if picks are missing
+                    if picks_count == 0:
+                        if deadline_passed:
+                            logger.warning(
+                                f"  GUARD BLOCK: Round {round_obj.round_number} has 0 picks but deadline passed. "
+                                f"Waiting for autopick job to run."
+                            )
+                        else:
+                            logger.info(
+                                f"  GUARD BLOCK: Round {round_obj.round_number} has 0 picks and deadline not passed. "
+                                f"Cannot complete round yet."
+                            )
+                        continue
+
+                    if picks_count < eligible_count:
+                        if deadline_passed:
+                            logger.warning(
+                                f"  GUARD BLOCK: Round {round_obj.round_number} has {picks_count}/{eligible_count} picks "
+                                f"but deadline passed. Waiting for autopick job to fill missing picks."
+                            )
+                        else:
+                            logger.info(
+                                f"  GUARD BLOCK: Round {round_obj.round_number} has {picks_count}/{eligible_count} picks "
+                                f"and deadline not passed. Cannot complete round yet."
+                            )
+                        continue
+
+                    # ======== ALL GUARDS PASSED - Proceed with elimination processing ========
+                    logger.info(f"  ALL GUARDS PASSED: Proceeding with elimination processing")
+
+                    # Ensure all completed fixtures have had their picks evaluated.
                     # This handles the race condition where sync_fixtures marks fixtures as 'completed'
-                    # (with scores from API) but doesn't evaluate picks, and process_eliminations
-                    # runs before update_fixture_results has a chance to evaluate them.
-                    # Without this fix, we'd send "0 survived / 0 eliminated" notifications.
+                    # (with scores from API) but doesn't evaluate picks.
                     for fixture in completed_fixtures:
                         if fixture.home_score is not None and fixture.away_score is not None:
                             self._update_picks_for_fixture(fixture)
@@ -483,11 +628,40 @@ class LMSScheduler:
                         fixture_teams_canonical.add(normalize_team_name(fx.home_team))
                         fixture_teams_canonical.add(normalize_team_name(fx.away_team))
 
-                    # Get all picks for this round
+                    # Refresh picks after evaluation
                     picks = Pick.query.filter_by(round_id=round_obj.id).all()
                     logger.info(f"  picks_total={len(picks)}")
 
-                    # Categorize picks
+                    # ======== GUARD 4: Check all picks have been evaluated ========
+                    unevaluated_picks = [p for p in picks if p.is_winner is None]
+                    if unevaluated_picks:
+                        # Try to evaluate unmatched picks
+                        for pick in unevaluated_picks:
+                            pick_canonical = normalize_team_name(pick.team_picked)
+                            if pick_canonical not in fixture_teams_canonical:
+                                # Unmatched pick = cannot win = eliminated
+                                pick.is_winner = False
+                                logger.warning(
+                                    f"  UNMATCHED PICK: player_id={pick.player_id} ({pick.player.name}) "
+                                    f"picked '{pick.team_picked}' (canonical: '{pick_canonical}') "
+                                    f"which doesn't match any fixture team - marking as LOSS"
+                                )
+
+                    # Re-check for unevaluated picks
+                    picks = Pick.query.filter_by(round_id=round_obj.id).all()
+                    still_unevaluated = [p for p in picks if p.is_winner is None]
+                    if still_unevaluated:
+                        logger.warning(
+                            f"  GUARD BLOCK: Round {round_obj.round_number} still has {len(still_unevaluated)} "
+                            f"unevaluated picks after fixture completion. This indicates a bug."
+                        )
+                        for pick in still_unevaluated[:5]:
+                            logger.warning(
+                                f"    - pick_id={pick.id}, player={pick.player.name}, team={pick.team_picked}"
+                            )
+                        continue
+
+                    # ======== Process eliminations ========
                     eliminated_count = 0
                     winners_count = 0
                     unmatched_picks = []
@@ -497,7 +671,7 @@ class LMSScheduler:
                     for pick in picks:
                         pick_canonical = normalize_team_name(pick.team_picked)
 
-                        # Check if pick matches any fixture team
+                        # Track unmatched picks for logging
                         if pick_canonical not in fixture_teams_canonical:
                             unmatched_picks.append({
                                 'pick_id': pick.id,
@@ -506,16 +680,8 @@ class LMSScheduler:
                                 'team_picked': pick.team_picked,
                                 'team_canonical': pick_canonical,
                             })
-                            # Unmatched pick = cannot win = eliminated
-                            if pick.is_winner is None:
-                                pick.is_winner = False
-                                logger.warning(
-                                    f"  UNMATCHED PICK: player_id={pick.player_id} ({pick.player.name}) "
-                                    f"picked '{pick.team_picked}' (canonical: '{pick_canonical}') "
-                                    f"which doesn't match any fixture team - marking as LOSS"
-                                )
 
-                        # Process elimination based on is_winner status
+                        # Process elimination based on is_winner status (idempotent)
                         if pick.is_winner == False and not pick.is_eliminated:
                             pick.is_eliminated = True
                             pick.player.status = 'eliminated'
@@ -525,13 +691,6 @@ class LMSScheduler:
                         elif pick.is_winner == True:
                             winners_count += 1
                             winning_players.append(f"{pick.player.name}(id={pick.player.id}, pick={pick.team_picked})")
-
-                        elif pick.is_winner is None:
-                            # This shouldn't happen if fixtures are complete and matching works
-                            logger.warning(
-                                f"  PICK NOT EVALUATED: player_id={pick.player_id} ({pick.player.name}) "
-                                f"picked '{pick.team_picked}' still has is_winner=None after fixture completion"
-                            )
 
                     # Log summary for this round
                     logger.info(
@@ -558,9 +717,9 @@ class LMSScheduler:
                     total_winners += winners_count
                     total_draws += len(draw_fixtures)
 
-                    # Mark round as completed
+                    # ======== Mark round as completed (all guards passed) ========
                     round_obj.status = 'completed'
-                    logger.info(f"  Round {round_obj.round_number}: Marked as COMPLETED")
+                    logger.info(f"  Round {round_obj.round_number}: Marked as COMPLETED (all guards passed)")
 
                     # SAFEGUARD: Ensure no picks have is_winner=False AND is_eliminated=False
                     # This is an invariant violation - if you lost, you MUST be eliminated
@@ -1535,6 +1694,23 @@ class LMSScheduler:
                     total_auto_picks_applied += round_auto_picks
                     logger.info(f"  Round {round_obj.round_number} summary: {round_auto_picks} auto-pick(s) created")
 
+                    # After applying auto-picks, check if all picks are now in and mark as picks_locked
+                    # This signals to process_eliminations that autopick has completed
+                    eligible_count = len(eligible_players)
+                    current_picks_count = Pick.query.filter_by(round_id=round_obj.id).count()
+
+                    if current_picks_count >= eligible_count:
+                        # All picks are in (manual + auto) - mark as locked
+                        if not (round_obj.special_note and 'picks_locked' in round_obj.special_note):
+                            if round_obj.special_note:
+                                round_obj.special_note += "; picks_locked"
+                            else:
+                                round_obj.special_note = "picks_locked"
+                            logger.info(
+                                f"  Round {round_obj.round_number}: ALL PICKS IN ({current_picks_count}/{eligible_count}) "
+                                f"- marked as picks_locked"
+                            )
+
                 db.session.commit()
                 logger.info("-" * 40)
                 logger.info(f"=== AUTO-PICK JOB COMPLETE ===")
@@ -1632,8 +1808,11 @@ class LMSScheduler:
         Check if all eligible players have submitted picks for active rounds.
 
         When all picks are submitted:
-        1. Mark the round as "picks_locked" (prevents further edits)
+        1. Mark the round as "picks_locked" in special_note (prevents further edits)
         2. Publish picks so everyone can see who picked what
+
+        IMPORTANT: This job does NOT complete rounds. It only marks them as picks_locked.
+        Round completion is handled by process_eliminations after fixtures complete.
 
         This enables early visibility when players are eager to see picks.
         """
@@ -1649,6 +1828,7 @@ class LMSScheduler:
                     eligible_count = len(eligible_players)
 
                     if eligible_count == 0:
+                        logger.info(f"Round {round_obj.round_number}: No eligible players, skipping")
                         continue
 
                     # Count picks submitted for this round
@@ -1660,15 +1840,27 @@ class LMSScheduler:
 
                     # Check if all eligible players have picks
                     if picks_count >= eligible_count:
-                        # All picks are in! Notify everyone
-                        logger.info(
-                            f"Round {round_obj.round_number}: ALL PICKS SUBMITTED! "
-                            f"({picks_count} picks from {eligible_count} eligible players)"
-                        )
+                        # All picks are in! Mark as locked and notify
 
-                        # Send notification that picks are now visible
+                        # Mark as picks_locked (idempotent - check if already set)
+                        if not (round_obj.special_note and 'picks_locked' in round_obj.special_note):
+                            if round_obj.special_note:
+                                round_obj.special_note += "; picks_locked"
+                            else:
+                                round_obj.special_note = "picks_locked"
+                            logger.info(
+                                f"Round {round_obj.round_number}: ALL PICKS SUBMITTED! "
+                                f"({picks_count}/{eligible_count}) - marked as picks_locked"
+                            )
+                        else:
+                            logger.debug(
+                                f"Round {round_obj.round_number}: Already marked as picks_locked"
+                            )
+
+                        # Send notification that picks are now visible (idempotent)
                         self._send_picks_published_notification(round_obj)
 
+                db.session.commit()
                 logger.info("=== ALL PICKS CHECK JOB COMPLETE ===")
 
             except Exception as e:
@@ -2101,6 +2293,152 @@ class LMSScheduler:
         """Get the URL to the picks grid page."""
         base_url = os.environ.get('BASE_URL', 'http://localhost:5000').rstrip('/')
         return f"{base_url}/picks-grid"
+
+
+def check_db_integrity():
+    """
+    DB Integrity Check Helper.
+
+    Detects common data integrity issues:
+    1. Rounds with 0 picks but status='completed'
+    2. Fixtures with 'fallback' in event_id (invalid fallback fixtures)
+    3. Duplicate fixtures (same teams in same round)
+    4. Picks referencing teams not in fixtures for that round
+    5. Picks with is_winner=False but is_eliminated=False (invariant violation)
+
+    Returns:
+        dict with keys:
+            - 'issues': list of issue descriptions
+            - 'counts': dict of issue counts by type
+            - 'ok': True if no issues found, False otherwise
+
+    Usage:
+        from lms_automation.scheduler import check_db_integrity
+        result = check_db_integrity()
+        if not result['ok']:
+            for issue in result['issues']:
+                print(issue)
+    """
+    issues = []
+    counts = {
+        'completed_rounds_no_picks': 0,
+        'fallback_fixtures': 0,
+        'duplicate_fixtures': 0,
+        'picks_invalid_teams': 0,
+        'elimination_invariant_violations': 0,
+    }
+
+    # Import here to avoid circular dependency
+    from lms_automation.models import Round, Fixture, Pick
+    from lms_automation.team_utils import normalize_team_name
+
+    # 1. Check for rounds with 0 picks but status='completed'
+    completed_rounds = Round.query.filter_by(status='completed').all()
+    for round_obj in completed_rounds:
+        picks_count = Pick.query.filter_by(round_id=round_obj.id).count()
+        if picks_count == 0:
+            issues.append(
+                f"INTEGRITY ERROR: Round {round_obj.round_number} (id={round_obj.id}) is 'completed' "
+                f"but has 0 picks. This should never happen."
+            )
+            counts['completed_rounds_no_picks'] += 1
+
+    # 2. Check for fallback fixtures (invalid team data)
+    fallback_fixtures = Fixture.query.filter(
+        Fixture.event_id.like('fallback_%')
+    ).all()
+    for fixture in fallback_fixtures:
+        issues.append(
+            f"INTEGRITY WARNING: Fallback fixture detected - Round {fixture.round_id}: "
+            f"{fixture.home_team} vs {fixture.away_team} (event_id={fixture.event_id}). "
+            f"This may contain invalid/outdated team data."
+        )
+        counts['fallback_fixtures'] += 1
+
+    # 3. Check for duplicate fixtures (same teams in same round)
+    all_rounds = Round.query.all()
+    for round_obj in all_rounds:
+        fixtures = Fixture.query.filter_by(round_id=round_obj.id).all()
+        seen_matchups = set()
+        for fixture in fixtures:
+            # Normalize and create a canonical matchup key
+            home = normalize_team_name(fixture.home_team)
+            away = normalize_team_name(fixture.away_team)
+            matchup = tuple(sorted([home, away]))  # Sorted to catch A vs B and B vs A
+
+            if matchup in seen_matchups:
+                issues.append(
+                    f"INTEGRITY ERROR: Duplicate fixture in Round {round_obj.round_number} - "
+                    f"{fixture.home_team} vs {fixture.away_team}"
+                )
+                counts['duplicate_fixtures'] += 1
+            else:
+                seen_matchups.add(matchup)
+
+    # 4. Check for picks referencing teams not in fixtures for that round
+    all_picks = Pick.query.all()
+    for pick in all_picks:
+        fixtures = Fixture.query.filter_by(round_id=pick.round_id).all()
+        fixture_teams = set()
+        for fx in fixtures:
+            fixture_teams.add(normalize_team_name(fx.home_team))
+            fixture_teams.add(normalize_team_name(fx.away_team))
+
+        pick_team = normalize_team_name(pick.team_picked)
+        if pick_team not in fixture_teams and fixtures:  # Only flag if fixtures exist
+            issues.append(
+                f"INTEGRITY WARNING: Pick {pick.id} by {pick.player.name} for Round "
+                f"{pick.round.round_number} references team '{pick.team_picked}' "
+                f"(normalized: '{pick_team}') which is not in any fixture for this round."
+            )
+            counts['picks_invalid_teams'] += 1
+
+    # 5. Check for elimination invariant violations (is_winner=False but is_eliminated=False)
+    violating_picks = Pick.query.filter_by(
+        is_winner=False,
+        is_eliminated=False
+    ).all()
+    for pick in violating_picks:
+        issues.append(
+            f"INTEGRITY ERROR: Elimination invariant violation - Pick {pick.id} by "
+            f"{pick.player.name} has is_winner=False but is_eliminated=False. "
+            f"This violates the rule: losing = eliminated."
+        )
+        counts['elimination_invariant_violations'] += 1
+
+    # Summary
+    total_issues = sum(counts.values())
+
+    return {
+        'issues': issues,
+        'counts': counts,
+        'ok': total_issues == 0,
+        'total_issues': total_issues,
+    }
+
+
+def run_integrity_check_with_logging():
+    """
+    Run DB integrity check and log results.
+
+    Convenience wrapper that logs all issues found.
+    """
+    result = check_db_integrity()
+
+    if result['ok']:
+        logger.info("=" * 60)
+        logger.info("DB INTEGRITY CHECK: ALL OK (no issues found)")
+        logger.info("=" * 60)
+    else:
+        logger.error("=" * 60)
+        logger.error(f"DB INTEGRITY CHECK: FOUND {result['total_issues']} ISSUE(S)")
+        logger.error("=" * 60)
+        logger.error(f"Issue counts: {result['counts']}")
+        for issue in result['issues']:
+            logger.error(f"  {issue}")
+        logger.error("=" * 60)
+
+    return result
 
 
 # Create global scheduler instance

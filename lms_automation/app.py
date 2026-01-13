@@ -1412,16 +1412,32 @@ def add_fixtures_to_round(round_id):
                 raise Exception("No fixtures returned from API")
                 
         except Exception as api_error:
+            # FALLBACK FIXTURES: Disabled by default to prevent invalid team data
+            # Only enable via env var ENABLE_FALLBACK_FIXTURES=true for development/testing
+            enable_fallback = os.environ.get('ENABLE_FALLBACK_FIXTURES', 'false').lower() == 'true'
+
+            if not enable_fallback:
+                # DO NOT create fallback fixtures - fail cleanly instead
+                print(f"API failed for round {round_id}: {api_error}")
+                print("Fallback fixtures are DISABLED (set ENABLE_FALLBACK_FIXTURES=true to enable)")
+                db.session.rollback()
+                return jsonify({
+                    'success': False,
+                    'error': f'Could not fetch fixtures from Football API: {str(api_error)}. '
+                             f'Fallback fixtures are disabled. Please check API connectivity.'
+                }), 502
+
+            # LEGACY FALLBACK (only if explicitly enabled)
             print(f"API failed, creating fallback fixtures for round {round_id}: {api_error}")
-            # Create fallback Premier League fixtures
+            print("WARNING: Using fallback fixtures - these contain outdated team data!")
             fallback_fixtures = [
-                ("Arsenal", "Chelsea"), ("Liverpool", "Manchester City"), 
+                ("Arsenal", "Chelsea"), ("Liverpool", "Manchester City"),
                 ("Manchester United", "Tottenham"), ("Newcastle", "Brighton"),
                 ("Aston Villa", "West Ham"), ("Crystal Palace", "Everton"),
                 ("Fulham", "Brentford"), ("Wolves", "Nottingham Forest"),
                 ("Bournemouth", "Sheffield United"), ("Burnley", "Luton Town")
             ]
-            
+
             for i, (home_team, away_team) in enumerate(fallback_fixtures):
                 fixture = Fixture(
                     round_id=round_obj.id,
@@ -1435,14 +1451,15 @@ def add_fixtures_to_round(round_id):
                     status='scheduled'
                 )
                 db.session.add(fixture)
-            
+
             db.session.commit()
-            
+
             return jsonify({
                 'success': True,
                 'fixtures_added': len(fallback_fixtures),
                 'source': 'fallback',
-                'warning': f'Used fallback fixtures due to API error: {str(api_error)}'
+                'warning': f'Used fallback fixtures due to API error: {str(api_error)}. '
+                           f'WARNING: Fallback fixtures contain outdated team data!'
             })
         
     except Exception as e:
