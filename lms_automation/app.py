@@ -514,6 +514,200 @@ def admin_dashboard():
     current_round = Round.query.filter_by(status='active').first()
     return render_template('admin_dashboard.html', players=players, current_round=current_round)
 
+
+@app.route('/admin/resend-announcement/<int:round_id>')
+@admin_required
+def resend_round_announcement(round_id):
+    """
+    DEBUG HELPER: Manually resend round announcement to a specific player.
+
+    Query params:
+        player_id: Player ID to send announcement to (required)
+        force: If 1, send even if reminder already exists (default: 0)
+    """
+    from lms_automation.models import ReminderSchedule, PickToken
+
+    player_id = request.args.get('player_id', type=int)
+    force = request.args.get('force', type=int, default=0)
+
+    round_obj = Round.query.get(round_id)
+    if not round_obj:
+        flash(f'Round {round_id} not found', 'danger')
+        return redirect(url_for('admin_dashboard'))
+
+    if player_id:
+        # Send to specific player
+        player = Player.query.get(player_id)
+        if not player:
+            flash(f'Player {player_id} not found', 'danger')
+            return redirect(url_for('admin_dashboard'))
+
+        if not player.telegram_id:
+            flash(f'Player {player.name} has no telegram_id', 'danger')
+            return redirect(url_for('admin_dashboard'))
+
+        # Get or create token
+        pick_token = PickToken.query.filter_by(
+            player_id=player.id,
+            round_id=round_id
+        ).first()
+
+        if not pick_token:
+            # Create token on the fly
+            pick_token = PickToken.create_for_player_round(player.id, round_id, expires_hours=168)
+            db.session.add(pick_token)
+            db.session.commit()
+
+        # Check for existing reminder
+        existing_reminder = ReminderSchedule.query.filter_by(
+            player_id=player.id,
+            round_id=round_id
+        ).first()
+
+        if existing_reminder and not force:
+            flash(f'Player {player.name} already has reminders scheduled. Use force=1 to resend anyway.', 'warning')
+            return redirect(url_for('admin_dashboard'))
+
+        # Send announcement
+        pick_url = f"{os.environ.get('BASE_URL', 'http://localhost:5000')}/pick/{pick_token.token}"
+        deadline_str = round_obj.first_kickoff_at.strftime('%A %d %B at %H:%M') if round_obj.first_kickoff_at else "soon"
+
+        message = f"⚽ NEW ROUND {round_obj.round_number} IS LIVE!\n\n"
+        message += f"Make your pick before {deadline_str}.\n\n"
+        message += "Click below to submit your pick:"
+
+        # Send via scheduler's telegram method
+        from lms_automation.scheduler import scheduler
+        success = scheduler._send_telegram_message(
+            player.telegram_id,
+            message,
+            button_url=pick_url,
+            button_text="⚽ Make Your Pick"
+        )
+
+        if success:
+            flash(f'Announcement sent to {player.name}', 'success')
+        else:
+            flash(f'Failed to send announcement to {player.name}', 'danger')
+
+        return redirect(url_for('admin_dashboard'))
+    else:
+        # Show list of players with telegram_id for this round
+        eligible_players = get_eligible_players_for_round(round_obj)
+        players_with_telegram = [p for p in eligible_players if p.telegram_id]
+
+        info = f"Round {round_obj.round_number} - Players with telegram_id:\n"
+        for p in players_with_telegram:
+            reminder = ReminderSchedule.query.filter_by(player_id=p.id, round_id=round_id).first()
+            token = PickToken.query.filter_by(player_id=p.id, round_id=round_id).first()
+            status = []
+            if reminder:
+                status.append("has_reminder")
+            if token:
+                status.append("has_token")
+            info += f"  - {p.name} (id={p.id}): {', '.join(status) or 'no token/reminder'}\n"
+
+        flash(info, 'info')
+        return redirect(url_for('admin_dashboard'))
+
+
+@app.route('/admin/seed-random-picks')
+@admin_required
+def seed_random_picks():
+    """
+    DEBUG HELPER: Seed random picks for testing.
+
+    Assigns a random unique team to each eligible player who doesn't have a pick yet.
+    This is for debugging/testing only - not for production use.
+
+    Query params:
+        round_id: Round ID to seed picks for (required)
+        count: Max number of picks to create (default: all eligible players)
+        only_missing: If 1, only create picks for players missing picks (default: 1)
+    """
+    import random
+
+    round_id = request.args.get('round_id', type=int)
+    max_count = request.args.get('count', type=int, default=999)
+    only_missing = request.args.get('only_missing', type=int, default=1)
+
+    if not round_id:
+        flash('Missing round_id parameter', 'danger')
+        return redirect(url_for('admin_dashboard'))
+
+    round_obj = Round.query.get(round_id)
+    if not round_obj:
+        flash(f'Round {round_id} not found', 'danger')
+        return redirect(url_for('admin_dashboard'))
+
+    # Get fixtures for this round to know valid teams
+    fixtures = Fixture.query.filter_by(round_id=round_id).all()
+    if not fixtures:
+        flash(f'No fixtures found for round {round_id}', 'danger')
+        return redirect(url_for('admin_dashboard'))
+
+    # Build list of available teams from fixtures
+    available_teams = []
+    for fixture in fixtures:
+        available_teams.append(fixture.home_team)
+        available_teams.append(fixture.away_team)
+
+    # Get eligible players
+    eligible_players = get_eligible_players_for_round(round_obj)
+
+    if only_missing:
+        # Filter to only players without picks
+        players_needing_picks = []
+        for player in eligible_players:
+            existing_pick = Pick.query.filter_by(
+                player_id=player.id,
+                round_id=round_id
+            ).first()
+            if not existing_pick:
+                players_needing_picks.append(player)
+    else:
+        players_needing_picks = list(eligible_players)
+
+    # Limit to max_count
+    players_to_seed = players_needing_picks[:max_count]
+
+    if not players_to_seed:
+        flash('No players need picks seeded', 'info')
+        return redirect(url_for('admin_dashboard'))
+
+    # Shuffle teams for random assignment
+    shuffled_teams = available_teams.copy()
+    random.shuffle(shuffled_teams)
+
+    picks_created = 0
+    now = datetime.utcnow()
+
+    for i, player in enumerate(players_to_seed):
+        # Cycle through shuffled teams (ensures unique if enough teams)
+        team = shuffled_teams[i % len(shuffled_teams)]
+
+        # Check if pick already exists (defensive)
+        existing = Pick.query.filter_by(player_id=player.id, round_id=round_id).first()
+        if existing:
+            continue
+
+        pick = Pick(
+            player_id=player.id,
+            round_id=round_id,
+            team_picked=team,
+            auto_assigned=True,
+            auto_reason='debug_random_seed',
+            timestamp=now
+        )
+        db.session.add(pick)
+        picks_created += 1
+
+    db.session.commit()
+
+    flash(f'Seeded {picks_created} random picks for round {round_obj.round_number}', 'success')
+    return redirect(url_for('admin_dashboard'))
+
+
 @app.route('/api/admin/current-round-picks-status')
 @admin_required
 def current_round_picks_status():
