@@ -684,31 +684,47 @@ def seed_random_picks():
     now = datetime.utcnow()
     current_cycle = round_obj.cycle_number or 1
 
+    # Debug: log what we're doing
+    print(f"[SEED-RANDOM] Round {round_obj.round_number}, cycle={current_cycle}, teams_in_round={len(teams_in_round_canonical)}")
+    print(f"[SEED-RANDOM] Teams available: {teams_in_round_canonical}")
+
     for player in players_to_seed:
         # Check if pick already exists (defensive)
         existing = Pick.query.filter_by(player_id=player.id, round_id=round_id).first()
         if existing:
+            print(f"[SEED-RANDOM] Player {player.id} ({player.name}): already has pick, skipping")
             continue
 
         # Get teams already used by this player in this cycle
+        # Handle NULL cycle_number by treating it as cycle 1
         cycle_picks = Pick.query.filter_by(player_id=player.id).join(Round).filter(
-            Round.cycle_number == current_cycle
+            db.or_(
+                Round.cycle_number == current_cycle,
+                db.and_(Round.cycle_number.is_(None), current_cycle == 1)
+            )
         ).all()
 
         used_teams_canonical = set()
         for pick in cycle_picks:
             used_teams_canonical.add(normalize_team_name(pick.team_picked))
 
+        # Debug: log used teams
+        print(f"[SEED-RANDOM] Player {player.id} ({player.name}): cycle_picks={len(cycle_picks)}, used_teams={used_teams_canonical}")
+
         # Calculate available teams for this player (not used in this cycle)
         available_canonical = teams_in_round_canonical - used_teams_canonical
+
+        print(f"[SEED-RANDOM] Player {player.id} ({player.name}): available={len(available_canonical)} teams")
 
         if not available_canonical:
             # Player has used all teams in this round's fixtures during this cycle
             skipped_no_available += 1
+            print(f"[SEED-RANDOM] Player {player.id} ({player.name}): NO AVAILABLE TEAMS, skipping")
             continue
 
         # Pick a random team from available teams
-        selected_canonical = random.choice(list(available_canonical))
+        available_list = list(available_canonical)
+        selected_canonical = random.choice(available_list)
 
         # Find the original team name (for display purposes)
         selected_team = selected_canonical  # Default to canonical
@@ -716,6 +732,8 @@ def seed_random_picks():
             if normalize_team_name(team) == selected_canonical:
                 selected_team = team
                 break
+
+        print(f"[SEED-RANDOM] Player {player.id} ({player.name}): SELECTED '{selected_team}' from {len(available_list)} options")
 
         pick = Pick(
             player_id=player.id,
@@ -730,7 +748,7 @@ def seed_random_picks():
 
     db.session.commit()
 
-    msg = f'Seeded {picks_created} random picks for round {round_obj.round_number}'
+    msg = f'Seeded {picks_created} random picks for round {round_obj.round_number} (cycle {current_cycle})'
     if skipped_no_available:
         msg += f' (skipped {skipped_no_available} players with no available teams)'
     flash(msg, 'success')
