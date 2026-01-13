@@ -618,7 +618,7 @@ def seed_random_picks():
     DEBUG HELPER: Seed random picks for testing.
 
     Assigns a random unique team to each eligible player who doesn't have a pick yet.
-    This is for debugging/testing only - not for production use.
+    RESPECTS THE RULE: No team can be picked twice in the same cycle.
 
     Query params:
         round_id: Round ID to seed picks for (required)
@@ -626,6 +626,7 @@ def seed_random_picks():
         only_missing: If 1, only create picks for players missing picks (default: 1)
     """
     import random
+    from lms_automation.team_utils import normalize_team_name
 
     round_id = request.args.get('round_id', type=int)
     max_count = request.args.get('count', type=int, default=999)
@@ -646,11 +647,14 @@ def seed_random_picks():
         flash(f'No fixtures found for round {round_id}', 'danger')
         return redirect(url_for('admin_dashboard'))
 
-    # Build list of available teams from fixtures
-    available_teams = []
+    # Build set of available teams from fixtures (use original names for display)
+    teams_in_round = []
+    teams_in_round_canonical = set()
     for fixture in fixtures:
-        available_teams.append(fixture.home_team)
-        available_teams.append(fixture.away_team)
+        teams_in_round.append(fixture.home_team)
+        teams_in_round.append(fixture.away_team)
+        teams_in_round_canonical.add(normalize_team_name(fixture.home_team))
+        teams_in_round_canonical.add(normalize_team_name(fixture.away_team))
 
     # Get eligible players
     eligible_players = get_eligible_players_for_round(round_obj)
@@ -675,26 +679,48 @@ def seed_random_picks():
         flash('No players need picks seeded', 'info')
         return redirect(url_for('admin_dashboard'))
 
-    # Shuffle teams for random assignment
-    shuffled_teams = available_teams.copy()
-    random.shuffle(shuffled_teams)
-
     picks_created = 0
+    skipped_no_available = 0
     now = datetime.utcnow()
+    current_cycle = round_obj.cycle_number or 1
 
-    for i, player in enumerate(players_to_seed):
-        # Cycle through shuffled teams (ensures unique if enough teams)
-        team = shuffled_teams[i % len(shuffled_teams)]
-
+    for player in players_to_seed:
         # Check if pick already exists (defensive)
         existing = Pick.query.filter_by(player_id=player.id, round_id=round_id).first()
         if existing:
             continue
 
+        # Get teams already used by this player in this cycle
+        cycle_picks = Pick.query.filter_by(player_id=player.id).join(Round).filter(
+            Round.cycle_number == current_cycle
+        ).all()
+
+        used_teams_canonical = set()
+        for pick in cycle_picks:
+            used_teams_canonical.add(normalize_team_name(pick.team_picked))
+
+        # Calculate available teams for this player (not used in this cycle)
+        available_canonical = teams_in_round_canonical - used_teams_canonical
+
+        if not available_canonical:
+            # Player has used all teams in this round's fixtures during this cycle
+            skipped_no_available += 1
+            continue
+
+        # Pick a random team from available teams
+        selected_canonical = random.choice(list(available_canonical))
+
+        # Find the original team name (for display purposes)
+        selected_team = selected_canonical  # Default to canonical
+        for team in teams_in_round:
+            if normalize_team_name(team) == selected_canonical:
+                selected_team = team
+                break
+
         pick = Pick(
             player_id=player.id,
             round_id=round_id,
-            team_picked=team,
+            team_picked=selected_team,
             auto_assigned=True,
             auto_reason='debug_random_seed',
             timestamp=now
@@ -704,7 +730,10 @@ def seed_random_picks():
 
     db.session.commit()
 
-    flash(f'Seeded {picks_created} random picks for round {round_obj.round_number}', 'success')
+    msg = f'Seeded {picks_created} random picks for round {round_obj.round_number}'
+    if skipped_no_available:
+        msg += f' (skipped {skipped_no_available} players with no available teams)'
+    flash(msg, 'success')
     return redirect(url_for('admin_dashboard'))
 
 
