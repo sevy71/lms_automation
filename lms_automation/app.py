@@ -1059,7 +1059,7 @@ def handle_rounds():
 
             # Fetch and populate fixtures
             try:
-                from football_api import FootballDataAPI
+                from lms_automation.football_api import FootballDataAPI
                 api = FootballDataAPI()
                 fixtures_data = api.get_premier_league_fixtures(pl_matchday)
                 formatted_fixtures = api.format_fixtures_for_db(fixtures_data, pl_matchday)
@@ -1153,7 +1153,7 @@ def get_available_matchdays():
         
         # Optional: Try to get real data from API if available
         try:
-            from football_api import FootballDataAPI
+            from lms_automation.football_api import FootballDataAPI
             api = FootballDataAPI()
             print("Attempting to get real matchday data from API...")
             
@@ -1216,7 +1216,7 @@ def get_matchday_info(matchday):
         
         # Try to get real API data to enhance the info
         try:
-            from football_api import FootballDataAPI
+            from lms_automation.football_api import FootballDataAPI
             api = FootballDataAPI()
             print(f"Attempting to get real data for matchday {matchday}")
             
@@ -1370,7 +1370,7 @@ def add_fixtures_to_round(round_id):
         
         # Try to get fixtures from API
         try:
-            from football_api import FootballDataAPI
+            from lms_automation.football_api import FootballDataAPI
             api = FootballDataAPI()
             fixtures_data = api.get_premier_league_fixtures(round_obj.pl_matchday)
             formatted_fixtures = api.format_fixtures_for_db(fixtures_data, round_obj.pl_matchday)
@@ -1509,7 +1509,7 @@ def auto_populate_results(round_id):
             return jsonify({'success': False, 'error': 'No fixtures found for this round'}), 400
         
         # Get updated results from API
-        from football_api import FootballDataAPI
+        from lms_automation.football_api import FootballDataAPI
         api = FootballDataAPI()
         fixtures_data = api.get_premier_league_fixtures(round_obj.pl_matchday)
         
