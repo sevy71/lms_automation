@@ -1105,41 +1105,11 @@ def handle_rounds():
                     raise Exception("No fixtures returned from API")
 
             except Exception as fixture_error:
-                print(f"API failed, creating fallback fixtures: {fixture_error}")
-
-                fallback_fixtures = [
-                    ("Arsenal", "Chelsea"), ("Liverpool", "Manchester City"),
-                    ("Manchester United", "Tottenham"), ("Newcastle", "Brighton"),
-                    ("Aston Villa", "West Ham"), ("Crystal Palace", "Everton"),
-                    ("Fulham", "Brentford"), ("Wolves", "Nottingham Forest"),
-                    ("Bournemouth", "Sheffield United"), ("Burnley", "Luton Town")
-                ]
-
-                for i, (home_team, away_team) in enumerate(fallback_fixtures):
-                    fixture = Fixture(
-                        round_id=new_round.id,
-                        event_id=f"fallback_{new_round.id}_{i}",
-                        home_team=home_team,
-                        away_team=away_team,
-                        date=None,
-                        time=None,
-                        home_score=None,
-                        away_score=None,
-                        status='scheduled'
-                    )
-                    db.session.add(fixture)
-
-                db.session.commit()
-
+                db.session.rollback()
                 return jsonify({
-                    'success': True,
-                    'id': new_round.id,
-                    'round_number': new_round.round_number,
-                    'cycle_number': new_round.cycle_number,  # ✅ NEW
-                    'pl_matchday': new_round.pl_matchday,
-                    'fixtures_added': len(fallback_fixtures),
-                    'warning': f'Round created with fallback fixtures (API failed): {str(fixture_error)}'
-                })
+                    'success': False,
+                    'error': f'Could not fetch fixtures from Football API: {str(fixture_error)}'
+                }), 502
 
         except Exception as e:
             db.session.rollback()
