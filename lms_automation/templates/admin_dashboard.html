@@ -149,9 +149,12 @@
             <div class="card-body text-center p-4">
                 <i class="fas fa-trophy text-info fa-2x mb-3"></i>
                 <h5 class="card-title">Process Results</h5>
-                <p class="card-text text-muted small">Enter match results and eliminate players whose teams lost</p>
-                <button class="btn btn-info btn-lg w-100" data-bs-toggle="modal" data-bs-target="#resultsModal">
-                    <i class="fas fa-calculator me-2"></i>Process Results
+                <p class="card-text text-muted small">Fetch results from API and eliminate players whose teams lost</p>
+                <button class="btn btn-info btn-lg w-100 mb-2" id="autoProcessResultsBtn">
+                    <i class="fas fa-magic me-2"></i>Auto Process Results
+                </button>
+                <button class="btn btn-outline-info btn-sm w-100" data-bs-toggle="modal" data-bs-target="#resultsModal">
+                    <i class="fas fa-edit me-2"></i>Manual Entry
                 </button>
             </div>
         </div>
@@ -382,6 +385,70 @@ document.addEventListener('DOMContentLoaded', function() {
         alert(msg);
       } catch (e) {
         alert('Error previewing auto-picks');
+      }
+    });
+  }
+
+  // Auto Process Results button (MANUAL_MODE support)
+  const autoProcessBtn = document.getElementById('autoProcessResultsBtn');
+  if (autoProcessBtn) {
+    autoProcessBtn.addEventListener('click', async () => {
+      const confirmMsg = 'This will:\n1. Fetch latest fixture results from Football API\n2. Evaluate all picks\n3. Eliminate players whose teams lost or drew\n4. Mark the round as completed\n\nContinue?';
+      if (!confirm(confirmMsg)) return;
+
+      autoProcessBtn.disabled = true;
+      autoProcessBtn.innerHTML = '<i class="fas fa-spinner fa-spin me-2"></i>Processing...';
+
+      try {
+        const resp = await fetch('/api/admin/process-results?update_fixtures=1', { method: 'POST' });
+        const data = await resp.json();
+
+        if (data.success) {
+          let msg = '✅ Results Processed Successfully!\n\n';
+          msg += `📊 Summary:\n`;
+          msg += `• Fixtures updated: ${data.summary.fixture_updates || 0}\n`;
+          msg += `• Rounds completed: ${data.summary.rounds_completed || 0}\n`;
+          msg += `• Eliminations this run: ${data.summary.total_eliminations_this_run || 0}\n`;
+          msg += `• Active players remaining: ${data.summary.total_active_players || 0}\n`;
+          msg += `• Total eliminated: ${data.summary.total_eliminated_players || 0}\n`;
+
+          if (data.eliminations && data.eliminations.length > 0) {
+            msg += `\n❌ Eliminated Players:\n`;
+            data.eliminations.slice(0, 10).forEach(e => {
+              msg += `• ${e.player_name} (picked ${e.team_picked})\n`;
+            });
+            if (data.eliminations.length > 10) {
+              msg += `... and ${data.eliminations.length - 10} more\n`;
+            }
+          }
+
+          if (data.winners && data.winners.length > 0) {
+            msg += `\n✅ Surviving Players:\n`;
+            data.winners.slice(0, 10).forEach(w => {
+              msg += `• ${w.player_name} (picked ${w.team_picked})\n`;
+            });
+            if (data.winners.length > 10) {
+              msg += `... and ${data.winners.length - 10} more\n`;
+            }
+          }
+
+          if (data.errors && data.errors.length > 0) {
+            msg += `\n⚠️ Notes:\n`;
+            data.errors.forEach(err => {
+              msg += `• ${err}\n`;
+            });
+          }
+
+          alert(msg);
+          location.reload();
+        } else {
+          alert('❌ Error: ' + (data.error || 'Unknown error'));
+        }
+      } catch (e) {
+        alert('❌ Error processing results: ' + e);
+      } finally {
+        autoProcessBtn.disabled = false;
+        autoProcessBtn.innerHTML = '<i class="fas fa-magic me-2"></i>Auto Process Results';
       }
     });
   }

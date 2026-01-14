@@ -92,6 +92,9 @@ class LMSScheduler:
         self.app = app
         self.notification_service = NotificationService()
         self.telegram_bot_url = os.environ.get('TELEGRAM_BOT_URL', 'http://localhost:8080')
+        # MANUAL_MODE: When true, disables automation that completes rounds or processes eliminations
+        # This allows the game to run at human pace for debugging
+        self.manual_mode = os.environ.get('MANUAL_MODE', 'false').lower() == 'true'
 
     def init_app(self, app: Flask):
         """Initialize scheduler with Flask app context"""
@@ -111,21 +114,44 @@ class LMSScheduler:
         - Most jobs run every 1-2 minutes for responsiveness
         - Internal guards prevent collisions and ensure correct sequencing
         - Jobs are idempotent: running twice won't cause issues
+
+        MANUAL_MODE:
+        - When MANUAL_MODE=true, critical automation jobs are disabled
+        - Disabled jobs: process_eliminations, update_fixtures, apply_missed_picks, check_all_picks, round_orchestrator
+        - Enabled jobs: sync_fixtures, generate_tokens, send_round_announcements, send_reminders, enforce_invariant
+        - This allows the admin to manually control round completion via the UI
         """
         if not self.scheduler.running:
+            # Log MANUAL_MODE status at startup
+            logger.info("=" * 60)
+            logger.info(f"SCHEDULER CONFIGURATION: MANUAL_MODE={self.manual_mode}")
+            if self.manual_mode:
+                logger.info("MANUAL MODE ENABLED: The following jobs are DISABLED:")
+                logger.info("  - update_fixtures (fixture result polling)")
+                logger.info("  - process_eliminations (round completion + eliminations)")
+                logger.info("  - apply_missed_picks (auto-picks after deadline)")
+                logger.info("  - check_all_picks (picks locked notification)")
+                logger.info("  - round_orchestrator (auto-activate pending rounds)")
+                logger.info("Admin must use 'Process Results' button to manually process rounds.")
+            logger.info("=" * 60)
+
             # Schedule jobs
 
             # Check for fixture updates every 5 minutes (was 30)
             # Guard: Only updates fixtures that have changed
+            # MANUAL_MODE: DISABLED - this job evaluates picks and could lead to auto-completion
             fixture_interval = int(os.environ.get('FIXTURE_UPDATE_INTERVAL_MINUTES', '5'))
-            self.scheduler.add_job(
-                func=self.update_fixture_results,
-                trigger=IntervalTrigger(minutes=fixture_interval),
-                id='update_fixtures',
-                name='Update fixture results from Football API',
-                replace_existing=True
-            )
-            logger.info(f"Fixture updates job configured with {fixture_interval}-minute interval")
+            if not self.manual_mode:
+                self.scheduler.add_job(
+                    func=self.update_fixture_results,
+                    trigger=IntervalTrigger(minutes=fixture_interval),
+                    id='update_fixtures',
+                    name='Update fixture results from Football API',
+                    replace_existing=True
+                )
+                logger.info(f"Fixture updates job configured with {fixture_interval}-minute interval")
+            else:
+                logger.info(f"Fixture updates job DISABLED (MANUAL_MODE=true)")
 
             # Sync fixtures every 30 minutes (was 60)
             # Guard: Only syncs fixtures that are missing or changed
@@ -143,16 +169,20 @@ class LMSScheduler:
             # GUARDS: Won't complete round unless ALL conditions met:
             #   1. All fixtures completed
             #   2. Picks exist for eligible players (or deadline passed + autopick ran)
+            # MANUAL_MODE: DISABLED - this is the main job that completes rounds and eliminates players
             elim_interval_minutes = int(os.environ.get('ELIMINATION_INTERVAL_MINUTES', '2'))
-            self.scheduler.add_job(
-                func=self.process_eliminations,
-                trigger=IntervalTrigger(minutes=elim_interval_minutes),
-                id='process_eliminations',
-                name='Process eliminations and check for rollover',
-                next_run_time=datetime.now(),  # run immediately on boot
-                replace_existing=True
-            )
-            logger.info(f"Eliminations job configured with {elim_interval_minutes}-minute interval (guarded)")
+            if not self.manual_mode:
+                self.scheduler.add_job(
+                    func=self.process_eliminations,
+                    trigger=IntervalTrigger(minutes=elim_interval_minutes),
+                    id='process_eliminations',
+                    name='Process eliminations and check for rollover',
+                    next_run_time=datetime.now(),  # run immediately on boot
+                    replace_existing=True
+                )
+                logger.info(f"Eliminations job configured with {elim_interval_minutes}-minute interval (guarded)")
+            else:
+                logger.info(f"Eliminations job DISABLED (MANUAL_MODE=true)")
 
             # Send reminders every 5 minutes (was 15)
             # Guard: Uses is_sent flag to prevent duplicates
@@ -193,41 +223,53 @@ class LMSScheduler:
 
             # Apply missed picks every 2 minutes (fast, catches deadlines promptly)
             # Guard: Only inserts if no existing pick for (player_id, round_id)
+            # MANUAL_MODE: DISABLED - prevents automatic team assignment; admin can trigger manually
             autopick_interval_minutes = int(os.environ.get('AUTOPICK_INTERVAL_MINUTES', '2'))
-            self.scheduler.add_job(
-                func=self.apply_missed_picks,
-                trigger=IntervalTrigger(minutes=autopick_interval_minutes),
-                id='apply_missed_picks',
-                name='Apply auto-picks for players who missed deadline',
-                next_run_time=datetime.now(),
-                replace_existing=True
-            )
-            logger.info(f"Auto-pick job configured with {autopick_interval_minutes}-minute interval")
+            if not self.manual_mode:
+                self.scheduler.add_job(
+                    func=self.apply_missed_picks,
+                    trigger=IntervalTrigger(minutes=autopick_interval_minutes),
+                    id='apply_missed_picks',
+                    name='Apply auto-picks for players who missed deadline',
+                    next_run_time=datetime.now(),
+                    replace_existing=True
+                )
+                logger.info(f"Auto-pick job configured with {autopick_interval_minutes}-minute interval")
+            else:
+                logger.info(f"Auto-pick job DISABLED (MANUAL_MODE=true)")
 
             # Orchestrator job - ensures proper round progression every 5 minutes (was 10)
             # Guard: Only activates rounds that meet all criteria
+            # MANUAL_MODE: DISABLED - prevents automatic round activation; admin controls when rounds go active
             orchestrator_interval = int(os.environ.get('ORCHESTRATOR_INTERVAL_MINUTES', '5'))
-            self.scheduler.add_job(
-                func=self.round_progression_orchestrator,
-                trigger=IntervalTrigger(minutes=orchestrator_interval),
-                id='round_orchestrator',
-                name='Orchestrate round progression (activate pending rounds with tokens)',
-                next_run_time=datetime.now(),
-                replace_existing=True
-            )
-            logger.info(f"Orchestrator job configured with {orchestrator_interval}-minute interval")
+            if not self.manual_mode:
+                self.scheduler.add_job(
+                    func=self.round_progression_orchestrator,
+                    trigger=IntervalTrigger(minutes=orchestrator_interval),
+                    id='round_orchestrator',
+                    name='Orchestrate round progression (activate pending rounds with tokens)',
+                    next_run_time=datetime.now(),
+                    replace_existing=True
+                )
+                logger.info(f"Orchestrator job configured with {orchestrator_interval}-minute interval")
+            else:
+                logger.info(f"Orchestrator job DISABLED (MANUAL_MODE=true)")
 
             # Check if all picks are submitted every 2 minutes (was 5)
             # Guard: Uses special_note to prevent duplicate notifications
+            # MANUAL_MODE: DISABLED - prevents auto-locking picks; admin controls the flow
             picks_check_interval = int(os.environ.get('PICKS_CHECK_INTERVAL_MINUTES', '2'))
-            self.scheduler.add_job(
-                func=self.check_all_picks_submitted,
-                trigger=IntervalTrigger(minutes=picks_check_interval),
-                id='check_all_picks',
-                name='Check if all picks submitted and publish',
-                replace_existing=True
-            )
-            logger.info(f"Picks check job configured with {picks_check_interval}-minute interval")
+            if not self.manual_mode:
+                self.scheduler.add_job(
+                    func=self.check_all_picks_submitted,
+                    trigger=IntervalTrigger(minutes=picks_check_interval),
+                    id='check_all_picks',
+                    name='Check if all picks submitted and publish',
+                    replace_existing=True
+                )
+                logger.info(f"Picks check job configured with {picks_check_interval}-minute interval")
+            else:
+                logger.info(f"Picks check job DISABLED (MANUAL_MODE=true)")
 
             # Global invariant enforcement every 30 minutes (was 1 hour)
             # Guard: Only corrects actual violations

@@ -828,6 +828,294 @@ def current_round_picks_status():
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
+
+@app.route('/api/admin/process-results', methods=['POST'])
+@admin_required
+def manual_process_results():
+    """
+    Manual endpoint to process results and eliminations for active rounds.
+
+    This endpoint is designed for MANUAL_MODE operation where automation is disabled.
+    It runs the same logic as the scheduler's process_eliminations job but on-demand.
+
+    Query params:
+        - update_fixtures: If '1' or 'true', sync fixture results from API first
+        - round_id: Optional specific round ID to process (defaults to all active rounds)
+
+    Returns JSON with:
+        - rounds_processed: list of round IDs that were completed
+        - eliminations: list of eliminated players with details
+        - winners: list of winning players
+        - fixture_updates: count of fixtures updated (if update_fixtures=true)
+        - errors: any errors encountered
+    """
+    import logging
+    logger = logging.getLogger(__name__)
+
+    logger.info("=" * 60)
+    logger.info("=== MANUAL PROCESS RESULTS START ===")
+    logger.info("=" * 60)
+
+    try:
+        update_fixtures = request.args.get('update_fixtures', '0') in ('1', 'true', 'True')
+        specific_round_id = request.args.get('round_id', type=int)
+
+        result = {
+            'success': True,
+            'rounds_processed': [],
+            'eliminations': [],
+            'winners': [],
+            'fixture_updates': 0,
+            'errors': [],
+            'summary': {}
+        }
+
+        # Step 1: Optionally update fixtures from API
+        if update_fixtures:
+            logger.info("Step 1: Updating fixtures from Football API...")
+            try:
+                from lms_automation.football_api import FootballDataAPI
+                from lms_automation.team_utils import normalize_team_name
+
+                api = FootballDataAPI()
+                season = os.environ.get('FOOTBALL_SEASON') or os.environ.get('SEASON')
+
+                # Get rounds to update
+                if specific_round_id:
+                    rounds_to_update = Round.query.filter_by(id=specific_round_id).all()
+                else:
+                    rounds_to_update = Round.query.filter(Round.status.in_(['active', 'pending'])).all()
+
+                for round_obj in rounds_to_update:
+                    if not round_obj.pl_matchday:
+                        continue
+
+                    api_data = api.get_premier_league_fixtures(
+                        matchday=round_obj.pl_matchday,
+                        season=season
+                    )
+
+                    if api_data and 'matches' in api_data:
+                        matches_by_id = {
+                            str(m.get('id')): m for m in api_data['matches'] if m.get('id') is not None
+                        }
+                        fixtures = Fixture.query.filter_by(round_id=round_obj.id).all()
+
+                        for fixture in fixtures:
+                            match = None
+                            if fixture.event_id:
+                                match = matches_by_id.get(str(fixture.event_id))
+                            if not match:
+                                for candidate in api_data['matches']:
+                                    if (candidate.get('homeTeam', {}).get('name') == fixture.home_team and
+                                        candidate.get('awayTeam', {}).get('name') == fixture.away_team):
+                                        match = candidate
+                                        break
+
+                            if match:
+                                score = match.get('score', {})
+                                full_time = score.get('fullTime', {})
+                                home_score = full_time.get('home')
+                                away_score = full_time.get('away')
+                                api_status = match.get('status', '')
+
+                                # Map API status to our status
+                                status_map = {
+                                    'FINISHED': 'completed',
+                                    'IN_PLAY': 'live',
+                                    'PAUSED': 'live',
+                                    'POSTPONED': 'postponed',
+                                    'CANCELLED': 'postponed',
+                                    'SCHEDULED': 'scheduled',
+                                    'TIMED': 'scheduled',
+                                }
+                                new_status = status_map.get(api_status, fixture.status)
+
+                                # Update fixture if scores changed
+                                if home_score is not None and away_score is not None:
+                                    if fixture.home_score != home_score or fixture.away_score != away_score or fixture.status != new_status:
+                                        fixture.home_score = home_score
+                                        fixture.away_score = away_score
+                                        fixture.status = new_status
+                                        result['fixture_updates'] += 1
+                                        logger.info(f"Updated fixture: {fixture.home_team} {home_score}-{away_score} {fixture.away_team} ({new_status})")
+
+                db.session.commit()
+                logger.info(f"Fixture updates complete: {result['fixture_updates']} fixtures updated")
+            except Exception as e:
+                logger.error(f"Error updating fixtures: {e}")
+                result['errors'].append(f"Fixture update error: {str(e)}")
+
+        # Step 2: Process eliminations for active rounds
+        logger.info("Step 2: Processing eliminations...")
+
+        if specific_round_id:
+            active_rounds = Round.query.filter_by(id=specific_round_id).all()
+        else:
+            active_rounds = Round.query.filter_by(status='active').all()
+
+        logger.info(f"Found {len(active_rounds)} round(s) to process")
+
+        from lms_automation.team_utils import normalize_team_name
+
+        for round_obj in active_rounds:
+            logger.info(f"Processing Round {round_obj.round_number} (id={round_obj.id})")
+            round_result = {
+                'round_id': round_obj.id,
+                'round_number': round_obj.round_number,
+                'status': 'skipped',
+                'reason': None,
+                'eliminations': [],
+                'winners': []
+            }
+
+            # GUARD 1: Check fixtures exist
+            fixtures = Fixture.query.filter_by(round_id=round_obj.id).all()
+            if not fixtures:
+                round_result['reason'] = 'no_fixtures'
+                logger.warning(f"  GUARD BLOCK: Round {round_obj.round_number} has no fixtures")
+                result['errors'].append(f"Round {round_obj.round_number}: no fixtures")
+                continue
+
+            # GUARD 2: Check all fixtures completed
+            completed_fixtures = [f for f in fixtures if f.status == 'completed']
+            if not all(f.status == 'completed' for f in fixtures):
+                pending_fixtures = [f for f in fixtures if f.status != 'completed']
+                round_result['reason'] = f'{len(pending_fixtures)}_fixtures_not_completed'
+                logger.info(f"  GUARD BLOCK: {len(pending_fixtures)} fixture(s) not completed")
+                result['errors'].append(f"Round {round_obj.round_number}: {len(pending_fixtures)} fixtures not completed")
+                continue
+
+            # GUARD 3: Check picks exist
+            eligible_players = get_eligible_players_for_round(round_obj)
+            picks = Pick.query.filter_by(round_id=round_obj.id).all()
+
+            if len(picks) == 0:
+                round_result['reason'] = 'no_picks'
+                logger.warning(f"  GUARD BLOCK: Round {round_obj.round_number} has 0 picks")
+                result['errors'].append(f"Round {round_obj.round_number}: no picks submitted")
+                continue
+
+            if len(picks) < len(eligible_players):
+                round_result['reason'] = f'picks_incomplete ({len(picks)}/{len(eligible_players)})'
+                logger.info(f"  GUARD BLOCK: {len(picks)}/{len(eligible_players)} picks")
+                result['errors'].append(f"Round {round_obj.round_number}: {len(picks)}/{len(eligible_players)} picks")
+                continue
+
+            # Evaluate picks based on fixture results
+            fixture_teams = {}
+            for fx in fixtures:
+                home_norm = normalize_team_name(fx.home_team)
+                away_norm = normalize_team_name(fx.away_team)
+
+                # Determine outcomes
+                if fx.home_score > fx.away_score:
+                    fixture_teams[home_norm] = True  # home win
+                    fixture_teams[away_norm] = False  # away loss
+                elif fx.away_score > fx.home_score:
+                    fixture_teams[home_norm] = False  # home loss
+                    fixture_teams[away_norm] = True  # away win
+                else:
+                    fixture_teams[home_norm] = False  # draw = loss
+                    fixture_teams[away_norm] = False  # draw = loss
+
+            # Update pick results
+            for pick in picks:
+                pick_norm = normalize_team_name(pick.team_picked)
+                if pick_norm in fixture_teams:
+                    pick.is_winner = fixture_teams[pick_norm]
+                else:
+                    # Unmatched pick = loss
+                    pick.is_winner = False
+                    logger.warning(f"  Unmatched pick: {pick.player.name} -> {pick.team_picked}")
+
+            # GUARD 4: Check all picks evaluated
+            unevaluated = [p for p in picks if p.is_winner is None]
+            if unevaluated:
+                round_result['reason'] = f'{len(unevaluated)}_unevaluated_picks'
+                logger.warning(f"  GUARD BLOCK: {len(unevaluated)} unevaluated picks")
+                result['errors'].append(f"Round {round_obj.round_number}: {len(unevaluated)} picks couldn't be evaluated")
+                continue
+
+            # Process eliminations
+            for pick in picks:
+                if pick.is_winner == False and not pick.is_eliminated:
+                    pick.is_eliminated = True
+                    pick.player.status = 'eliminated'
+                    elimination_info = {
+                        'player_id': pick.player_id,
+                        'player_name': pick.player.name,
+                        'team_picked': pick.team_picked,
+                        'round_number': round_obj.round_number
+                    }
+                    round_result['eliminations'].append(elimination_info)
+                    result['eliminations'].append(elimination_info)
+                    logger.info(f"  ELIMINATED: {pick.player.name} (picked {pick.team_picked})")
+                elif pick.is_winner == True:
+                    winner_info = {
+                        'player_id': pick.player_id,
+                        'player_name': pick.player.name,
+                        'team_picked': pick.team_picked,
+                        'round_number': round_obj.round_number
+                    }
+                    round_result['winners'].append(winner_info)
+                    result['winners'].append(winner_info)
+
+            # Check if results already sent (idempotency)
+            special_note = round_obj.special_note or ''
+            results_already_sent = 'results_sent' in special_note
+
+            # Mark round as completed
+            round_obj.status = 'completed'
+            round_result['status'] = 'completed'
+
+            # Add results_sent marker if not already present
+            if not results_already_sent:
+                if special_note:
+                    round_obj.special_note = f"{special_note},results_sent"
+                else:
+                    round_obj.special_note = "results_sent"
+                logger.info(f"  Added results_sent marker to round {round_obj.round_number}")
+            else:
+                logger.info(f"  Results already sent for round {round_obj.round_number} (idempotent)")
+
+            result['rounds_processed'].append(round_result)
+            logger.info(f"  Round {round_obj.round_number}: COMPLETED (winners={len(round_result['winners'])}, eliminated={len(round_result['eliminations'])})")
+
+        db.session.commit()
+
+        # Build summary
+        total_active = Player.query.filter_by(status='active').count()
+        total_eliminated = Player.query.filter_by(status='eliminated').count()
+        total_winner = Player.query.filter_by(status='winner').count()
+
+        result['summary'] = {
+            'total_active_players': total_active,
+            'total_eliminated_players': total_eliminated,
+            'total_winners': total_winner,
+            'rounds_completed': len(result['rounds_processed']),
+            'total_eliminations_this_run': len(result['eliminations']),
+            'fixture_updates': result['fixture_updates']
+        }
+
+        logger.info("=" * 60)
+        logger.info(f"=== MANUAL PROCESS RESULTS COMPLETE ===")
+        logger.info(f"Summary: {result['summary']}")
+        logger.info("=" * 60)
+
+        return jsonify(result)
+
+    except Exception as e:
+        import traceback
+        logger.error(f"Error in manual_process_results: {e}")
+        logger.error(traceback.format_exc())
+        db.session.rollback()
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
 def _earliest_kickoff_for_round(round_obj: Round):
     """Helper: determine earliest kickoff datetime for a round from fixtures."""
     try:
