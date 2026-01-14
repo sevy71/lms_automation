@@ -13,16 +13,28 @@ States:
                  (tracked via special_note containing 'picks_locked')
 - completed    : All fixtures finished AND eliminations processed
 
+PHASE MARKERS (in special_note):
+--------------------------------
+- tokens_generated : All eligible players have tokens for this round
+- announced        : Initial "round is live" announcement attempted for all eligible players
+- picks_locked     : All picks are in (manual or auto); no more edits allowed
+- picks_published  : "Picks locked" notification sent
+- results_sent     : Round results notification sent
+
 Transitions:
 ------------
 pending -> active:
-  WHEN: fixtures exist AND tokens generated for all eligible players
+  WHEN: fixtures exist AND tokens_generated marker set
   BY: round_progression_orchestrator job
 
-active -> picks_locked:
-  WHEN: (picks_count == eligible_players_count) OR (deadline_passed AND autopick_applied)
-  BY: check_all_picks_submitted OR apply_missed_picks (sets marker in special_note)
-  NOTE: This is a logical state tracked via special_note='picks_locked'
+active -> announced:
+  WHEN: round is active AND send_new_round_announcements runs
+  BY: send_new_round_announcements job (marks 'announced' after attempting all)
+
+announced -> picks_locked:
+  WHEN: (picks_count == eligible_count) OR (deadline_passed AND autopick_applied)
+  BY: check_all_picks_submitted OR apply_missed_picks
+  GUARD: MUST have 'announced' marker (or SKIP_ANNOUNCEMENT_GATE=true)
 
 picks_locked -> completed:
   WHEN: ALL of:
@@ -42,9 +54,13 @@ CRITICAL INVARIANTS:
 3. NEVER mark round completed if any fixture is still scheduled/live/postponed
 4. is_winner=False MUST always mean is_eliminated=True (enforced by invariant job)
 5. Auto-picks MUST be applied before eliminations if deadline has passed
+6. NEVER allow picks_locked without tokens_generated (unless SKIP_ANNOUNCEMENT_GATE)
+7. NEVER allow picks_locked without announced marker (unless SKIP_ANNOUNCEMENT_GATE)
 
 IDEMPOTENCY RULES:
 ------------------
+- generate_round_tokens: Only creates if token doesn't exist; marks 'tokens_generated' once
+- send_new_round_announcements: Only sends if not announced; marks 'announced' once
 - apply_missed_picks: Only insert if no pick exists for (player_id, round_id)
 - process_eliminations: Only set is_eliminated=True if is_winner=False AND not already eliminated
 - check_all_picks_submitted: Only send notification once (check special_note)
@@ -719,7 +735,14 @@ class LMSScheduler:
 
                     # ======== Mark round as completed (all guards passed) ========
                     round_obj.status = 'completed'
-                    logger.info(f"  Round {round_obj.round_number}: Marked as COMPLETED (all guards passed)")
+
+                    # Log completion with phase summary for one-glance debugging
+                    phase_status = self._get_phase_status(round_obj)
+                    logger.info(
+                        f"  Round {round_obj.round_number}: COMPLETED "
+                        f"(picks_total={len(picks)}, winners={winners_count}, eliminated={eliminated_count}, "
+                        f"fixtures_completed={len(completed_fixtures)}, phase={phase_status})"
+                    )
 
                     # SAFEGUARD: Ensure no picks have is_winner=False AND is_eliminated=False
                     # This is an invariant violation - if you lost, you MUST be eliminated
@@ -953,15 +976,16 @@ class LMSScheduler:
         IMPORTANT: This is called AFTER db.session.commit() so the round+fixtures
         are already persisted. Telegram messages happen outside the DB transaction.
 
-        Reuses existing job logic (not duplicating):
-        1. Token generation (same logic as generate_round_tokens)
-        2. Round activation (same logic as round_progression_orchestrator)
-        3. Announcements (calls send_new_round_announcements directly)
+        Uses phase markers for proper sequencing:
+        1. Token generation -> sets 'tokens_generated' marker
+        2. Round activation (requires 'tokens_generated')
+        3. Announcements -> sets 'announced' marker
         """
         logger.info(f"=== ROLLOVER AUTOMATION START (round {round_obj.round_number}) ===")
 
         # Step 1: Generate tokens (reuse logic from generate_round_tokens)
         eligible_players = self._get_eligible_players_for_round(round_obj)
+        eligible_count = len(eligible_players)
         tokens_created = 0
 
         for player in eligible_players:
@@ -977,29 +1001,39 @@ class LMSScheduler:
                 db.session.add(token)
                 tokens_created += 1
 
-        db.session.commit()
-        logger.info(f"ROLLOVER: Generated {tokens_created} tokens")
+        # Set tokens_generated marker
+        token_count = PickToken.query.filter_by(round_id=round_obj.id).count() + tokens_created
+        if token_count >= eligible_count and eligible_count > 0:
+            self._add_marker(round_obj, 'tokens_generated')
+            logger.info(
+                f"ROLLOVER: Generated {tokens_created} tokens, TOKENS_GENERATED marker set "
+                f"({token_count}/{eligible_count})"
+            )
+        else:
+            logger.info(f"ROLLOVER: Generated {tokens_created} tokens")
 
-        # Step 2: Activate round if ready (reuse logic from orchestrator)
+        db.session.commit()
+
+        # Step 2: Activate round if ready (requires tokens_generated marker)
         fixtures = Fixture.query.filter_by(round_id=round_obj.id).all()
-        token_count = PickToken.query.filter_by(round_id=round_obj.id).count()
 
         activated = False
-        if fixtures and token_count >= len(eligible_players) and len(eligible_players) > 0:
+        if fixtures and self._has_marker(round_obj, 'tokens_generated') and eligible_count > 0:
             round_obj.status = 'active'
             db.session.commit()
             activated = True
             logger.info(
                 f"ROLLOVER: Round {round_obj.round_number} ACTIVATED "
-                f"({len(fixtures)} fixtures, {token_count} tokens)"
+                f"({len(fixtures)} fixtures, {token_count} tokens, tokens_generated=True)"
             )
         else:
             logger.warning(
                 f"ROLLOVER: Round {round_obj.round_number} NOT activated "
-                f"(fixtures={len(fixtures)}, tokens={token_count}, eligible={len(eligible_players)})"
+                f"(fixtures={len(fixtures)}, tokens={token_count}, eligible={eligible_count}, "
+                f"tokens_generated={self._has_marker(round_obj, 'tokens_generated')})"
             )
 
-        # Step 3: Send announcements using EXISTING function
+        # Step 3: Send announcements and set 'announced' marker
         # This function is idempotent (skips already-announced players via ReminderSchedule)
         # and handles all the telegram sending + reminder scheduling
         if activated:
@@ -1097,11 +1131,15 @@ class LMSScheduler:
                     )
                     db.session.add(reminder_2h)
 
+        # Set 'announced' marker after processing all eligible players
+        self._add_marker(round_obj, 'announced')
+
         db.session.commit()
 
         logger.info(
             f"ROLLOVER: Announcements sent={sent}, skipped_no_token={skipped_no_token}, "
-            f"skipped_no_telegram={skipped_no_telegram}, skipped_already_announced={skipped_already_announced}"
+            f"skipped_no_telegram={skipped_no_telegram}, skipped_already_announced={skipped_already_announced}, "
+            f"ANNOUNCED marker set"
         )
 
     def _enforce_elimination_invariant(self, round_obj):
@@ -1348,11 +1386,15 @@ class LMSScheduler:
         - Have a telegram_chat_id
         - Have NOT already submitted a pick for this round
 
+        PHASE MARKER: Sets 'announced' marker when announcements have been attempted
+        for all eligible players. This marker gates auto-pick from running.
+
         This makes the job idempotent - running it multiple times will not
         re-notify players who have already picked.
         """
         with self.app.app_context():
             try:
+                logger.info("=" * 60)
                 logger.info("=== ROUND ANNOUNCEMENT JOB START ===")
 
                 # Get active rounds
@@ -1361,9 +1403,31 @@ class LMSScheduler:
 
                 if not active_rounds:
                     logger.info("No active rounds found")
+                    logger.info("=== ROUND ANNOUNCEMENT JOB COMPLETE (no rounds) ===")
                     return
 
                 for round_obj in active_rounds:
+                    # Log phase status for debugging
+                    phase_status = self._get_phase_status(round_obj)
+                    logger.info(
+                        f"Round {round_obj.round_number} (id={round_obj.id}): phase={phase_status}"
+                    )
+
+                    # GUARD: Skip if already announced
+                    if self._has_marker(round_obj, 'announced'):
+                        logger.info(
+                            f"Round {round_obj.round_number}: Already has 'announced' marker, skipping"
+                        )
+                        continue
+
+                    # GUARD: Require tokens_generated before announcements
+                    if not self._has_marker(round_obj, 'tokens_generated'):
+                        logger.warning(
+                            f"Round {round_obj.round_number}: Missing 'tokens_generated' marker, "
+                            f"waiting for token generation job"
+                        )
+                        continue
+
                     # Use eligibility check to respect per-round eliminations
                     eligible_players = self._get_eligible_players_for_round(round_obj)
 
@@ -1376,6 +1440,13 @@ class LMSScheduler:
                     skipped_not_active = 0
                     sent = 0
                     failed = 0
+
+                    if eligible_total == 0:
+                        logger.warning(
+                            f"Round {round_obj.round_number}: No eligible players, marking as announced"
+                        )
+                        self._add_marker(round_obj, 'announced')
+                        continue
 
                     for player in eligible_players:
                         # LEAN & CLEAN: Only send to ACTIVE players (defensive check)
@@ -1406,6 +1477,9 @@ class LMSScheduler:
 
                         if not pick_token:
                             skipped_no_token += 1
+                            logger.warning(
+                                f"  Player {player.name} (id={player.id}): No token exists, cannot send announcement"
+                            )
                             continue
 
                         # Check if we've already sent the initial announcement
@@ -1423,10 +1497,9 @@ class LMSScheduler:
                         if not (hasattr(player, 'telegram_id') and player.telegram_id):
                             skipped_missing_telegram += 1
                             logger.warning(
-                                "Skipping round announcement for %s (player_id=%s, phone=%s): missing telegram_chat_id",
+                                "  Player %s (player_id=%s): missing telegram_id, cannot send announcement",
                                 player.name,
-                                player.id,
-                                player.whatsapp_number or "-"
+                                player.id
                             )
                             continue
 
@@ -1450,7 +1523,7 @@ class LMSScheduler:
                         )
                         if success:
                             sent += 1
-                            logger.info(f"Sent new round announcement to {player.name}")
+                            logger.info(f"  Sent pick-link announcement to {player.name} (id={player.id})")
 
                             # Now schedule the reminders (4-hour and 2-hour)
                             if round_obj.first_kickoff_at:
@@ -1476,40 +1549,46 @@ class LMSScheduler:
                         else:
                             failed += 1
                             logger.warning(
-                                "Failed to send round announcement to %s (player_id=%s, phone=%s)",
+                                "  FAILED to send announcement to %s (player_id=%s)",
                                 player.name,
-                                player.id,
-                                player.whatsapp_number or "-"
+                                player.id
                             )
+
+                    # PHASE MARKER: Set 'announced' after processing all eligible players
+                    # This is set regardless of how many were actually sent - the attempt was made
+                    # Players without telegram_id will get auto-picks, which is correct behavior
+                    if self._add_marker(round_obj, 'announced'):
+                        logger.info(
+                            f"Round {round_obj.round_number}: ANNOUNCED marker set "
+                            f"(sent={sent}, failed={failed}, skipped_no_telegram={skipped_missing_telegram})"
+                        )
 
                     # Structured logging summary with all counts
                     logger.info(
-                        "Round announcement summary: round_id=%s, round_number=%s, "
-                        "eligible_total=%s, skipped_not_active=%s, already_picked_skipped=%s, skipped_no_token=%s, "
-                        "skipped_already_announced=%s, skipped_missing_telegram=%s, sent=%s, failed=%s",
-                        round_obj.id,
-                        round_obj.round_number,
-                        eligible_total,
-                        skipped_not_active,
-                        already_picked_skipped,
-                        skipped_no_token,
-                        skipped_already_announced,
-                        skipped_missing_telegram,
-                        sent,
-                        failed
+                        f"Round {round_obj.round_number} announcement summary: "
+                        f"eligible={eligible_total}, sent={sent}, failed={failed}, "
+                        f"skipped_not_active={skipped_not_active}, already_picked={already_picked_skipped}, "
+                        f"no_token={skipped_no_token}, already_announced={skipped_already_announced}, "
+                        f"no_telegram={skipped_missing_telegram}"
                     )
 
                 db.session.commit()
                 logger.info("=== ROUND ANNOUNCEMENT JOB COMPLETE ===")
+                logger.info("=" * 60)
 
             except Exception as e:
                 logger.error(f"Error sending round announcements: {e}")
                 db.session.rollback()
 
     def generate_round_tokens(self):
-        """Generate pick tokens for pending/active rounds without tokens"""
+        """Generate pick tokens for pending/active rounds without tokens.
+
+        PHASE MARKER: Sets 'tokens_generated' when all eligible players have tokens.
+        This marker is required before round activation and announcements.
+        """
         with self.app.app_context():
             try:
+                logger.info("=" * 60)
                 logger.info("=== TOKEN GENERATION JOB START ===")
 
                 # Get pending AND active rounds (tokens should be created before activation)
@@ -1522,16 +1601,32 @@ class LMSScheduler:
 
                 if not rounds_needing_tokens:
                     logger.info("No pending or active rounds found")
+                    logger.info("=== TOKEN GENERATION JOB COMPLETE (no rounds) ===")
                     return
 
-                tokens_created = 0
+                total_tokens_created = 0
 
                 for round_obj in rounds_needing_tokens:
                     # Use eligibility check to respect per-round eliminations
                     eligible_players = self._get_eligible_players_for_round(round_obj)
+                    eligible_count = len(eligible_players)
+
+                    # Count existing tokens
+                    existing_token_count = PickToken.query.filter_by(round_id=round_obj.id).count()
+
+                    # Log phase status for debugging
+                    phase_status = self._get_phase_status(round_obj)
                     logger.info(
-                        f"Round {round_obj.round_number}: Processing {len(eligible_players)} eligible player(s)"
+                        f"Round {round_obj.round_number} (id={round_obj.id}): "
+                        f"eligible={eligible_count}, existing_tokens={existing_token_count}, "
+                        f"phase={phase_status}"
                     )
+
+                    if eligible_count == 0:
+                        logger.warning(
+                            f"Round {round_obj.round_number}: No eligible players, skipping token generation"
+                        )
+                        continue
 
                     round_tokens_created = 0
 
@@ -1549,17 +1644,31 @@ class LMSScheduler:
                             )
                             db.session.add(token)
                             logger.info(
-                                f"Created token for player '{player.name}' (id={player.id}) - Round {round_obj.round_number}"
+                                f"  Created token for player '{player.name}' (id={player.id})"
                             )
                             round_tokens_created += 1
 
-                    tokens_created += round_tokens_created
+                    total_tokens_created += round_tokens_created
+
+                    # Check if all eligible players now have tokens
+                    final_token_count = PickToken.query.filter_by(round_id=round_obj.id).count()
+
+                    # PHASE MARKER: Set 'tokens_generated' when all tokens exist
+                    if final_token_count >= eligible_count and not self._has_marker(round_obj, 'tokens_generated'):
+                        self._add_marker(round_obj, 'tokens_generated')
+                        logger.info(
+                            f"Round {round_obj.round_number}: TOKENS_GENERATED marker set "
+                            f"({final_token_count}/{eligible_count} tokens)"
+                        )
+
                     logger.info(
-                        f"Round {round_obj.round_number}: Created {round_tokens_created} new token(s)"
+                        f"Round {round_obj.round_number}: tokens_created={round_tokens_created}, "
+                        f"total_tokens={final_token_count}/{eligible_count}"
                     )
 
                 db.session.commit()
-                logger.info(f"=== TOKEN GENERATION COMPLETE: {tokens_created} token(s) created ===")
+                logger.info(f"=== TOKEN GENERATION COMPLETE: {total_tokens_created} token(s) created ===")
+                logger.info("=" * 60)
 
             except Exception as e:
                 logger.error(f"Error generating tokens: {e}")
@@ -1572,6 +1681,10 @@ class LMSScheduler:
         who is eligible but has not submitted a pick after the deadline (1 hour
         before first kickoff).
 
+        PHASE GUARD: Requires 'announced' marker before auto-picks can run.
+        This ensures players receive pick-link announcements before auto-pick.
+        Set SKIP_ANNOUNCEMENT_GATE=true to bypass this check (emergency use).
+
         Important: This does NOT require telegram_chat_id or pick tokens.
         It only requires players.status='active' and no existing pick for the round.
         """
@@ -1580,6 +1693,11 @@ class LMSScheduler:
                 logger.info("=" * 60)
                 logger.info("=== AUTO-PICK JOB START ===")
                 logger.info("=" * 60)
+
+                # Check if announcement gate is disabled (emergency bypass)
+                skip_announcement_gate = os.environ.get('SKIP_ANNOUNCEMENT_GATE', 'false').lower() == 'true'
+                if skip_announcement_gate:
+                    logger.warning("SKIP_ANNOUNCEMENT_GATE=true - bypassing announcement requirement")
 
                 # Always use UTC for consistency
                 now = datetime.utcnow()
@@ -1598,6 +1716,20 @@ class LMSScheduler:
                 for round_obj in active_rounds:
                     logger.info("-" * 40)
                     logger.info(f"Checking Round {round_obj.round_number} (round_id={round_obj.id})")
+
+                    # Log phase status for debugging
+                    phase_status = self._get_phase_status(round_obj)
+                    logger.info(f"  phase_status = {phase_status}")
+
+                    # PHASE GUARD: Require 'announced' marker before auto-picks
+                    # This ensures players received their pick-link announcements first
+                    if not skip_announcement_gate and not self._has_marker(round_obj, 'announced'):
+                        logger.warning(
+                            f"  GUARD BLOCK: Round {round_obj.round_number} missing 'announced' marker. "
+                            f"Waiting for announcement job to complete before auto-picks. "
+                            f"(Set SKIP_ANNOUNCEMENT_GATE=true to bypass)"
+                        )
+                        continue
 
                     # Determine first kickoff time
                     kickoff = round_obj.first_kickoff_at
@@ -1730,63 +1862,71 @@ class LMSScheduler:
         """
         Orchestrator job that ensures proper round progression.
 
-        This job runs every 10 minutes and:
-        1. Activates pending rounds that have tokens created
+        This job runs every 5 minutes and:
+        1. Activates pending rounds that have 'tokens_generated' marker
         2. Checks if active rounds are ready to be processed
         3. Ensures the automation pipeline doesn't stall
+
+        PHASE REQUIREMENT: Round activation requires 'tokens_generated' marker,
+        ensuring tokens exist for all eligible players before the round goes active.
         """
         with self.app.app_context():
             try:
+                logger.info("=" * 60)
                 logger.info("=== ROUND ORCHESTRATOR JOB START ===")
 
-                # Step 1: Check for pending rounds with fixtures and tokens, and activate them
+                # Step 1: Check for pending rounds with fixtures and tokens_generated marker
                 pending_rounds = Round.query.filter_by(status='pending').all()
                 logger.info(f"Found {len(pending_rounds)} pending round(s)")
 
                 for round_obj in pending_rounds:
+                    # Log phase status for debugging
+                    phase_status = self._get_phase_status(round_obj)
+                    logger.info(
+                        f"Round {round_obj.round_number} (id={round_obj.id}): phase={phase_status}"
+                    )
+
                     # Check if fixtures exist
                     fixtures = Fixture.query.filter_by(round_id=round_obj.id).all()
                     if not fixtures:
                         logger.info(f"Round {round_obj.round_number}: No fixtures yet, staying pending")
                         continue
 
-                    # Check if tokens exist for eligible players
+                    # Check if tokens_generated marker exists
+                    if not self._has_marker(round_obj, 'tokens_generated'):
+                        logger.info(
+                            f"Round {round_obj.round_number}: Missing 'tokens_generated' marker, "
+                            f"waiting for token generation job"
+                        )
+                        continue
+
+                    # Check if there are eligible players
                     eligible_players = self._get_eligible_players_for_round(round_obj)
                     if not eligible_players:
                         logger.warning(f"Round {round_obj.round_number}: No eligible players found")
                         continue
 
-                    # Count how many tokens exist for this round
-                    token_count = PickToken.query.filter_by(round_id=round_obj.id).count()
-
+                    # ACTIVATION: Round has fixtures AND tokens_generated marker
+                    round_obj.status = 'active'
                     logger.info(
-                        f"Round {round_obj.round_number}: {len(fixtures)} fixture(s), "
-                        f"{len(eligible_players)} eligible player(s), {token_count} token(s)"
+                        f"Round {round_obj.round_number}: ACTIVATED "
+                        f"({len(fixtures)} fixtures, {len(eligible_players)} eligible players, "
+                        f"tokens_generated=True)"
                     )
-
-                    # If tokens exist for all eligible players, activate the round
-                    if token_count >= len(eligible_players) and len(eligible_players) > 0:
-                        round_obj.status = 'active'
-                        logger.info(
-                            f"Round {round_obj.round_number}: ACTIVATED (has {token_count} tokens for {len(eligible_players)} players)"
-                        )
-                    else:
-                        logger.info(
-                            f"Round {round_obj.round_number}: Not ready to activate "
-                            f"(needs {len(eligible_players)} tokens, has {token_count})"
-                        )
 
                 # Step 2: Check active rounds for completion readiness
                 active_rounds = Round.query.filter_by(status='active').all()
                 logger.info(f"Found {len(active_rounds)} active round(s)")
 
                 for round_obj in active_rounds:
+                    phase_status = self._get_phase_status(round_obj)
                     fixtures = Fixture.query.filter_by(round_id=round_obj.id).all()
                     completed_fixtures = [f for f in fixtures if f.status == 'completed']
 
                     logger.info(
                         f"Round {round_obj.round_number} (active): "
-                        f"{len(completed_fixtures)}/{len(fixtures)} fixtures completed"
+                        f"{len(completed_fixtures)}/{len(fixtures)} fixtures completed, "
+                        f"phase={phase_status}"
                     )
 
                     # If all fixtures are completed, the process_eliminations job will handle it
@@ -1798,6 +1938,7 @@ class LMSScheduler:
 
                 db.session.commit()
                 logger.info("=== ROUND ORCHESTRATOR JOB COMPLETE ===")
+                logger.info("=" * 60)
 
             except Exception as e:
                 logger.error(f"Error in round orchestrator: {e}")
@@ -1811,6 +1952,9 @@ class LMSScheduler:
         1. Mark the round as "picks_locked" in special_note (prevents further edits)
         2. Publish picks so everyone can see who picked what
 
+        PHASE GUARD: Requires 'tokens_generated' marker before allowing picks_locked.
+        This ensures tokens were created (prerequisite for announcements).
+
         IMPORTANT: This job does NOT complete rounds. It only marks them as picks_locked.
         Round completion is handled by process_eliminations after fixtures complete.
 
@@ -1818,11 +1962,21 @@ class LMSScheduler:
         """
         with self.app.app_context():
             try:
+                logger.info("=" * 60)
                 logger.info("=== ALL PICKS CHECK JOB START ===")
+
+                # Check if announcement gate is disabled (emergency bypass)
+                skip_announcement_gate = os.environ.get('SKIP_ANNOUNCEMENT_GATE', 'false').lower() == 'true'
 
                 active_rounds = Round.query.filter_by(status='active').all()
 
                 for round_obj in active_rounds:
+                    # Log phase status for debugging
+                    phase_status = self._get_phase_status(round_obj)
+                    logger.info(
+                        f"Round {round_obj.round_number} (id={round_obj.id}): phase={phase_status}"
+                    )
+
                     # Get eligible players for this round
                     eligible_players = self._get_eligible_players_for_round(round_obj)
                     eligible_count = len(eligible_players)
@@ -1840,17 +1994,23 @@ class LMSScheduler:
 
                     # Check if all eligible players have picks
                     if picks_count >= eligible_count:
+                        # PHASE GUARD: Require tokens_generated before picks_locked
+                        # This ensures the proper flow: tokens -> announcements -> picks
+                        if not skip_announcement_gate and not self._has_marker(round_obj, 'tokens_generated'):
+                            logger.warning(
+                                f"Round {round_obj.round_number}: GUARD BLOCK - Cannot mark picks_locked "
+                                f"without 'tokens_generated' marker. Waiting for token generation."
+                            )
+                            continue
+
                         # All picks are in! Mark as locked and notify
 
                         # Mark as picks_locked (idempotent - check if already set)
-                        if not (round_obj.special_note and 'picks_locked' in round_obj.special_note):
-                            if round_obj.special_note:
-                                round_obj.special_note += "; picks_locked"
-                            else:
-                                round_obj.special_note = "picks_locked"
+                        if not self._has_marker(round_obj, 'picks_locked'):
+                            self._add_marker(round_obj, 'picks_locked')
                             logger.info(
                                 f"Round {round_obj.round_number}: ALL PICKS SUBMITTED! "
-                                f"({picks_count}/{eligible_count}) - marked as picks_locked"
+                                f"({picks_count}/{eligible_count}) - marked as PICKS_LOCKED"
                             )
                         else:
                             logger.debug(
@@ -1862,6 +2022,7 @@ class LMSScheduler:
 
                 db.session.commit()
                 logger.info("=== ALL PICKS CHECK JOB COMPLETE ===")
+                logger.info("=" * 60)
 
             except Exception as e:
                 logger.error(f"Error checking all picks: {e}")
@@ -2240,6 +2401,36 @@ class LMSScheduler:
     def _get_eligible_players_for_round(self, round_obj):
         """Delegate to canonical eligibility function in eligibility.py."""
         return get_eligible_players_for_round(round_obj)
+
+    # ==================== PHASE MARKER HELPERS ====================
+
+    def _has_marker(self, round_obj, marker: str) -> bool:
+        """Check if round has a specific phase marker in special_note."""
+        return round_obj.special_note and marker in round_obj.special_note
+
+    def _add_marker(self, round_obj, marker: str) -> bool:
+        """
+        Add a phase marker to round.special_note if not already present.
+        Returns True if marker was added, False if already present.
+        """
+        if self._has_marker(round_obj, marker):
+            return False
+        if round_obj.special_note:
+            round_obj.special_note += f"; {marker}"
+        else:
+            round_obj.special_note = marker
+        return True
+
+    def _get_phase_status(self, round_obj) -> dict:
+        """Get current phase status for a round (for logging)."""
+        return {
+            'status': round_obj.status,
+            'tokens_generated': self._has_marker(round_obj, 'tokens_generated'),
+            'announced': self._has_marker(round_obj, 'announced'),
+            'picks_locked': self._has_marker(round_obj, 'picks_locked'),
+            'picks_published': self._has_marker(round_obj, 'picks_published'),
+            'results_sent': self._has_marker(round_obj, 'results_sent'),
+        }
 
     def _player_has_pick_for_round(self, player_id: int, round_id: int) -> bool:
         """
