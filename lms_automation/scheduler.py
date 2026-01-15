@@ -830,54 +830,176 @@ class LMSScheduler:
                 logger.error("=" * 60)
                 db.session.rollback()
 
-    def _check_game_state(self, completed_round):
-        """Check for winner, all eliminated, or end of cycle"""
+    def _evaluate_game_state_after_round(self, completed_round) -> str:
+        """
+        Centralized end-of-round game-state evaluation.
+
+        DEFINITIONS (EXACT SEMANTICS):
+
+        WINNER:
+        - Declared ONLY when:
+          - A round is completed AND
+          - EXACTLY 1 player remains active across the entire game (Player.status == 'active')
+
+        ROLLOVER:
+        - Occurs ONLY when:
+          - A round is completed AND
+          - ZERO players remain active (everyone eliminated)
+
+        CONTINUE (normal progression):
+        - Occurs when:
+          - A round is completed AND
+          - active_players > 1
+
+        This function is the SINGLE SOURCE OF TRUTH for game state transitions.
+        It must be called after EVERY round completion (scheduler and manual API).
+
+        Returns:
+            str: 'winner', 'rollover', or 'continue'
+        """
+        logger.info("=" * 60)
+        logger.info("=== GAME STATE EVALUATION START ===")
+        logger.info(f"Evaluating after Round {completed_round.round_number} (cycle={completed_round.cycle_number})")
+
+        # Count active players GLOBALLY (not per-round)
         active_players = Player.query.filter_by(status='active').all()
+        active_count = len(active_players)
 
-        # Check for winner (exactly 1 active player)
-        if len(active_players) == 1:
+        logger.info(f"Active players globally: {active_count}")
+
+        # ==================== WINNER CHECK ====================
+        # EXACTLY 1 player remains active
+        if active_count == 1:
             winner = active_players[0]
-            winner.status = 'winner'
-            logger.info(f"WINNER DETECTED: {winner.name} has won the game!")
+            logger.info("=" * 60)
+            logger.info("GAME STATE: winner")
+            logger.info(f"WINNER DECLARED: {winner.name} (id={winner.id})")
+            logger.info("=" * 60)
 
-            # Send winner notification (with idempotency via completed_round)
+            # Idempotency check
+            if self._has_marker(completed_round, 'game_winner_announced'):
+                logger.info("Winner already announced (idempotent), skipping notifications")
+                return 'winner'
+
+            # Mark winner status
+            winner.status = 'winner'
+
+            # Send winner DM + broadcast
             self._send_winner_notification(winner, completed_round)
 
-            # Optionally auto-reset for new game
-            if os.environ.get('AUTO_RESET_ON_WIN', 'false').lower() == 'true':
-                self._reset_game_for_new_cycle()
+            # Mark round with winner marker (done inside _send_winner_notification)
+            # DO NOT create new round - game is over
 
-        # Check for all eliminated (rollover scenario)
-        elif len(active_players) == 0:
-            logger.info("ALL PLAYERS ELIMINATED! Triggering rollover...")
+            logger.info("=== GAME STATE EVALUATION COMPLETE (winner) ===")
+            return 'winner'
 
-            # Reset all players to active for new cycle
-            Player.query.update({'status': 'active'}, synchronize_session=False)
+        # ==================== ROLLOVER CHECK ====================
+        # ZERO players remain active (everyone eliminated)
+        elif active_count == 0:
+            logger.info("=" * 60)
+            logger.info("GAME STATE: rollover")
+            logger.info("All players eliminated - triggering rollover")
+            logger.info("=" * 60)
 
-            # Calculate next cycle
+            # Idempotency check
             next_cycle = (completed_round.cycle_number or 1) + 1
-            logger.info(f"Starting Cycle {next_cycle} after all players eliminated")
+            rollover_marker = f"rollover_processed_cycle_{next_cycle}"
 
-            # Send rollover notification
+            if self._has_marker(completed_round, rollover_marker):
+                logger.info(f"Rollover already processed for cycle {next_cycle} (idempotent)")
+                return 'rollover'
+
+            # Add rollover marker
+            self._add_marker(completed_round, rollover_marker)
+
+            # Increment cycle_number, reset round_number to 1 conceptually
+            # (new round will be round_number = global_max + 1, but cycle_number = next_cycle)
+
+            # Reset ALL players to status='active'
+            Player.query.update({'status': 'active'}, synchronize_session=False)
+            logger.info("All players reset to status='active'")
+
+            # Clear elimination-related state on picks for new cycle
+            # (Not strictly necessary since new cycle has new picks, but good hygiene)
+
+            # Send rollover notification to ALL players
             self._send_rollover_notification(next_cycle)
 
-            # Create the next round for the new cycle and trigger automation
+            # Send admin notification
+            self._send_admin_rollover_notification(next_cycle, completed_round)
+
+            # Create new round (cycle+1, round 1 of that cycle)
             new_round = self._create_rollover_round(completed_round, next_cycle)
             if new_round:
-                # Commit round+fixtures first, THEN trigger automation (telegram outside txn)
+                # Commit round+fixtures first
                 db.session.commit()
+
+                # Mark that next round was created
+                next_round_marker = f"next_round_created_cycle_{next_cycle}"
+                self._add_marker(completed_round, next_round_marker)
+
+                # Trigger automation: generate tokens, announce round
                 self._trigger_rollover_automation(new_round)
 
-        # Check for end of cycle (Round 20 with 2+ survivors)
-        elif completed_round.round_number == 20 and len(active_players) >= 2:
-            logger.info(f"END OF CYCLE {completed_round.cycle_number}: {len(active_players)} survivors")
+                logger.info(f"New round created: round_id={new_round.id}, round_number={new_round.round_number}")
 
-            # Survivors continue, eliminated players stay eliminated
-            next_cycle = (completed_round.cycle_number or 1) + 1
-            logger.info(f"Starting Cycle {next_cycle} with {len(active_players)} survivors")
+            logger.info("=== GAME STATE EVALUATION COMPLETE (rollover) ===")
+            return 'rollover'
 
-            # Send cycle complete notification
-            self._send_cycle_complete_notification(active_players, next_cycle)
+        # ==================== CONTINUE (normal progression) ====================
+        # active_players > 1
+        else:
+            logger.info("=" * 60)
+            logger.info("GAME STATE: continue")
+            logger.info(f"{active_count} players still active - game continues")
+            logger.info("=" * 60)
+
+            # Normal progression:
+            # - Next round will be created manually by admin or via API
+            # - OR automatically if automation is enabled
+
+            # Check for end of cycle (Round 20 with 2+ survivors) - special case
+            if completed_round.round_number == 20 and active_count >= 2:
+                next_cycle = (completed_round.cycle_number or 1) + 1
+                logger.info(f"END OF CYCLE {completed_round.cycle_number}: {active_count} survivors advance to Cycle {next_cycle}")
+                self._send_cycle_complete_notification(active_players, next_cycle)
+
+            logger.info("=== GAME STATE EVALUATION COMPLETE (continue) ===")
+            return 'continue'
+
+    def _send_admin_rollover_notification(self, new_cycle, completed_round):
+        """
+        Send Telegram notification to ADMIN about rollover event.
+
+        This notification is sent regardless of admin's player status.
+        Uses ADMIN_TELEGRAM_ID environment variable.
+        """
+        admin_telegram_id = os.environ.get('ADMIN_TELEGRAM_ID')
+        if not admin_telegram_id:
+            logger.warning("ADMIN_TELEGRAM_ID not set, skipping admin rollover notification")
+            return
+
+        message = (
+            f"🔄 ROLLOVER: All players eliminated.\n\n"
+            f"Starting Cycle {new_cycle}, Round 1.\n"
+            f"Previous round: {completed_round.round_number} (Cycle {completed_round.cycle_number or 1})"
+        )
+
+        try:
+            success = self._send_telegram_message(admin_telegram_id, message)
+            if success:
+                logger.info(f"Admin rollover notification sent to telegram_id={admin_telegram_id}")
+            else:
+                logger.warning(f"Failed to send admin rollover notification to telegram_id={admin_telegram_id}")
+        except Exception as e:
+            logger.error(f"Error sending admin rollover notification: {e}")
+
+    def _check_game_state(self, completed_round):
+        """
+        Legacy wrapper for backwards compatibility.
+        Delegates to _evaluate_game_state_after_round.
+        """
+        return self._evaluate_game_state_after_round(completed_round)
 
     def _create_rollover_round(self, completed_round, next_cycle):
         """
@@ -2255,6 +2377,20 @@ class LMSScheduler:
                     errors += 1
             else:
                 skipped_missing_telegram += 1
+
+        # 3) Send admin notification (always, regardless of player status)
+        admin_telegram_id = os.environ.get('ADMIN_TELEGRAM_ID')
+        if admin_telegram_id:
+            admin_message = (
+                f"🏆 WINNER DECLARED: {winner.name} (id={winner.id})\n\n"
+                f"Round {completed_round.round_number} complete.\n"
+                f"Game over - competition ended."
+            )
+            try:
+                self._send_telegram_message(admin_telegram_id, admin_message)
+                logger.info(f"Admin winner notification sent to telegram_id={admin_telegram_id}")
+            except Exception as e:
+                logger.error(f"Error sending admin winner notification: {e}")
 
         # Mark as announced (idempotency)
         if completed_round.special_note:

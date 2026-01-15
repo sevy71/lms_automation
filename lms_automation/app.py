@@ -512,7 +512,47 @@ def index():
 def admin_dashboard():
     players = Player.query.all()
     current_round = Round.query.filter_by(status='active').first()
-    return render_template('admin_dashboard.html', players=players, current_round=current_round)
+
+    # Compute game state info for dashboard display
+    active_player_count = Player.query.filter_by(status='active').count()
+    eliminated_player_count = Player.query.filter_by(status='eliminated').count()
+    winner_player_count = Player.query.filter_by(status='winner').count()
+
+    # Get current cycle number
+    current_cycle = None
+    if current_round:
+        current_cycle = current_round.cycle_number or 1
+    else:
+        # Find from most recent round
+        latest_round = Round.query.order_by(Round.id.desc()).first()
+        if latest_round:
+            current_cycle = latest_round.cycle_number or 1
+
+    # Get last completed round and its outcome
+    last_completed_round = Round.query.filter_by(status='completed').order_by(Round.id.desc()).first()
+    last_round_outcome = None
+    if last_completed_round:
+        special_note = last_completed_round.special_note or ''
+        if 'game_winner_announced' in special_note:
+            last_round_outcome = 'winner'
+        elif 'rollover_processed' in special_note:
+            last_round_outcome = 'rollover'
+        else:
+            last_round_outcome = 'continue'
+
+    game_state_info = {
+        'current_cycle': current_cycle,
+        'active_players': active_player_count,
+        'eliminated_players': eliminated_player_count,
+        'winner_players': winner_player_count,
+        'last_completed_round': last_completed_round,
+        'last_round_outcome': last_round_outcome
+    }
+
+    return render_template('admin_dashboard.html',
+                           players=players,
+                           current_round=current_round,
+                           game_state_info=game_state_info)
 
 
 @app.route('/admin/resend-announcement/<int:round_id>')
@@ -1082,6 +1122,12 @@ def manual_process_results():
             result['rounds_processed'].append(round_result)
             logger.info(f"  Round {round_obj.round_number}: COMPLETED (winners={len(round_result['winners'])}, eliminated={len(round_result['eliminations'])})")
 
+            # CRITICAL: Evaluate game state after each completed round
+            # This is the centralized logic for winner/rollover/continue
+            game_state = _evaluate_game_state_after_round_standalone(round_obj)
+            round_result['game_state'] = game_state
+            logger.info(f"  Game state after Round {round_obj.round_number}: {game_state}")
+
         db.session.commit()
 
         # Build summary
@@ -1089,13 +1135,19 @@ def manual_process_results():
         total_eliminated = Player.query.filter_by(status='eliminated').count()
         total_winner = Player.query.filter_by(status='winner').count()
 
+        # Determine last completed round outcome
+        last_game_state = None
+        if result['rounds_processed']:
+            last_game_state = result['rounds_processed'][-1].get('game_state', 'unknown')
+
         result['summary'] = {
             'total_active_players': total_active,
             'total_eliminated_players': total_eliminated,
             'total_winners': total_winner,
             'rounds_completed': len(result['rounds_processed']),
             'total_eliminations_this_run': len(result['eliminations']),
-            'fixture_updates': result['fixture_updates']
+            'fixture_updates': result['fixture_updates'],
+            'last_game_state': last_game_state
         }
 
         logger.info("=" * 60)
@@ -1114,6 +1166,223 @@ def manual_process_results():
             'success': False,
             'error': str(e)
         }), 500
+
+
+def _evaluate_game_state_after_round_standalone(completed_round) -> str:
+    """
+    Standalone version of centralized game state evaluation for use in app.py.
+
+    DEFINITIONS (EXACT SEMANTICS):
+
+    WINNER:
+    - Declared ONLY when:
+      - A round is completed AND
+      - EXACTLY 1 player remains active across the entire game (Player.status == 'active')
+
+    ROLLOVER:
+    - Occurs ONLY when:
+      - A round is completed AND
+      - ZERO players remain active (everyone eliminated)
+
+    CONTINUE (normal progression):
+    - Occurs when:
+      - A round is completed AND
+      - active_players > 1
+
+    This mirrors the scheduler's _evaluate_game_state_after_round but works standalone.
+
+    Returns:
+        str: 'winner', 'rollover', or 'continue'
+    """
+    import logging
+    import requests
+    logger = logging.getLogger(__name__)
+
+    logger.info("=" * 60)
+    logger.info("=== GAME STATE EVALUATION START (manual API) ===")
+    logger.info(f"Evaluating after Round {completed_round.round_number} (cycle={completed_round.cycle_number})")
+
+    # Count active players GLOBALLY (not per-round)
+    active_players = Player.query.filter_by(status='active').all()
+    active_count = len(active_players)
+
+    logger.info(f"Active players globally: {active_count}")
+
+    # Helper to add marker
+    def add_marker(round_obj, marker):
+        if round_obj.special_note and marker in round_obj.special_note:
+            return False
+        if round_obj.special_note:
+            round_obj.special_note += f"; {marker}"
+        else:
+            round_obj.special_note = marker
+        return True
+
+    def has_marker(round_obj, marker):
+        return round_obj.special_note and marker in round_obj.special_note
+
+    def send_telegram_message(telegram_id, message, button_url=None, button_text="View"):
+        """Send message via Telegram bot"""
+        try:
+            bot_token = os.environ.get('TELEGRAM_BOT_TOKEN')
+            if not bot_token:
+                logger.error("TELEGRAM_BOT_TOKEN not set")
+                return False
+
+            url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+            payload = {
+                'chat_id': telegram_id,
+                'text': message
+            }
+
+            if button_url:
+                payload['reply_markup'] = {
+                    'inline_keyboard': [[
+                        {'text': button_text, 'url': button_url}
+                    ]]
+                }
+
+            response = requests.post(url, json=payload)
+            return response.status_code == 200
+        except Exception as e:
+            logger.error(f"Error sending Telegram message: {e}")
+            return False
+
+    def get_picks_grid_url():
+        base_url = os.environ.get('BASE_URL', 'http://localhost:5000').rstrip('/')
+        return f"{base_url}/picks-grid"
+
+    # ==================== WINNER CHECK ====================
+    # EXACTLY 1 player remains active
+    if active_count == 1:
+        winner = active_players[0]
+        logger.info("=" * 60)
+        logger.info("GAME STATE: winner")
+        logger.info(f"WINNER DECLARED: {winner.name} (id={winner.id})")
+        logger.info("=" * 60)
+
+        # Idempotency check
+        if has_marker(completed_round, 'game_winner_announced'):
+            logger.info("Winner already announced (idempotent), skipping notifications")
+            return 'winner'
+
+        # Mark winner status
+        winner.status = 'winner'
+
+        # Send winner notification
+        picks_grid_url = get_picks_grid_url()
+        winner_dm_text = (
+            f"🏆 You've won the competition!\n\n"
+            f"Congratulations! You are the Last Man Standing! 🎉"
+        )
+        broadcast_text = (
+            f"🏁 Competition over — Winner is {winner.name}.\n\n"
+            f"Thanks for playing! 🎉"
+        )
+
+        # Send winner DM
+        if winner.telegram_id:
+            send_telegram_message(
+                winner.telegram_id,
+                winner_dm_text,
+                button_url=picks_grid_url,
+                button_text="📊 View Final Grid"
+            )
+
+        # Broadcast to all players
+        all_players = Player.query.all()
+        for player in all_players:
+            if player.telegram_id:
+                send_telegram_message(
+                    player.telegram_id,
+                    broadcast_text,
+                    button_url=picks_grid_url,
+                    button_text="📊 View Final Grid"
+                )
+
+        # Send admin notification
+        admin_telegram_id = os.environ.get('ADMIN_TELEGRAM_ID')
+        if admin_telegram_id:
+            admin_message = (
+                f"🏆 WINNER DECLARED: {winner.name} (id={winner.id})\n\n"
+                f"Round {completed_round.round_number} complete.\n"
+                f"Game over - competition ended."
+            )
+            send_telegram_message(admin_telegram_id, admin_message)
+            logger.info(f"Admin winner notification sent to telegram_id={admin_telegram_id}")
+
+        # Mark round with winner marker
+        add_marker(completed_round, 'game_winner_announced')
+        db.session.commit()
+
+        logger.info("=== GAME STATE EVALUATION COMPLETE (winner) ===")
+        return 'winner'
+
+    # ==================== ROLLOVER CHECK ====================
+    # ZERO players remain active (everyone eliminated)
+    elif active_count == 0:
+        logger.info("=" * 60)
+        logger.info("GAME STATE: rollover")
+        logger.info("All players eliminated - triggering rollover")
+        logger.info("=" * 60)
+
+        # Idempotency check
+        next_cycle = (completed_round.cycle_number or 1) + 1
+        rollover_marker = f"rollover_processed_cycle_{next_cycle}"
+
+        if has_marker(completed_round, rollover_marker):
+            logger.info(f"Rollover already processed for cycle {next_cycle} (idempotent)")
+            return 'rollover'
+
+        # Add rollover marker
+        add_marker(completed_round, rollover_marker)
+
+        # Reset ALL players to status='active'
+        Player.query.update({'status': 'active'}, synchronize_session=False)
+        logger.info("All players reset to status='active'")
+
+        # Send rollover notification to ALL players
+        picks_grid_url = get_picks_grid_url()
+        rollover_message = f"🔄 ROLLOVER!\n\nAll players eliminated. Starting Cycle {next_cycle}.\nEveryone is back in!"
+
+        all_players = Player.query.all()
+        for player in all_players:
+            if player.telegram_id:
+                send_telegram_message(
+                    player.telegram_id,
+                    rollover_message,
+                    button_url=picks_grid_url,
+                    button_text="📊 View Grid"
+                )
+
+        # Send admin notification
+        admin_telegram_id = os.environ.get('ADMIN_TELEGRAM_ID')
+        if admin_telegram_id:
+            admin_message = (
+                f"🔄 ROLLOVER: All players eliminated.\n\n"
+                f"Starting Cycle {next_cycle}, Round 1.\n"
+                f"Previous round: {completed_round.round_number} (Cycle {completed_round.cycle_number or 1})"
+            )
+            send_telegram_message(admin_telegram_id, admin_message)
+            logger.info(f"Admin rollover notification sent to telegram_id={admin_telegram_id}")
+
+        db.session.commit()
+
+        # Note: In manual mode, admin creates next round manually
+        logger.info(f"Rollover complete. Admin should create next round for Cycle {next_cycle}.")
+        logger.info("=== GAME STATE EVALUATION COMPLETE (rollover) ===")
+        return 'rollover'
+
+    # ==================== CONTINUE (normal progression) ====================
+    # active_players > 1
+    else:
+        logger.info("=" * 60)
+        logger.info("GAME STATE: continue")
+        logger.info(f"{active_count} players still active - game continues")
+        logger.info("=" * 60)
+
+        logger.info("=== GAME STATE EVALUATION COMPLETE (continue) ===")
+        return 'continue'
 
 
 def _earliest_kickoff_for_round(round_obj: Round):

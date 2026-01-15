@@ -102,18 +102,42 @@
             </div>
             <div class="card-body">
                 <div class="row text-center">
+                    <!-- Cycle Info -->
+                    <div class="col-12 mb-3">
+                        <span class="badge bg-info fs-6 px-3 py-2">
+                            Cycle {{ game_state_info.current_cycle or 1 }}
+                        </span>
+                        {% if current_round %}
+                        <span class="badge bg-secondary fs-6 px-3 py-2 ms-1">
+                            Round {{ current_round.round_number }}
+                        </span>
+                        {% endif %}
+                    </div>
                     <div class="col-12 mb-3">
                         <h3 class="text-primary mb-0">{{ players|length }}</h3>
                         <small class="text-muted">Total Players</small>
                     </div>
                     <div class="col-6">
-                        <h4 class="text-success mb-0">{{ players|selectattr('status', 'equalto', 'active')|list|length }}</h4>
+                        <h4 class="text-success mb-0">{{ game_state_info.active_players }}</h4>
                         <small class="text-muted">Active</small>
                     </div>
                     <div class="col-6">
-                        <h4 class="text-danger mb-0">{{ players|selectattr('status', 'equalto', 'eliminated')|list|length }}</h4>
+                        <h4 class="text-danger mb-0">{{ game_state_info.eliminated_players }}</h4>
                         <small class="text-muted">Eliminated</small>
                     </div>
+                    <!-- Last Round Outcome -->
+                    {% if game_state_info.last_completed_round %}
+                    <div class="col-12 mt-3 pt-3 border-top">
+                        <small class="text-muted d-block mb-1">Last Completed Round {{ game_state_info.last_completed_round.round_number }}</small>
+                        {% if game_state_info.last_round_outcome == 'winner' %}
+                            <span class="badge bg-warning text-dark">🏆 WINNER DECLARED</span>
+                        {% elif game_state_info.last_round_outcome == 'rollover' %}
+                            <span class="badge bg-info">🔄 ROLLOVER</span>
+                        {% else %}
+                            <span class="badge bg-success">✅ CONTINUE</span>
+                        {% endif %}
+                    </div>
+                    {% endif %}
                 </div>
             </div>
         </div>
