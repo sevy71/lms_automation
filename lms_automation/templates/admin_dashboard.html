@@ -304,10 +304,16 @@ document.addEventListener('DOMContentLoaded', function() {
       console.log('[Start New Game] Calling /api/admin/start-new-game...');
       const resp = await fetch('/api/admin/start-new-game', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' }
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({})
       });
       const data = await resp.json();
-      console.log('[Start New Game] Response:', data);
+      console.log('[Start New Game] Response:', resp.status, data);
+
+      if (!resp.ok) {
+        alert('Error starting new game (HTTP ' + resp.status + '): ' + (data.error || JSON.stringify(data)));
+        return;
+      }
 
       if (data.success) {
         let msg = `New game started!\n\nCycle ${data.cycle_number} Round 1 created.`;

@@ -1200,7 +1200,8 @@ def start_new_game():
     logger.info("=" * 60)
 
     try:
-        data = request.get_json() or {}
+        # Use silent=True to avoid 400 Bad Request when no body is sent
+        data = request.get_json(silent=True) or {}
         requested_matchday = data.get('pl_matchday')
 
         # Find the last completed round
@@ -1287,9 +1288,7 @@ def start_new_game():
             }), 500
 
     except Exception as e:
-        import traceback
-        logger.error(f"Error in start_new_game: {e}")
-        logger.error(traceback.format_exc())
+        current_app.logger.exception("start-new-game failed")
         db.session.rollback()
         return jsonify({
             'success': False,
