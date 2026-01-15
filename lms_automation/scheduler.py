@@ -1026,9 +1026,9 @@ class LMSScheduler:
             return None
 
         try:
-            # Determine next round_number (global increment)
-            max_round_number = db.session.query(db.func.max(Round.round_number)).scalar() or 0
-            next_round_number = max_round_number + 1
+            # Each cycle starts at round_number=1 (per-cycle numbering)
+            # This aligns with _auto_create_rollover_round in app.py
+            next_round_number = 1
 
             # Determine next matchday (cap at 38, don't wrap)
             current_matchday = completed_round.pl_matchday or 1

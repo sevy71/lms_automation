@@ -1,4 +1,4 @@
-from flask import Blueprint, jsonify
+from flask import Blueprint, jsonify, request
 
 from ...auth import admin_required
 from ...services.picks import build_picks_grid
@@ -10,7 +10,13 @@ bp = Blueprint('api', __name__, url_prefix='/api')
 @bp.get('/picks-grid')
 @admin_required
 def picks_grid():
-    data = build_picks_grid()
+    """Return picks grid data, optionally filtered by cycle.
+
+    Query params:
+        cycle: int - filter to a specific cycle. If omitted, defaults to current cycle.
+    """
+    requested_cycle = request.args.get('cycle', type=int)
+    data = build_picks_grid(cycle=requested_cycle)
     return jsonify({'success': True, **data})
 
 

@@ -4,16 +4,57 @@ from __future__ import annotations
 
 from collections import defaultdict
 
-from lms_automation.models import Player, Round, Pick
+from lms_automation.models import Player, Round, Pick, db
 
 from .teams import display_name
 
 
-def build_picks_grid() -> dict[str, object]:
-    """Return data needed to populate the picks grid UI."""
-    rounds = Round.query.order_by(Round.round_number).all()
+def build_picks_grid(cycle: int | None = None) -> dict[str, object]:
+    """Return data needed to populate the picks grid UI.
+
+    Args:
+        cycle: Optional cycle number to filter by. If None, uses current cycle.
+
+    Returns:
+        dict with rounds, players, current_cycle, and available_cycles.
+    """
+    # Determine available cycles
+    all_cycles = (
+        db.session.query(Round.cycle_number)
+        .filter(Round.cycle_number.isnot(None))
+        .distinct()
+        .order_by(Round.cycle_number)
+        .all()
+    )
+    available_cycles = [c[0] for c in all_cycles] or [1]
+
+    # Determine current cycle (default):
+    # - If there is an active/pending round, use its cycle
+    # - Otherwise, use max(cycle_number)
+    if cycle is not None:
+        current_cycle = cycle
+    else:
+        active_round = Round.query.filter(Round.status.in_(['active', 'pending'])).order_by(Round.id.desc()).first()
+        if active_round:
+            current_cycle = active_round.cycle_number or 1
+        else:
+            current_cycle = max(available_cycles)
+
+    # Query rounds only in the selected cycle, ordered by round_number
+    rounds = (
+        Round.query
+        .filter(Round.cycle_number == current_cycle)
+        .order_by(Round.round_number)
+        .all()
+    )
+
+    # Build round_id set for efficient filtering
+    round_ids = {r.id for r in rounds}
+
     players = Player.query.order_by(Player.name).all()
-    picks = Pick.query.all()
+
+    # Fetch only picks whose round is in the selected cycle
+    picks = Pick.query.filter(Pick.round_id.in_(round_ids)).all() if round_ids else []
 
     picks_map: dict[tuple[int, int], Pick] = {}
     results_map: dict[tuple[int, int], dict[str, bool | None]] = {}
@@ -51,6 +92,8 @@ def build_picks_grid() -> dict[str, object]:
     return {
         'rounds': [round_obj.round_number for round_obj in rounds],
         'players': players_payload,
+        'current_cycle': current_cycle,
+        'available_cycles': available_cycles,
     }
 
 

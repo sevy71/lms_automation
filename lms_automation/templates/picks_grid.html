@@ -15,8 +15,13 @@
 
     <div class="card">
         <div class="card-header d-flex flex-column gap-2">
-            <div class="d-flex align-items-center gap-2">
+            <div class="d-flex align-items-center gap-2 flex-wrap">
                 <h5 class="card-title mb-0">All Player Picks</h5>
+                <!-- Cycle selector -->
+                <div class="d-flex align-items-center gap-1 ms-2">
+                    <label for="cycleSelect" class="form-label mb-0 small fw-bold">Cycle:</label>
+                    <select id="cycleSelect" class="form-select form-select-sm" style="width:auto; min-width:70px;"></select>
+                </div>
                 <div class="btn-group ms-2" role="group" aria-label="View mode">
                     <button type="button" class="btn btn-sm btn-outline-secondary" id="viewPlayer">Player View</button>
                     <button type="button" class="btn btn-sm btn-outline-secondary" id="viewRound">Round View</button>
@@ -443,9 +448,12 @@ let currentSort = 'progress';
 let currentView = 'player'; // 'player' | 'round'
 let currentRoundNumber = null;
 let showAllMobileRounds = false; // player view compaction toggle
+let currentCycle = null; // currently selected cycle
+let availableCycles = []; // list of all cycles
 
 document.addEventListener('DOMContentLoaded', function() {
     const gridContainer = document.getElementById('grid-container');
+    const cycleSelect = document.getElementById('cycleSelect');
 
     // Default to Round view on small screens
     const isMobile = window.matchMedia && window.matchMedia('(max-width: 576px)').matches;
@@ -453,31 +461,62 @@ document.addEventListener('DOMContentLoaded', function() {
         currentView = 'round';
     }
 
-    // Load data
-    fetch('/api/picks-grid-data')
-        .then(response => response.json())
-        .then(data => {
-            if (data.success) {
-                gridData = data;
-                // Initialize rounds selector for round view
-                const rounds = data.rounds || [];
-                const roundSelect = document.getElementById('roundSelect');
-                if (rounds.length > 0 && roundSelect) {
-                    roundSelect.innerHTML = rounds.map(r => `<option value="${r}">R${r}</option>`).join('');
-                    currentRoundNumber = Math.max(...rounds);
-                    roundSelect.value = String(currentRoundNumber);
-                }
+    // Load data with optional cycle param
+    function loadGridData(cycle = null) {
+        let url = '/api/picks-grid-data';
+        if (cycle !== null) {
+            url += `?cycle=${cycle}`;
+        }
+        fetch(url)
+            .then(response => response.json())
+            .then(data => {
+                if (data.success) {
+                    gridData = data;
+                    currentCycle = data.current_cycle;
+                    availableCycles = data.available_cycles || [1];
 
-                renderByView();
-                setupEventListeners();
-            } else {
-                gridContainer.innerHTML = `<div class="alert alert-danger">Error loading data: ${data.error}</div>`;
-            }
-        })
-        .catch(error => {
-            console.error('Error fetching picks grid data:', error);
-            gridContainer.innerHTML = '<div class="alert alert-danger">Could not fetch data from the server.</div>';
+                    // Populate cycle selector (only once or when cycles change)
+                    if (cycleSelect && cycleSelect.options.length !== availableCycles.length) {
+                        cycleSelect.innerHTML = availableCycles.map(c =>
+                            `<option value="${c}"${c === currentCycle ? ' selected' : ''}>Cycle ${c}</option>`
+                        ).join('');
+                    } else if (cycleSelect) {
+                        cycleSelect.value = String(currentCycle);
+                    }
+
+                    // Initialize rounds selector for round view
+                    const rounds = data.rounds || [];
+                    const roundSelect = document.getElementById('roundSelect');
+                    if (rounds.length > 0 && roundSelect) {
+                        roundSelect.innerHTML = rounds.map(r => `<option value="${r}">R${r}</option>`).join('');
+                        currentRoundNumber = Math.max(...rounds);
+                        roundSelect.value = String(currentRoundNumber);
+                    }
+
+                    renderByView();
+                } else {
+                    gridContainer.innerHTML = `<div class="alert alert-danger">Error loading data: ${data.error}</div>`;
+                }
+            })
+            .catch(error => {
+                console.error('Error fetching picks grid data:', error);
+                gridContainer.innerHTML = '<div class="alert alert-danger">Could not fetch data from the server.</div>';
+            });
+    }
+
+    // Initial load (uses default cycle from backend)
+    loadGridData();
+
+    // Cycle selector change handler
+    if (cycleSelect) {
+        cycleSelect.addEventListener('change', function() {
+            const selectedCycle = parseInt(this.value, 10);
+            loadGridData(selectedCycle);
         });
+    }
+
+    // Setup other event listeners after initial load
+    setTimeout(() => setupEventListeners(), 100);
 
     function sortPlayersForProgress(players) {
         // Active first, then by teams picked (descending), then name

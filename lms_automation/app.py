@@ -452,16 +452,63 @@ def picks_grid():
 @app.route('/api/picks-grid-data')
 @admin_required
 def get_picks_grid_data():
-    """Provide data for the picks grid."""
+    """Provide data for the picks grid.
+
+    Query params:
+      cycle: int - filter to a specific cycle. If omitted, defaults to current cycle.
+
+    Response includes:
+      - rounds: list of round_numbers within the selected cycle
+      - players: list with picks scoped to the selected cycle
+      - current_cycle: the cycle being displayed
+      - available_cycles: list of all cycles (for the selector)
+    """
     try:
-        rounds = Round.query.order_by(Round.round_number).all()
+        from sqlalchemy import func
+
+        # Determine available cycles
+        all_cycles = (
+            db.session.query(Round.cycle_number)
+            .filter(Round.cycle_number.isnot(None))
+            .distinct()
+            .order_by(Round.cycle_number)
+            .all()
+        )
+        available_cycles = [c[0] for c in all_cycles] or [1]
+
+        # Determine current cycle (default):
+        # - If there is an active/pending round, use its cycle
+        # - Otherwise, use max(cycle_number)
+        requested_cycle = request.args.get('cycle', type=int)
+        if requested_cycle is not None:
+            current_cycle = requested_cycle
+        else:
+            active_round = Round.query.filter(Round.status.in_(['active', 'pending'])).order_by(Round.id.desc()).first()
+            if active_round:
+                current_cycle = active_round.cycle_number or 1
+            else:
+                current_cycle = max(available_cycles)
+
+        # Query rounds only in the selected cycle, ordered by round_number
+        rounds = (
+            Round.query
+            .filter(Round.cycle_number == current_cycle)
+            .order_by(Round.round_number)
+            .all()
+        )
+
+        # Build round_id set for efficient filtering
+        round_ids = {r.id for r in rounds}
+
         players = Player.query.order_by(Player.name).all()
-        picks = Pick.query.all()
+
+        # Fetch only picks whose round is in the selected cycle
+        picks = Pick.query.filter(Pick.round_id.in_(round_ids)).all()
 
         # Create mappings
         picks_map = {}
         results_map = {}
-        
+
         for pick in picks:
             key = (pick.player_id, pick.round_id)
             picks_map[key] = pick.team_picked
@@ -474,7 +521,7 @@ def get_picks_grid_data():
         players_data = []
         for player in players:
             player_picks = {}
-            
+
             for r in rounds:
                 key = (player.id, r.id)
                 if key in picks_map:
@@ -487,7 +534,7 @@ def get_picks_grid_data():
                     }
                 else:
                     player_picks[r.round_number] = None
-            
+
             players_data.append({
                 'name': player.name,
                 'status': player.status,
@@ -497,7 +544,9 @@ def get_picks_grid_data():
         return jsonify({
             'success': True,
             'rounds': [r.round_number for r in rounds],
-            'players': players_data
+            'players': players_data,
+            'current_cycle': current_cycle,
+            'available_cycles': available_cycles
         })
 
     except Exception as e:
@@ -3797,9 +3846,22 @@ def make_pick(token):
     if not fixtures:
         print(f"ERROR: No fixtures found for round {round_obj.id}. This round may have been created without fixtures.")
     
-    # Get player's previous picks to prevent reusing teams
-    previous_picks = Pick.query.filter_by(player_id=player.id).all()
+    # Get player's previous picks to prevent reusing teams - SCOPED BY CYCLE
+    # Determine the cycle from the token's round
+    token_cycle = round_obj.cycle_number or 1
+
+    # Get only picks from rounds in the same cycle
+    previous_picks = (
+        Pick.query
+        .join(Round, Pick.round_id == Round.id)
+        .filter(Pick.player_id == player.id)
+        .filter(Round.cycle_number == token_cycle)
+        .all()
+    )
     used_teams = [pick.team_picked for pick in previous_picks]
+
+    # Log for debugging/acceptance testing
+    print(f"Used teams computed: player_id={player.id} cycle={token_cycle} used_count={len(used_teams)}")
     
     # Create a normalized team matching function to handle name variations
     def normalize_team_name(team_name):
