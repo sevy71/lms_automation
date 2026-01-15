@@ -1168,6 +1168,385 @@ def manual_process_results():
         }), 500
 
 
+@app.route('/api/admin/start-new-game', methods=['POST'])
+@admin_required
+def start_new_game():
+    """
+    Admin endpoint to start a new game (cycle) after a WINNER is declared.
+
+    This endpoint:
+    1. Verifies the last completed round had a winner
+    2. Resets all players to 'active' status
+    3. Creates a new cycle (cycle_number + 1) with round 1
+    4. Loads fixtures for the next PL matchday
+    5. Generates tokens and announces the round
+
+    Request body (optional):
+        - pl_matchday: Specific matchday to use (otherwise auto-selects next)
+
+    Returns JSON with:
+        - success: bool
+        - cycle_number: The new cycle number
+        - round_id: The new round ID
+        - fixtures_added: Number of fixtures loaded
+        - announcement: Result of the announcement
+        - error: Error message (if success=False)
+    """
+    import logging
+    logger = logging.getLogger(__name__)
+
+    logger.info("=" * 60)
+    logger.info("=== START NEW GAME ENDPOINT ===")
+    logger.info("=" * 60)
+
+    try:
+        data = request.get_json() or {}
+        requested_matchday = data.get('pl_matchday')
+
+        # Find the last completed round
+        last_completed_round = Round.query.filter_by(status='completed').order_by(Round.id.desc()).first()
+
+        if not last_completed_round:
+            return jsonify({
+                'success': False,
+                'error': 'No completed rounds found. Cannot start new game.'
+            }), 400
+
+        # Check if game ended with a winner
+        special_note = last_completed_round.special_note or ''
+        if 'game_winner_announced' not in special_note:
+            return jsonify({
+                'success': False,
+                'error': 'Last completed round did not have a winner. Use Process Results to complete the current game first.'
+            }), 400
+
+        # Determine next cycle number
+        current_cycle = last_completed_round.cycle_number or 1
+        next_cycle = current_cycle + 1
+
+        # Check if next cycle already exists (idempotency)
+        existing_next_round = Round.query.filter_by(
+            cycle_number=next_cycle,
+            round_number=1
+        ).first()
+
+        if existing_next_round:
+            logger.info(f"Cycle {next_cycle} Round 1 already exists (id={existing_next_round.id})")
+            return jsonify({
+                'success': True,
+                'already_existed': True,
+                'cycle_number': next_cycle,
+                'round_id': existing_next_round.id,
+                'message': f'Cycle {next_cycle} Round 1 already exists'
+            })
+
+        # Reset ALL players to status='active'
+        Player.query.update({'status': 'active'}, synchronize_session=False)
+        db.session.commit()
+        logger.info("All players reset to status='active'")
+
+        # Determine matchday
+        pl_matchday = requested_matchday
+        if not pl_matchday:
+            # Use next matchday after previous
+            if last_completed_round.pl_matchday:
+                pl_matchday = (last_completed_round.pl_matchday % 38) + 1
+            else:
+                pl_matchday = 1
+
+        logger.info(f"Creating new game: Cycle {next_cycle}, Round 1, Matchday {pl_matchday}")
+
+        # Create the round using the helper function
+        result = _auto_create_rollover_round(next_cycle, pl_matchday - 1 if pl_matchday > 1 else 38)
+
+        # Override matchday if specifically requested
+        if requested_matchday and result.get('success'):
+            # Update the round with the requested matchday (the helper uses next matchday logic)
+            new_round = Round.query.get(result.get('round_id'))
+            if new_round and new_round.pl_matchday != requested_matchday:
+                # Need to refetch fixtures for the correct matchday
+                # For simplicity, just update the matchday if it's different
+                logger.info(f"Note: Used matchday {new_round.pl_matchday} (requested was {requested_matchday})")
+
+        if result.get('success'):
+            logger.info(f"New game started: Cycle {next_cycle} Round 1 (id={result.get('round_id')})")
+            return jsonify({
+                'success': True,
+                'cycle_number': next_cycle,
+                'round_number': 1,
+                'round_id': result.get('round_id'),
+                'pl_matchday': result.get('pl_matchday', pl_matchday),
+                'fixtures_added': result.get('fixtures_added', 0),
+                'announcement': result.get('announcement', {}),
+                'message': f'Started Cycle {next_cycle} Round 1!'
+            })
+        else:
+            return jsonify({
+                'success': False,
+                'error': result.get('error', 'Failed to create new round')
+            }), 500
+
+    except Exception as e:
+        import traceback
+        logger.error(f"Error in start_new_game: {e}")
+        logger.error(traceback.format_exc())
+        db.session.rollback()
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@app.route('/api/admin/game-state')
+@admin_required
+def get_game_state():
+    """
+    Get the current game state for dashboard display.
+
+    Returns JSON with:
+        - current_cycle: Current cycle number
+        - current_round: Current active/pending round number (or null)
+        - active_players: Count of active players
+        - eliminated_players: Count of eliminated players
+        - winner_players: Count of winners
+        - last_completed_round: Info about last completed round
+        - last_round_outcome: 'winner', 'rollover', or 'continue'
+        - game_ended: True if game ended with a winner
+        - next_round_defaults: Suggested defaults for creating next round
+    """
+    try:
+        # Get current round
+        current_round = Round.query.filter_by(status='active').first()
+        if not current_round:
+            current_round = Round.query.filter_by(status='pending').order_by(Round.id.desc()).first()
+
+        # Get player counts
+        active_count = Player.query.filter_by(status='active').count()
+        eliminated_count = Player.query.filter_by(status='eliminated').count()
+        winner_count = Player.query.filter_by(status='winner').count()
+
+        # Determine current cycle
+        current_cycle = 1
+        if current_round:
+            current_cycle = current_round.cycle_number or 1
+        else:
+            latest_round = Round.query.order_by(Round.id.desc()).first()
+            if latest_round:
+                current_cycle = latest_round.cycle_number or 1
+
+        # Get last completed round and outcome
+        last_completed_round = Round.query.filter_by(status='completed').order_by(Round.id.desc()).first()
+        last_round_outcome = None
+        game_ended = False
+
+        if last_completed_round:
+            special_note = last_completed_round.special_note or ''
+            if 'game_winner_announced' in special_note:
+                last_round_outcome = 'winner'
+                game_ended = True
+            elif 'rollover_processed' in special_note:
+                last_round_outcome = 'rollover'
+            else:
+                last_round_outcome = 'continue'
+
+        # Compute next round defaults
+        next_round_defaults = {}
+        if game_ended:
+            # After winner: suggest next cycle round 1
+            next_round_defaults = {
+                'cycle_number': (last_completed_round.cycle_number or 1) + 1,
+                'round_number': 1,
+                'pl_matchday': ((last_completed_round.pl_matchday or 0) % 38) + 1,
+                'suggestion': 'start_new_game'
+            }
+        elif last_round_outcome == 'rollover':
+            # After rollover: round was auto-created, suggest round 2
+            next_round_defaults = {
+                'cycle_number': current_cycle,
+                'round_number': 2,
+                'pl_matchday': ((current_round.pl_matchday if current_round else 0) % 38) + 1,
+                'suggestion': 'continue'
+            }
+        elif current_round:
+            # Normal continuation: next round in same cycle
+            next_round_defaults = {
+                'cycle_number': current_cycle,
+                'round_number': current_round.round_number + 1,
+                'pl_matchday': ((current_round.pl_matchday or 0) % 38) + 1,
+                'suggestion': 'continue'
+            }
+        else:
+            # No current round: suggest starting fresh
+            next_round_defaults = {
+                'cycle_number': current_cycle,
+                'round_number': 1,
+                'pl_matchday': 1,
+                'suggestion': 'create_first_round'
+            }
+
+        return jsonify({
+            'success': True,
+            'current_cycle': current_cycle,
+            'current_round': {
+                'id': current_round.id,
+                'round_number': current_round.round_number,
+                'status': current_round.status,
+                'pl_matchday': current_round.pl_matchday
+            } if current_round else None,
+            'active_players': active_count,
+            'eliminated_players': eliminated_count,
+            'winner_players': winner_count,
+            'last_completed_round': {
+                'id': last_completed_round.id,
+                'round_number': last_completed_round.round_number,
+                'cycle_number': last_completed_round.cycle_number,
+                'special_note': last_completed_round.special_note
+            } if last_completed_round else None,
+            'last_round_outcome': last_round_outcome,
+            'game_ended': game_ended,
+            'next_round_defaults': next_round_defaults
+        })
+
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+def _auto_create_rollover_round(next_cycle: int, previous_matchday: int = None) -> dict:
+    """
+    Auto-create a new round for rollover (Cycle N, Round 1).
+
+    This is called after a ROLLOVER when all players are eliminated.
+    Creates a new cycle's round 1, loads fixtures, generates tokens, and announces.
+
+    Args:
+        next_cycle: The new cycle number to create
+        previous_matchday: The PL matchday from the previous round (used to determine next matchday)
+
+    Returns:
+        dict: {success: bool, round_id: int, fixtures_added: int, announcement: dict, error: str}
+    """
+    import logging
+    logger = logging.getLogger(__name__)
+
+    logger.info(f"_auto_create_rollover_round: Creating Cycle {next_cycle} Round 1")
+
+    try:
+        # Check if round already exists (idempotency)
+        existing_round = Round.query.filter_by(
+            cycle_number=next_cycle,
+            round_number=1
+        ).first()
+
+        if existing_round:
+            logger.info(f"Round 1 already exists for Cycle {next_cycle} (id={existing_round.id}), skipping creation")
+            return {
+                'success': True,
+                'round_id': existing_round.id,
+                'fixtures_added': 0,
+                'already_existed': True
+            }
+
+        # Determine next matchday to use
+        # Strategy: Use the next matchday after previous_matchday, or find the next upcoming matchday
+        pl_matchday = None
+
+        if previous_matchday:
+            # Simple approach: use next matchday (wrap around if needed)
+            pl_matchday = (previous_matchday % 38) + 1
+        else:
+            # Fallback: find the last used matchday and increment
+            last_round = Round.query.order_by(Round.id.desc()).first()
+            if last_round and last_round.pl_matchday:
+                pl_matchday = (last_round.pl_matchday % 38) + 1
+            else:
+                pl_matchday = 1  # Start from matchday 1
+
+        logger.info(f"Using PL Matchday {pl_matchday} for rollover round")
+
+        # Create the new round
+        new_round = Round(
+            round_number=1,
+            cycle_number=next_cycle,
+            pl_matchday=pl_matchday,
+            status='active'  # Active immediately for rollover
+        )
+        db.session.add(new_round)
+        db.session.flush()  # Get the ID
+
+        # Fetch and populate fixtures
+        from lms_automation.football_api import FootballDataAPI
+        api = FootballDataAPI()
+        fixtures_data = api.get_premier_league_fixtures(pl_matchday)
+        formatted_fixtures = api.format_fixtures_for_db(fixtures_data, pl_matchday)
+
+        fixtures_added = 0
+        earliest_kickoff = None
+
+        if formatted_fixtures:
+            for fixture_data in formatted_fixtures:
+                fixture = Fixture(
+                    round_id=new_round.id,
+                    event_id=fixture_data['event_id'],
+                    home_team=fixture_data['home_team'],
+                    away_team=fixture_data['away_team'],
+                    date=fixture_data['date'],
+                    time=fixture_data['time'],
+                    home_score=fixture_data['home_score'],
+                    away_score=fixture_data['away_score'],
+                    status=fixture_data['status']
+                )
+                db.session.add(fixture)
+                fixtures_added += 1
+
+                # Track earliest kickoff
+                try:
+                    if fixture_data['date'] and fixture_data['time']:
+                        dt = datetime.combine(fixture_data['date'], fixture_data['time'])
+                        if earliest_kickoff is None or dt < earliest_kickoff:
+                            earliest_kickoff = dt
+                except Exception:
+                    pass
+
+            if earliest_kickoff:
+                new_round.first_kickoff_at = earliest_kickoff
+
+        db.session.commit()
+        logger.info(f"Created round id={new_round.id} with {fixtures_added} fixtures")
+
+        # Announce the round immediately (generate tokens + send pick links)
+        announcement_result = {}
+        try:
+            from lms_automation.scheduler import scheduler
+            announcement_result = scheduler.announce_round_now(new_round.id)
+            logger.info(f"Rollover round announced: {announcement_result}")
+        except Exception as e:
+            logger.error(f"Failed to announce rollover round: {e}")
+            announcement_result = {'error': str(e)}
+
+        return {
+            'success': True,
+            'round_id': new_round.id,
+            'cycle_number': next_cycle,
+            'round_number': 1,
+            'pl_matchday': pl_matchday,
+            'fixtures_added': fixtures_added,
+            'announcement': announcement_result
+        }
+
+    except Exception as e:
+        logger.error(f"Error creating rollover round: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        db.session.rollback()
+        return {
+            'success': False,
+            'error': str(e)
+        }
+
+
 def _evaluate_game_state_after_round_standalone(completed_round) -> str:
     """
     Standalone version of centralized game state evaluation for use in app.py.
@@ -1368,8 +1747,14 @@ def _evaluate_game_state_after_round_standalone(completed_round) -> str:
 
         db.session.commit()
 
-        # Note: In manual mode, admin creates next round manually
-        logger.info(f"Rollover complete. Admin should create next round for Cycle {next_cycle}.")
+        # AUTO-CREATE next cycle round 1 (even in MANUAL_MODE - this is a rollover)
+        logger.info(f"Auto-creating Cycle {next_cycle} Round 1...")
+        rollover_result = _auto_create_rollover_round(next_cycle, completed_round.pl_matchday)
+        if rollover_result.get('success'):
+            logger.info(f"Rollover round created: id={rollover_result.get('round_id')}, fixtures={rollover_result.get('fixtures_added')}")
+        else:
+            logger.error(f"Failed to auto-create rollover round: {rollover_result.get('error')}")
+
         logger.info("=== GAME STATE EVALUATION COMPLETE (rollover) ===")
         return 'rollover'
 

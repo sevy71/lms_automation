@@ -67,9 +67,15 @@
                     {% set winners = players|selectattr('status', 'equalto', 'winner')|list %}
                     {% if winners|length > 0 %}
                         <div class="alert alert-success mt-3" role="alert">
-                            🏆 <strong>Winner detected:</strong>
-                            {{ winners|map(attribute='name')|list|join(', ') }}.
-                            You can now reset the game to start a new cycle.
+                            <div class="d-flex justify-content-between align-items-center flex-wrap">
+                                <div class="mb-2 mb-md-0">
+                                    🏆 <strong>Winner declared:</strong>
+                                    {{ winners|map(attribute='name')|list|join(', ') }}
+                                </div>
+                                <button class="btn btn-success btn-sm" id="startNewGameBtn">
+                                    <i class="fas fa-play me-1"></i>Start New Game
+                                </button>
+                            </div>
                         </div>
                     {% endif %}
 
@@ -82,13 +88,26 @@
                         </a>
                     </div>
                 {% else %}
-                    <div class="text-center py-4">
-                        <i class="fas fa-exclamation-triangle text-warning fa-3x mb-3"></i>
-                        <h4 class="text-muted">No Active Round</h4>
-                        <p class="mb-3">Create a new round to get started</p>
-                        <button class="btn btn-primary btn-lg" data-bs-toggle="modal" data-bs-target="#createRoundModal">
-                            <i class="fas fa-plus me-2"></i>Create New Round
-                        </button>
+                    <!-- No Active Round - show different options based on game state -->
+                    <div class="text-center py-4" id="noActiveRoundSection">
+                        {% if game_state_info.last_round_outcome == 'winner' %}
+                            <i class="fas fa-trophy text-warning fa-3x mb-3"></i>
+                            <h4 class="text-warning">Game Ended - Winner Declared!</h4>
+                            <p class="mb-3">Start a new game to begin the next cycle</p>
+                            <button class="btn btn-success btn-lg" id="startNewGameBtnAlt">
+                                <i class="fas fa-play me-2"></i>Start New Game
+                            </button>
+                            <button class="btn btn-outline-secondary btn-lg ms-2" data-bs-toggle="modal" data-bs-target="#createRoundModal">
+                                <i class="fas fa-plus me-2"></i>Manual Create
+                            </button>
+                        {% else %}
+                            <i class="fas fa-exclamation-triangle text-warning fa-3x mb-3"></i>
+                            <h4 class="text-muted">No Active Round</h4>
+                            <p class="mb-3">Create a new round to get started</p>
+                            <button class="btn btn-primary btn-lg" data-bs-toggle="modal" data-bs-target="#createRoundModal">
+                                <i class="fas fa-plus me-2"></i>Create New Round
+                            </button>
+                        {% endif %}
                     </div>
                 {% endif %}
             </div>
@@ -386,6 +405,48 @@ document.addEventListener('DOMContentLoaded', function() {
         alert('Error applying auto-picks');
       }
     });
+  }
+
+  // Start New Game button handlers (shown after winner is declared)
+  async function handleStartNewGame() {
+    if (!confirm('Start a new game? This will:\n\n• Reset all players to active\n• Create a new cycle with Round 1\n• Send pick announcements to all players')) return;
+
+    try {
+      const resp = await fetch('/api/admin/start-new-game', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' }
+      });
+      const data = await resp.json();
+
+      if (data.success) {
+        let msg = `New game started!\n\nCycle ${data.cycle_number} Round 1 created.`;
+        if (data.fixtures_added) {
+          msg += `\n${data.fixtures_added} fixtures loaded.`;
+        }
+        if (data.announcement && data.announcement.sent) {
+          msg += `\n${data.announcement.sent} pick announcements sent.`;
+        }
+        if (data.already_existed) {
+          msg = `Cycle ${data.cycle_number} Round 1 already exists.\nPage will refresh.`;
+        }
+        alert(msg);
+        location.reload();
+      } else {
+        alert('Error starting new game: ' + (data.error || 'Unknown error'));
+      }
+    } catch (e) {
+      alert('Error starting new game: ' + e.message);
+    }
+  }
+
+  const startNewGameBtn = document.getElementById('startNewGameBtn');
+  if (startNewGameBtn) {
+    startNewGameBtn.addEventListener('click', handleStartNewGame);
+  }
+
+  const startNewGameBtnAlt = document.getElementById('startNewGameBtnAlt');
+  if (startNewGameBtnAlt) {
+    startNewGameBtnAlt.addEventListener('click', handleStartNewGame);
   }
 
   // Preview auto-picks (dry-run; no changes)
@@ -849,6 +910,8 @@ document.addEventListener('DOMContentLoaded', function() {
             </div>
             <form id="createRoundForm">
                 <div class="modal-body">
+                    <!-- Game state info placeholder -->
+                    <div id="createRoundModalInfo"></div>
                     <div class="mb-3">
                         <label for="roundNumber" class="form-label">Game Round Number</label>
                         <input type="number" class="form-control" id="roundNumber" min="1" required>
@@ -1683,48 +1746,97 @@ document.addEventListener('DOMContentLoaded', function() {
         document.getElementById('changePasswordForm').reset();
     });
     
-    // Auto-populate next round number and load matchdays when modal opens
-    document.getElementById('createRoundModal').addEventListener('show.bs.modal', function() {
-        // Populate next round number
-        fetch('/api/rounds')
-            .then(response => response.json())
-            .then(data => {
+    // Auto-populate round defaults using game state API
+    document.getElementById('createRoundModal').addEventListener('show.bs.modal', async function() {
+        const roundNumberInput = document.getElementById('roundNumber');
+        const matchdaySelect = document.getElementById('plMatchday');
+        const modalInfoDiv = document.getElementById('createRoundModalInfo');
+
+        // First, get game state for smart defaults
+        let gameState = null;
+        try {
+            const stateResp = await fetch('/api/admin/game-state');
+            const stateData = await stateResp.json();
+            if (stateData.success) {
+                gameState = stateData;
+                console.log('Game state:', gameState);
+            }
+        } catch (e) {
+            console.error('Error fetching game state:', e);
+        }
+
+        // Set smart defaults based on game state
+        if (gameState && gameState.next_round_defaults) {
+            const defaults = gameState.next_round_defaults;
+            roundNumberInput.value = defaults.round_number || 1;
+
+            // Show info message based on game state
+            if (modalInfoDiv) {
+                if (gameState.game_ended) {
+                    modalInfoDiv.innerHTML = `
+                        <div class="alert alert-warning mb-3">
+                            <i class="fas fa-trophy me-2"></i>
+                            <strong>Game ended with a winner!</strong>
+                            Creating a round here will start Cycle ${defaults.cycle_number}.
+                            <br><small>Or use the "Start New Game" button on the dashboard for a guided setup.</small>
+                        </div>
+                    `;
+                } else if (defaults.suggestion === 'continue') {
+                    modalInfoDiv.innerHTML = `
+                        <div class="alert alert-info mb-3">
+                            <i class="fas fa-info-circle me-2"></i>
+                            Continuing Cycle ${gameState.current_cycle} - suggesting Round ${defaults.round_number}
+                        </div>
+                    `;
+                } else {
+                    modalInfoDiv.innerHTML = '';
+                }
+            }
+        } else {
+            // Fallback: calculate from existing rounds
+            try {
+                const roundsResp = await fetch('/api/rounds');
+                const rounds = await roundsResp.json();
                 let maxRound = 0;
-                data.forEach(round => {
+                (rounds || []).forEach(round => {
                     if (round.round_number > maxRound) {
                         maxRound = round.round_number;
                     }
                 });
-                document.getElementById('roundNumber').value = maxRound + 1;
-            })
-            .catch(error => {
-                console.error('Error fetching rounds:', error);
-                document.getElementById('roundNumber').value = 1;
-            });
-        
+                roundNumberInput.value = maxRound + 1;
+            } catch (e) {
+                console.error('Error fetching rounds:', e);
+                roundNumberInput.value = 1;
+            }
+            if (modalInfoDiv) modalInfoDiv.innerHTML = '';
+        }
+
         // Load available matchdays
-        const matchdaySelect = document.getElementById('plMatchday');
         matchdaySelect.innerHTML = '<option value="">Loading matchdays...</option>';
-        
-        fetch('/api/matchdays')
-            .then(response => response.json())
-            .then(data => {
-                if (data.success) {
-                    matchdaySelect.innerHTML = '<option value="">Select a matchday...</option>';
-                    data.matchdays.forEach(matchday => {
-                        const option = document.createElement('option');
-                        option.value = matchday.matchday;
-                        option.textContent = `Matchday ${matchday.matchday} (${matchday.fixture_count} fixtures)`;
-                        matchdaySelect.appendChild(option);
-                    });
-                } else {
-                    matchdaySelect.innerHTML = '<option value="">Error loading matchdays</option>';
+
+        try {
+            const matchdaysResp = await fetch('/api/matchdays');
+            const matchdaysData = await matchdaysResp.json();
+            if (matchdaysData.success) {
+                matchdaySelect.innerHTML = '<option value="">Select a matchday...</option>';
+                matchdaysData.matchdays.forEach(matchday => {
+                    const option = document.createElement('option');
+                    option.value = matchday.matchday;
+                    option.textContent = `Matchday ${matchday.matchday} (${matchday.fixture_count} fixtures)`;
+                    matchdaySelect.appendChild(option);
+                });
+
+                // Pre-select the suggested matchday if available
+                if (gameState && gameState.next_round_defaults && gameState.next_round_defaults.pl_matchday) {
+                    matchdaySelect.value = gameState.next_round_defaults.pl_matchday;
                 }
-            })
-            .catch(error => {
-                console.error('Error fetching matchdays:', error);
+            } else {
                 matchdaySelect.innerHTML = '<option value="">Error loading matchdays</option>';
-            });
+            }
+        } catch (e) {
+            console.error('Error fetching matchdays:', e);
+            matchdaySelect.innerHTML = '<option value="">Error loading matchdays</option>';
+        }
     });
     
     // Handle matchday selection change
