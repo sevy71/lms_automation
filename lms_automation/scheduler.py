@@ -840,8 +840,8 @@ class LMSScheduler:
             winner.status = 'winner'
             logger.info(f"WINNER DETECTED: {winner.name} has won the game!")
 
-            # Send winner notification
-            self._send_winner_notification(winner)
+            # Send winner notification (with idempotency via completed_round)
+            self._send_winner_notification(winner, completed_round)
 
             # Optionally auto-reset for new game
             if os.environ.get('AUTO_RESET_ON_WIN', 'false').lower() == 'true':
@@ -1462,13 +1462,13 @@ class LMSScheduler:
                         )
                         continue
 
-                    # GUARD: Require tokens_generated before announcements
+                    # ENSURE: Generate tokens inline if marker is missing (deterministic boot behavior)
                     if not self._has_marker(round_obj, 'tokens_generated'):
-                        logger.warning(
-                            f"Round {round_obj.round_number}: Missing 'tokens_generated' marker, "
-                            f"waiting for token generation job"
+                        logger.info(
+                            f"Announcements: tokens missing → generating now for Round {round_obj.round_number}"
                         )
-                        continue
+                        self._ensure_tokens_for_round(round_obj)
+                        db.session.flush()  # Ensure tokens are available for queries below
 
                     # Use eligibility check to respect per-round eliminations
                     eligible_players = self._get_eligible_players_for_round(round_obj)
@@ -1605,13 +1605,16 @@ class LMSScheduler:
                             f"(sent={sent}, failed={failed}, skipped_no_telegram={skipped_missing_telegram})"
                         )
 
-                    # Structured logging summary with all counts
+                    # Structured logging summary with requested format
                     logger.info(
-                        f"Round {round_obj.round_number} announcement summary: "
-                        f"eligible={eligible_total}, sent={sent}, failed={failed}, "
-                        f"skipped_not_active={skipped_not_active}, already_picked={already_picked_skipped}, "
-                        f"no_token={skipped_no_token}, already_announced={skipped_already_announced}, "
-                        f"no_telegram={skipped_missing_telegram}"
+                        f"Announcements: sent={sent} skipped_missing_telegram={skipped_missing_telegram} "
+                        f"skipped_already_announced={skipped_already_announced} errors={failed}"
+                    )
+                    # Detailed breakdown for debugging
+                    logger.debug(
+                        f"Round {round_obj.round_number} full breakdown: "
+                        f"eligible={eligible_total}, skipped_not_active={skipped_not_active}, "
+                        f"already_picked={already_picked_skipped}, no_token={skipped_no_token}"
                     )
 
                 db.session.commit()
@@ -2328,34 +2331,95 @@ class LMSScheduler:
             logger.error(f"Error sending Telegram message: {e}")
             return False
 
-    def _send_winner_notification(self, winner):
+    def _send_winner_notification(self, winner, completed_round):
         """
-        LEAN & CLEAN: Send winner announcement to ALL players (active + eliminated).
-        Short message + link.
-        """
-        picks_grid_url = self._get_picks_grid_url()
-        message = f"🏆 WINNER!\n\n{winner.name} has won the Last Man Standing competition! 🎉"
+        Game-over winner notification: sends winner DM + broadcast to all players.
 
-        # Send to ALL players (regardless of status)
-        players = Player.query.all()
-        sent_count = 0
-        skipped_missing = 0
-        for player in players:
-            if hasattr(player, 'telegram_id') and player.telegram_id:
+        ONLY triggers on true game over (exactly 1 active player OR 1 player with status='winner').
+        Uses 'game_winner_announced' marker in rounds.special_note for idempotency.
+
+        Sends:
+        1) Winner DM to the winner (if they have telegram_id)
+        2) Broadcast to ALL players who have telegram_id (including eliminated)
+
+        Logs: winner_sent=0/1 broadcast_sent=N skipped_missing_telegram=M errors=E winner=<name>(id=<id>)
+        """
+        # Idempotency check: don't resend if already announced
+        idempotency_marker = 'game_winner_announced'
+        if completed_round.special_note and idempotency_marker in completed_round.special_note:
+            logger.info(
+                f"Winner broadcast: SKIPPED (already announced) winner={winner.name}(id={winner.id})"
+            )
+            return
+
+        picks_grid_url = self._get_picks_grid_url()
+
+        # Message texts
+        winner_dm_text = (
+            f"🏆 You've won the competition!\n\n"
+            f"Congratulations! You are the Last Man Standing! 🎉"
+        )
+        broadcast_text = (
+            f"🏁 Competition over — Winner is {winner.name}.\n\n"
+            f"Thanks for playing! 🎉"
+        )
+
+        # Counters
+        winner_sent = 0
+        broadcast_sent = 0
+        skipped_missing_telegram = 0
+        errors = 0
+
+        # 1) Send winner DM to the winner
+        if winner.telegram_id:
+            try:
                 if self._send_telegram_message(
-                    player.telegram_id,
-                    message,
+                    winner.telegram_id,
+                    winner_dm_text,
                     button_url=picks_grid_url,
                     button_text="📊 View Final Grid"
                 ):
-                    sent_count += 1
+                    winner_sent = 1
+                else:
+                    errors += 1
+            except Exception as e:
+                logger.error(f"Error sending winner DM to {winner.name}: {e}")
+                errors += 1
+        else:
+            skipped_missing_telegram += 1
+
+        # 2) Send broadcast to ALL players (including eliminated, even the winner gets both)
+        players = Player.query.all()
+        for player in players:
+            if player.telegram_id:
+                try:
+                    if self._send_telegram_message(
+                        player.telegram_id,
+                        broadcast_text,
+                        button_url=picks_grid_url,
+                        button_text="📊 View Final Grid"
+                    ):
+                        broadcast_sent += 1
+                    else:
+                        errors += 1
+                except Exception as e:
+                    logger.error(f"Error sending broadcast to {player.name}: {e}")
+                    errors += 1
             else:
-                skipped_missing += 1
+                skipped_missing_telegram += 1
+
+        # Mark as announced (idempotency)
+        if completed_round.special_note:
+            completed_round.special_note += f"; {idempotency_marker}"
+        else:
+            completed_round.special_note = idempotency_marker
+        db.session.commit()
+
+        # Log summary (single clear line)
         logger.info(
-            "Winner announcement: sent=%s, skipped_no_telegram=%s, total_players=%s",
-            sent_count,
-            skipped_missing,
-            len(players)
+            f"Winner broadcast: winner_sent={winner_sent} broadcast_sent={broadcast_sent} "
+            f"skipped_missing_telegram={skipped_missing_telegram} errors={errors} "
+            f"winner={winner.name}(id={winner.id})"
         )
 
     def _send_rollover_notification(self, new_cycle):
@@ -2462,6 +2526,56 @@ class LMSScheduler:
         else:
             round_obj.special_note = marker
         return True
+
+    def _ensure_tokens_for_round(self, round_obj) -> dict:
+        """
+        Ensure all eligible players have tokens for a round (idempotent).
+
+        Called inline from send_new_round_announcements when tokens_generated
+        marker is missing, ensuring tokens exist before sending pick links.
+
+        Returns:
+            dict with 'created' and 'total' counts
+        """
+        eligible_players = self._get_eligible_players_for_round(round_obj)
+        eligible_count = len(eligible_players)
+        tokens_created = 0
+
+        if eligible_count == 0:
+            logger.warning(
+                f"Round {round_obj.round_number}: No eligible players for token generation"
+            )
+            return {'created': 0, 'total': 0}
+
+        for player in eligible_players:
+            # Check if token already exists (idempotent)
+            existing_token = PickToken.query.filter_by(
+                player_id=player.id,
+                round_id=round_obj.id
+            ).first()
+
+            if not existing_token:
+                token = PickToken.create_for_player_round(
+                    player.id, round_obj.id, expires_hours=168
+                )
+                db.session.add(token)
+                logger.debug(
+                    f"  Created token for player '{player.name}' (id={player.id})"
+                )
+                tokens_created += 1
+
+        # Count final tokens
+        final_token_count = PickToken.query.filter_by(round_id=round_obj.id).count()
+
+        # Set marker if all tokens exist
+        if final_token_count >= eligible_count and not self._has_marker(round_obj, 'tokens_generated'):
+            self._add_marker(round_obj, 'tokens_generated')
+
+        logger.info(
+            f"Tokens: created {tokens_created}/{eligible_count}; marker set"
+        )
+
+        return {'created': tokens_created, 'total': final_token_count}
 
     def _get_phase_status(self, round_obj) -> dict:
         """Get current phase status for a round (for logging)."""
