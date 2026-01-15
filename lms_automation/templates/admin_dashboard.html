@@ -295,9 +295,60 @@
 
 <script>
 document.addEventListener('DOMContentLoaded', function() {
-  // Only attempt fetch if the picksStatus container exists
+  // ===== START NEW GAME BUTTON HANDLERS =====
+  // These must be registered FIRST, before any early returns
+  async function handleStartNewGame() {
+    if (!confirm('Start a new game? This will:\n\n• Reset all players to active\n• Create a new cycle with Round 1\n• Send pick announcements to all players')) return;
+
+    try {
+      console.log('[Start New Game] Calling /api/admin/start-new-game...');
+      const resp = await fetch('/api/admin/start-new-game', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' }
+      });
+      const data = await resp.json();
+      console.log('[Start New Game] Response:', data);
+
+      if (data.success) {
+        let msg = `New game started!\n\nCycle ${data.cycle_number} Round 1 created.`;
+        if (data.fixtures_added) {
+          msg += `\n${data.fixtures_added} fixtures loaded.`;
+        }
+        if (data.announcement && data.announcement.sent) {
+          msg += `\n${data.announcement.sent} pick announcements sent.`;
+        }
+        if (data.already_existed) {
+          msg = `Cycle ${data.cycle_number} Round 1 already exists.\nPage will refresh.`;
+        }
+        alert(msg);
+        location.reload();
+      } else {
+        alert('Error starting new game: ' + (data.error || 'Unknown error'));
+      }
+    } catch (e) {
+      console.error('[Start New Game] Error:', e);
+      alert('Error starting new game: ' + e.message);
+    }
+  }
+
+  const startNewGameBtn = document.getElementById('startNewGameBtn');
+  if (startNewGameBtn) {
+    console.log('[Start New Game] Registering handler for #startNewGameBtn');
+    startNewGameBtn.addEventListener('click', handleStartNewGame);
+  }
+
+  const startNewGameBtnAlt = document.getElementById('startNewGameBtnAlt');
+  if (startNewGameBtnAlt) {
+    console.log('[Start New Game] Registering handler for #startNewGameBtnAlt');
+    startNewGameBtnAlt.addEventListener('click', handleStartNewGame);
+  }
+
+  // ===== PICKS STATUS (only if container exists) =====
   const container = document.getElementById('picksStatus');
-  if (!container) return;
+  if (!container) {
+    console.log('[Picks Status] No #picksStatus container, skipping picks status handlers');
+    return;
+  }
 
   async function loadPicksStatus() {
     try {
@@ -405,48 +456,6 @@ document.addEventListener('DOMContentLoaded', function() {
         alert('Error applying auto-picks');
       }
     });
-  }
-
-  // Start New Game button handlers (shown after winner is declared)
-  async function handleStartNewGame() {
-    if (!confirm('Start a new game? This will:\n\n• Reset all players to active\n• Create a new cycle with Round 1\n• Send pick announcements to all players')) return;
-
-    try {
-      const resp = await fetch('/api/admin/start-new-game', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' }
-      });
-      const data = await resp.json();
-
-      if (data.success) {
-        let msg = `New game started!\n\nCycle ${data.cycle_number} Round 1 created.`;
-        if (data.fixtures_added) {
-          msg += `\n${data.fixtures_added} fixtures loaded.`;
-        }
-        if (data.announcement && data.announcement.sent) {
-          msg += `\n${data.announcement.sent} pick announcements sent.`;
-        }
-        if (data.already_existed) {
-          msg = `Cycle ${data.cycle_number} Round 1 already exists.\nPage will refresh.`;
-        }
-        alert(msg);
-        location.reload();
-      } else {
-        alert('Error starting new game: ' + (data.error || 'Unknown error'));
-      }
-    } catch (e) {
-      alert('Error starting new game: ' + e.message);
-    }
-  }
-
-  const startNewGameBtn = document.getElementById('startNewGameBtn');
-  if (startNewGameBtn) {
-    startNewGameBtn.addEventListener('click', handleStartNewGame);
-  }
-
-  const startNewGameBtnAlt = document.getElementById('startNewGameBtnAlt');
-  if (startNewGameBtnAlt) {
-    startNewGameBtnAlt.addEventListener('click', handleStartNewGame);
   }
 
   // Preview auto-picks (dry-run; no changes)
@@ -912,6 +921,8 @@ document.addEventListener('DOMContentLoaded', function() {
                 <div class="modal-body">
                     <!-- Game state info placeholder -->
                     <div id="createRoundModalInfo"></div>
+                    <!-- Hidden cycle_number field - set automatically from game state -->
+                    <input type="hidden" id="cycleNumber" value="1">
                     <div class="mb-3">
                         <label for="roundNumber" class="form-label">Game Round Number</label>
                         <input type="number" class="form-control" id="roundNumber" min="1" required>
@@ -1749,6 +1760,7 @@ document.addEventListener('DOMContentLoaded', function() {
     // Auto-populate round defaults using game state API
     document.getElementById('createRoundModal').addEventListener('show.bs.modal', async function() {
         const roundNumberInput = document.getElementById('roundNumber');
+        const cycleNumberInput = document.getElementById('cycleNumber');
         const matchdaySelect = document.getElementById('plMatchday');
         const modalInfoDiv = document.getElementById('createRoundModalInfo');
 
@@ -1759,16 +1771,18 @@ document.addEventListener('DOMContentLoaded', function() {
             const stateData = await stateResp.json();
             if (stateData.success) {
                 gameState = stateData;
-                console.log('Game state:', gameState);
+                console.log('[Create Round Modal] Game state:', gameState);
             }
         } catch (e) {
-            console.error('Error fetching game state:', e);
+            console.error('[Create Round Modal] Error fetching game state:', e);
         }
 
         // Set smart defaults based on game state
         if (gameState && gameState.next_round_defaults) {
             const defaults = gameState.next_round_defaults;
             roundNumberInput.value = defaults.round_number || 1;
+            cycleNumberInput.value = defaults.cycle_number || 1;
+            console.log('[Create Round Modal] Setting defaults: cycle=' + cycleNumberInput.value + ', round=' + roundNumberInput.value);
 
             // Show info message based on game state
             if (modalInfoDiv) {
@@ -1777,7 +1791,7 @@ document.addEventListener('DOMContentLoaded', function() {
                         <div class="alert alert-warning mb-3">
                             <i class="fas fa-trophy me-2"></i>
                             <strong>Game ended with a winner!</strong>
-                            Creating a round here will start Cycle ${defaults.cycle_number}.
+                            Creating a round here will start <strong>Cycle ${defaults.cycle_number}, Round 1</strong>.
                             <br><small>Or use the "Start New Game" button on the dashboard for a guided setup.</small>
                         </div>
                     `;
@@ -1785,7 +1799,7 @@ document.addEventListener('DOMContentLoaded', function() {
                     modalInfoDiv.innerHTML = `
                         <div class="alert alert-info mb-3">
                             <i class="fas fa-info-circle me-2"></i>
-                            Continuing Cycle ${gameState.current_cycle} - suggesting Round ${defaults.round_number}
+                            Continuing <strong>Cycle ${defaults.cycle_number}</strong> - suggesting Round ${defaults.round_number}
                         </div>
                     `;
                 } else {
@@ -1798,15 +1812,22 @@ document.addEventListener('DOMContentLoaded', function() {
                 const roundsResp = await fetch('/api/rounds');
                 const rounds = await roundsResp.json();
                 let maxRound = 0;
+                let maxCycle = 1;
                 (rounds || []).forEach(round => {
                     if (round.round_number > maxRound) {
                         maxRound = round.round_number;
                     }
+                    if (round.cycle_number && round.cycle_number > maxCycle) {
+                        maxCycle = round.cycle_number;
+                    }
                 });
                 roundNumberInput.value = maxRound + 1;
+                cycleNumberInput.value = maxCycle;
+                console.log('[Create Round Modal] Fallback defaults: cycle=' + maxCycle + ', round=' + (maxRound + 1));
             } catch (e) {
-                console.error('Error fetching rounds:', e);
+                console.error('[Create Round Modal] Error fetching rounds:', e);
                 roundNumberInput.value = 1;
+                cycleNumberInput.value = 1;
             }
             if (modalInfoDiv) modalInfoDiv.innerHTML = '';
         }
@@ -1891,43 +1912,47 @@ document.addEventListener('DOMContentLoaded', function() {
     // Handle create round form submission
     document.getElementById('createRoundForm').addEventListener('submit', function(e) {
         e.preventDefault();
-        
+
         const roundNumber = document.getElementById('roundNumber').value;
+        const cycleNumber = document.getElementById('cycleNumber').value;
         const plMatchday = document.getElementById('plMatchday').value;
         const startDate = document.getElementById('startDate').value;
         const endDate = document.getElementById('endDate').value;
         const status = document.getElementById('roundStatus').value;
-        
+
         if (!roundNumber) {
             alert('Round number is required');
             return;
         }
-        
+
         if (!plMatchday) {
             alert('Premier League matchday is required');
             return;
         }
-        
+
         // Validate dates if both are provided
         if (startDate && endDate && new Date(startDate) >= new Date(endDate)) {
             alert('End date must be after start date');
             return;
         }
-        
+
         const roundData = {
             round_number: parseInt(roundNumber),
+            cycle_number: parseInt(cycleNumber) || 1,
             pl_matchday: parseInt(plMatchday),
             status: status
         };
-        
+
+        console.log('[Create Round] Submitting:', roundData);
+
         if (startDate) {
             roundData.start_date = startDate;
         }
-        
+
         if (endDate) {
             roundData.end_date = endDate;
         }
-        
+
         fetch('/api/rounds', {
             method: 'POST',
             headers: {
@@ -1937,8 +1962,9 @@ document.addEventListener('DOMContentLoaded', function() {
         })
         .then(response => response.json())
         .then(data => {
+            console.log('[Create Round] Response:', data);
             if (data.success) {
-                let message = `Round ${data.round_number} created successfully!`;
+                let message = `Cycle ${data.cycle_number} Round ${data.round_number} created successfully!`;
                 if (data.fixtures_added > 0) {
                     message += ` ${data.fixtures_added} Premier League fixtures added.`;
                 }

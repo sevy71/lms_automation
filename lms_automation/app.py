@@ -1314,6 +1314,10 @@ def get_game_state():
         - game_ended: True if game ended with a winner
         - next_round_defaults: Suggested defaults for creating next round
     """
+    import logging
+    logger = logging.getLogger(__name__)
+    logger.info("=" * 40)
+    logger.info("=== GET GAME STATE ===")
     try:
         # Get current round
         current_round = Round.query.filter_by(status='active').first()
@@ -1384,6 +1388,9 @@ def get_game_state():
                 'suggestion': 'create_first_round'
             }
 
+        logger.info(f"  game_ended={game_ended}, last_round_outcome={last_round_outcome}")
+        logger.info(f"  next_round_defaults: cycle={next_round_defaults.get('cycle_number')}, round={next_round_defaults.get('round_number')}, suggestion={next_round_defaults.get('suggestion')}")
+
         return jsonify({
             'success': True,
             'current_cycle': current_cycle,
@@ -1408,6 +1415,7 @@ def get_game_state():
         })
 
     except Exception as e:
+        logger.error(f"Error in get_game_state: {e}")
         return jsonify({
             'success': False,
             'error': str(e)
@@ -2179,6 +2187,9 @@ def handle_rounds():
     elif request.method == 'POST':
         try:
             data = request.get_json()
+            app.logger.info("=" * 40)
+            app.logger.info("=== POST /api/rounds ===")
+            app.logger.info(f"  Request data: {data}")
 
             if not data or not data.get('round_number'):
                 return jsonify({'success': False, 'error': 'Round number is required'}), 400
@@ -2195,6 +2206,11 @@ def handle_rounds():
             if cycle_number is None:
                 # Default to current/latest cycle in DB (prevents accidentally creating cycle 1 rounds)
                 cycle_number = db.session.query(db.func.max(Round.cycle_number)).scalar() or 1
+                app.logger.info(f"  cycle_number not provided, defaulting to max cycle: {cycle_number}")
+            else:
+                app.logger.info(f"  cycle_number provided: {cycle_number}")
+
+            app.logger.info(f"  Creating: Cycle {cycle_number} Round {round_number} (Matchday {pl_matchday})")
 
             # ✅ Check if round already exists *within the same cycle*
             existing_round = Round.query.filter_by(
@@ -2202,6 +2218,7 @@ def handle_rounds():
                 cycle_number=cycle_number
             ).first()
             if existing_round:
+                app.logger.warning(f"  CONFLICT: Round {round_number} already exists in cycle {cycle_number} (id={existing_round.id})")
                 return jsonify({
                     'success': False,
                     'error': f'Round {round_number} already exists in cycle {cycle_number}'
@@ -2276,16 +2293,18 @@ def handle_rounds():
 
                     db.session.commit()
 
+                    app.logger.info(f"  SUCCESS: Created Round id={new_round.id}, Cycle {new_round.cycle_number} Round {new_round.round_number}")
+
                     # Immediately announce the round (send pick links to all eligible players)
                     from lms_automation.scheduler import scheduler
-                    app.logger.info(f"API round create: announcing now for round_id={new_round.id}")
+                    app.logger.info(f"  Announcing round_id={new_round.id}")
                     announcement_result = scheduler.announce_round_now(new_round.id)
 
                     return jsonify({
                         'success': True,
                         'id': new_round.id,
                         'round_number': new_round.round_number,
-                        'cycle_number': new_round.cycle_number,  # ✅ NEW
+                        'cycle_number': new_round.cycle_number,
                         'pl_matchday': new_round.pl_matchday,
                         'fixtures_added': len(formatted_fixtures),
                         'announcement': announcement_result
