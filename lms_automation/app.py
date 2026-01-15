@@ -1622,13 +1622,19 @@ def handle_rounds():
 
                     db.session.commit()
 
+                    # Immediately announce the round (send pick links to all eligible players)
+                    from lms_automation.scheduler import scheduler
+                    app.logger.info(f"API round create: announcing now for round_id={new_round.id}")
+                    announcement_result = scheduler.announce_round_now(new_round.id)
+
                     return jsonify({
                         'success': True,
                         'id': new_round.id,
                         'round_number': new_round.round_number,
                         'cycle_number': new_round.cycle_number,  # ✅ NEW
                         'pl_matchday': new_round.pl_matchday,
-                        'fixtures_added': len(formatted_fixtures)
+                        'fixtures_added': len(formatted_fixtures),
+                        'announcement': announcement_result
                     })
                 else:
                     raise Exception("No fixtures returned from API")

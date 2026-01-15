@@ -1433,6 +1433,9 @@ class LMSScheduler:
 
         This makes the job idempotent - running it multiple times will not
         re-notify players who have already picked.
+
+        Delegates to announce_round_now() for each active round to ensure
+        consistent behavior between scheduled and immediate announcements.
         """
         with self.app.app_context():
             try:
@@ -1455,169 +1458,14 @@ class LMSScheduler:
                         f"Round {round_obj.round_number} (id={round_obj.id}): phase={phase_status}"
                     )
 
-                    # GUARD: Skip if already announced
-                    if self._has_marker(round_obj, 'announced'):
+                    # Delegate to announce_round_now for consistent logic
+                    result = self.announce_round_now(round_obj.id)
+
+                    if result.get('skipped_already_announced'):
                         logger.info(
-                            f"Round {round_obj.round_number}: Already has 'announced' marker, skipping"
-                        )
-                        continue
-
-                    # ENSURE: Generate tokens inline if marker is missing (deterministic boot behavior)
-                    if not self._has_marker(round_obj, 'tokens_generated'):
-                        logger.info(
-                            f"Announcements: tokens missing → generating now for Round {round_obj.round_number}"
-                        )
-                        self._ensure_tokens_for_round(round_obj)
-                        db.session.flush()  # Ensure tokens are available for queries below
-
-                    # Use eligibility check to respect per-round eliminations
-                    eligible_players = self._get_eligible_players_for_round(round_obj)
-
-                    # Initialize counters for structured logging
-                    eligible_total = len(eligible_players)
-                    already_picked_skipped = 0
-                    skipped_missing_telegram = 0
-                    skipped_no_token = 0
-                    skipped_already_announced = 0
-                    skipped_not_active = 0
-                    sent = 0
-                    failed = 0
-
-                    if eligible_total == 0:
-                        logger.warning(
-                            f"Round {round_obj.round_number}: No eligible players, marking as announced"
-                        )
-                        self._add_marker(round_obj, 'announced')
-                        continue
-
-                    for player in eligible_players:
-                        # LEAN & CLEAN: Only send to ACTIVE players (defensive check)
-                        if player.status != 'active':
-                            skipped_not_active += 1
-                            logger.debug(
-                                "Skipping announcement for %s (player_id=%s): status=%s (not active)",
-                                player.name, player.id, player.status
-                            )
-                            continue
-
-                        # Check if player already has a pick for this round (idempotency check)
-                        if self._player_has_pick_for_round(player.id, round_obj.id):
-                            already_picked_skipped += 1
-                            logger.debug(
-                                "Skipping announcement for %s (player_id=%s): already has pick for round_id=%s",
-                                player.name,
-                                player.id,
-                                round_obj.id
-                            )
-                            continue
-
-                        # Get pick token
-                        pick_token = PickToken.query.filter_by(
-                            player_id=player.id,
-                            round_id=round_obj.id
-                        ).first()
-
-                        if not pick_token:
-                            skipped_no_token += 1
-                            logger.warning(
-                                f"  Player {player.name} (id={player.id}): No token exists, cannot send announcement"
-                            )
-                            continue
-
-                        # Check if we've already sent the initial announcement
-                        # We track this by checking if any reminder has been scheduled
-                        existing_reminder = ReminderSchedule.query.filter_by(
-                            player_id=player.id,
-                            round_id=round_obj.id
-                        ).first()
-
-                        if existing_reminder:
-                            skipped_already_announced += 1
-                            continue
-
-                        # Check for telegram_id
-                        if not (hasattr(player, 'telegram_id') and player.telegram_id):
-                            skipped_missing_telegram += 1
-                            logger.warning(
-                                "  Player %s (player_id=%s): missing telegram_id, cannot send announcement",
-                                player.name,
-                                player.id
-                            )
-                            continue
-
-                        # Send initial announcement via Telegram
-                        pick_url = f"{os.environ.get('BASE_URL', 'http://localhost:5000')}/pick/{pick_token.token}"
-
-                        # Get deadline info
-                        if round_obj.first_kickoff_at:
-                            deadline_str = round_obj.first_kickoff_at.strftime('%A %d %B at %H:%M')
-                        else:
-                            deadline_str = "soon"
-
-                        message = f"⚽ NEW ROUND {round_obj.round_number} IS LIVE!\n\n"
-                        message += f"Make your pick before {deadline_str}"
-
-                        success = self._send_telegram_message(
-                            player.telegram_id,
-                            message,
-                            button_url=pick_url,
-                            button_text="⚽ Make Your Pick"
-                        )
-                        if success:
-                            sent += 1
-                            logger.info(f"  Sent pick-link announcement to {player.name} (id={player.id})")
-
-                            # Now schedule the reminders (4-hour and 2-hour)
-                            if round_obj.first_kickoff_at:
-                                # 4-hour reminder
-                                reminder_4h = ReminderSchedule(
-                                    player_id=player.id,
-                                    round_id=round_obj.id,
-                                    reminder_type='4_hour',
-                                    scheduled_time=round_obj.first_kickoff_at - timedelta(hours=4),
-                                    is_sent=False
-                                )
-                                db.session.add(reminder_4h)
-
-                                # 2-hour reminder
-                                reminder_2h = ReminderSchedule(
-                                    player_id=player.id,
-                                    round_id=round_obj.id,
-                                    reminder_type='2_hour',
-                                    scheduled_time=round_obj.first_kickoff_at - timedelta(hours=2),
-                                    is_sent=False
-                                )
-                                db.session.add(reminder_2h)
-                        else:
-                            failed += 1
-                            logger.warning(
-                                "  FAILED to send announcement to %s (player_id=%s)",
-                                player.name,
-                                player.id
-                            )
-
-                    # PHASE MARKER: Set 'announced' after processing all eligible players
-                    # This is set regardless of how many were actually sent - the attempt was made
-                    # Players without telegram_id will get auto-picks, which is correct behavior
-                    if self._add_marker(round_obj, 'announced'):
-                        logger.info(
-                            f"Round {round_obj.round_number}: ANNOUNCED marker set "
-                            f"(sent={sent}, failed={failed}, skipped_no_telegram={skipped_missing_telegram})"
+                            f"Round {round_obj.round_number}: Already has 'announced' marker, skipped"
                         )
 
-                    # Structured logging summary with requested format
-                    logger.info(
-                        f"Announcements: sent={sent} skipped_missing_telegram={skipped_missing_telegram} "
-                        f"skipped_already_announced={skipped_already_announced} errors={failed}"
-                    )
-                    # Detailed breakdown for debugging
-                    logger.debug(
-                        f"Round {round_obj.round_number} full breakdown: "
-                        f"eligible={eligible_total}, skipped_not_active={skipped_not_active}, "
-                        f"already_picked={already_picked_skipped}, no_token={skipped_no_token}"
-                    )
-
-                db.session.commit()
                 logger.info("=== ROUND ANNOUNCEMENT JOB COMPLETE ===")
                 logger.info("=" * 60)
 
@@ -2586,6 +2434,194 @@ class LMSScheduler:
             'picks_locked': self._has_marker(round_obj, 'picks_locked'),
             'picks_published': self._has_marker(round_obj, 'picks_published'),
             'results_sent': self._has_marker(round_obj, 'results_sent'),
+        }
+
+    def announce_round_now(self, round_id: int) -> dict:
+        """
+        Immediately announce a round to all eligible players (public API).
+
+        This is the canonical announcement function that:
+        1. Ensures tokens exist for all eligible players
+        2. Sends pick-link messages to players with telegram_id
+        3. Schedules reminders (4h and 2h before deadline)
+        4. Sets the 'announced' marker
+
+        Idempotency:
+        - If 'announced' marker exists, returns immediately with skipped_already_announced=1
+        - Token generation is idempotent (no duplicates)
+        - Players who already have ReminderSchedule are skipped (already notified)
+
+        Works in MANUAL_MODE (announcements are allowed regardless of manual_mode setting).
+
+        Args:
+            round_id: The round ID to announce
+
+        Returns:
+            dict: {
+                success: bool,
+                round_id: int,
+                sent: int,
+                skipped_missing_telegram: int,
+                skipped_already_announced: int,
+                errors: int,
+                error: str (only if success=False)
+            }
+        """
+        # Load round
+        round_obj = Round.query.get(round_id)
+        if not round_obj:
+            logger.warning(f"announce_round_now: Round {round_id} not found")
+            return {
+                'success': False,
+                'round_id': round_id,
+                'sent': 0,
+                'skipped_missing_telegram': 0,
+                'skipped_already_announced': 0,
+                'errors': 0,
+                'error': f'Round {round_id} not found'
+            }
+
+        # Idempotency: skip if already announced
+        if self._has_marker(round_obj, 'announced'):
+            logger.info(
+                f"Announce round now: sent=0 skipped_missing_telegram=0 "
+                f"skipped_already_announced=1 errors=0"
+            )
+            return {
+                'success': True,
+                'round_id': round_id,
+                'sent': 0,
+                'skipped_missing_telegram': 0,
+                'skipped_already_announced': 1,
+                'errors': 0
+            }
+
+        # Ensure tokens exist (idempotent)
+        if not self._has_marker(round_obj, 'tokens_generated'):
+            self._ensure_tokens_for_round(round_obj)
+            db.session.flush()
+
+        # Get eligible players
+        eligible_players = self._get_eligible_players_for_round(round_obj)
+
+        sent = 0
+        skipped_missing_telegram = 0
+        skipped_already_notified = 0
+        skipped_not_active = 0
+        skipped_already_picked = 0
+        skipped_no_token = 0
+        errors = 0
+
+        for player in eligible_players:
+            # Skip non-active players
+            if player.status != 'active':
+                skipped_not_active += 1
+                continue
+
+            # Skip if already has a pick
+            if self._player_has_pick_for_round(player.id, round_obj.id):
+                skipped_already_picked += 1
+                continue
+
+            # Get pick token
+            pick_token = PickToken.query.filter_by(
+                player_id=player.id,
+                round_id=round_obj.id
+            ).first()
+
+            if not pick_token:
+                skipped_no_token += 1
+                logger.warning(
+                    f"  Player {player.name} (id={player.id}): No token, cannot send announcement"
+                )
+                continue
+
+            # Skip if already notified (reminder exists = already sent)
+            existing_reminder = ReminderSchedule.query.filter_by(
+                player_id=player.id,
+                round_id=round_obj.id
+            ).first()
+            if existing_reminder:
+                skipped_already_notified += 1
+                continue
+
+            # Check for telegram_id
+            if not (hasattr(player, 'telegram_id') and player.telegram_id):
+                skipped_missing_telegram += 1
+                logger.warning(
+                    f"  Player {player.name} (id={player.id}): missing telegram_id"
+                )
+                continue
+
+            # Build and send announcement message
+            pick_url = f"{os.environ.get('BASE_URL', 'http://localhost:5000')}/pick/{pick_token.token}"
+
+            if round_obj.first_kickoff_at:
+                deadline_str = round_obj.first_kickoff_at.strftime('%A %d %B at %H:%M')
+            else:
+                deadline_str = "soon"
+
+            message = f"⚽ NEW ROUND {round_obj.round_number} IS LIVE!\n\n"
+            message += f"Make your pick before {deadline_str}"
+
+            try:
+                success = self._send_telegram_message(
+                    player.telegram_id,
+                    message,
+                    button_url=pick_url,
+                    button_text="⚽ Make Your Pick"
+                )
+
+                if success:
+                    sent += 1
+                    logger.info(f"  Sent pick-link announcement to {player.name} (id={player.id})")
+
+                    # Schedule reminders
+                    if round_obj.first_kickoff_at:
+                        reminder_4h = ReminderSchedule(
+                            player_id=player.id,
+                            round_id=round_obj.id,
+                            reminder_type='4_hour',
+                            scheduled_time=round_obj.first_kickoff_at - timedelta(hours=4),
+                            is_sent=False
+                        )
+                        db.session.add(reminder_4h)
+
+                        reminder_2h = ReminderSchedule(
+                            player_id=player.id,
+                            round_id=round_obj.id,
+                            reminder_type='2_hour',
+                            scheduled_time=round_obj.first_kickoff_at - timedelta(hours=2),
+                            is_sent=False
+                        )
+                        db.session.add(reminder_2h)
+                else:
+                    errors += 1
+                    logger.warning(
+                        f"  FAILED to send announcement to {player.name} (id={player.id})"
+                    )
+            except Exception as e:
+                errors += 1
+                logger.error(
+                    f"  Exception sending to {player.name} (id={player.id}): {e}"
+                )
+
+        # Set 'announced' marker after processing (even if some players missing telegram)
+        self._add_marker(round_obj, 'announced')
+        db.session.commit()
+
+        logger.info(
+            f"Announce round now: sent={sent} skipped_missing_telegram={skipped_missing_telegram} "
+            f"skipped_already_announced=0 errors={errors}"
+        )
+
+        return {
+            'success': True,
+            'round_id': round_id,
+            'sent': sent,
+            'skipped_missing_telegram': skipped_missing_telegram,
+            'skipped_already_announced': 0,
+            'errors': errors
         }
 
     def _player_has_pick_for_round(self, player_id: int, round_id: int) -> bool:
