@@ -1228,6 +1228,228 @@ def manual_process_results():
         }), 500
 
 
+@app.route('/api/admin/finalize-round', methods=['POST'])
+@admin_required
+def finalize_round():
+    """
+    Admin endpoint to finalize a round after manual score entry.
+
+    This endpoint runs the FULL end-of-round pipeline:
+    1. Processes eliminations for all picks in the round
+    2. Marks round as completed (sets results_sent marker)
+    3. Calls the centralized evaluator for WINNER/ROLLOVER/CONTINUE
+
+    Idempotency guarantees:
+    - results_sent marker prevents duplicate elimination processing
+    - rollover_processed_cycle_{N} prevents duplicate rollover rounds
+    - game_winner_announced prevents duplicate winner notifications
+
+    Request body:
+        - round_id: The round ID to finalize (required)
+
+    Returns JSON with:
+        - success: bool
+        - outcome: 'winner' | 'rollover' | 'continue'
+        - new_round_created: bool (true if rollover created a new round)
+        - cycle_number: Current/new cycle number
+        - round_number: Current/new round number
+        - eliminations: List of eliminated players
+        - survivors: List of surviving players
+        - error: Error message (if success=False)
+    """
+    import logging
+    logger = logging.getLogger(__name__)
+
+    try:
+        data = request.get_json(silent=True) or {}
+        round_id = data.get('round_id')
+
+        if not round_id:
+            return jsonify({
+                'success': False,
+                'error': 'round_id is required'
+            }), 400
+
+        round_obj = Round.query.get(round_id)
+        if not round_obj:
+            return jsonify({
+                'success': False,
+                'error': f'Round {round_id} not found'
+            }), 404
+
+        logger.info("=" * 60)
+        logger.info("FINALIZE ROUND START: round_id=%s cycle=%s round=%s",
+                    round_id, round_obj.cycle_number, round_obj.round_number)
+        logger.info("=" * 60)
+
+        # Helper functions
+        def has_marker(r, marker):
+            return r.special_note and marker in r.special_note
+
+        def add_marker(r, marker):
+            if has_marker(r, marker):
+                return False
+            if r.special_note:
+                r.special_note += f"; {marker}"
+            else:
+                r.special_note = marker
+            return True
+
+        # GUARD 1: Check fixtures exist
+        fixtures = Fixture.query.filter_by(round_id=round_id).all()
+        if not fixtures:
+            logger.warning("FINALIZE ROUND BLOCKED: No fixtures in round %s", round_id)
+            return jsonify({
+                'success': False,
+                'error': 'Round has no fixtures'
+            }), 400
+
+        # GUARD 2: Check all fixtures have scores (completed)
+        incomplete = [f for f in fixtures if f.home_score is None or f.away_score is None]
+        if incomplete:
+            logger.warning("FINALIZE ROUND BLOCKED: %d fixtures missing scores", len(incomplete))
+            return jsonify({
+                'success': False,
+                'error': f'{len(incomplete)} fixtures missing scores - enter all scores via Manual Entry first'
+            }), 400
+
+        # Mark all fixtures as completed if they have scores
+        for fx in fixtures:
+            if fx.status != 'completed':
+                fx.status = 'completed'
+
+        # GUARD 3: Check picks exist
+        picks = Pick.query.filter_by(round_id=round_id).all()
+        if not picks:
+            logger.warning("FINALIZE ROUND BLOCKED: No picks in round %s", round_id)
+            return jsonify({
+                'success': False,
+                'error': 'Round has no picks'
+            }), 400
+
+        # Idempotency check: results_sent marker
+        already_finalized = has_marker(round_obj, 'results_sent')
+        if already_finalized:
+            logger.info("Round %s already finalized (results_sent marker present) - running evaluator only", round_id)
+        else:
+            logger.info("Processing eliminations for round %s...", round_id)
+
+        # Import team normalization
+        from lms_automation.team_utils import normalize_team_name
+
+        # Build fixture outcome map
+        fixture_outcomes = {}
+        for fx in fixtures:
+            home_norm = normalize_team_name(fx.home_team)
+            away_norm = normalize_team_name(fx.away_team)
+
+            if fx.home_score > fx.away_score:
+                fixture_outcomes[home_norm] = True   # home win
+                fixture_outcomes[away_norm] = False  # away loss
+            elif fx.away_score > fx.home_score:
+                fixture_outcomes[home_norm] = False  # home loss
+                fixture_outcomes[away_norm] = True   # away win
+            else:
+                fixture_outcomes[home_norm] = False  # draw = loss
+                fixture_outcomes[away_norm] = False  # draw = loss
+
+        # Process eliminations (idempotent - only updates if not already set)
+        eliminations = []
+        survivors = []
+
+        for pick in picks:
+            pick_norm = normalize_team_name(pick.team_picked)
+            is_winner = fixture_outcomes.get(pick_norm, False)
+
+            # Update pick outcome
+            pick.is_winner = is_winner
+
+            if is_winner:
+                pick.is_eliminated = False
+                survivors.append({
+                    'player_id': pick.player_id,
+                    'player_name': pick.player.name,
+                    'team_picked': pick.team_picked
+                })
+            else:
+                pick.is_eliminated = True
+                # Only mark player eliminated if not already
+                if pick.player.status != 'eliminated':
+                    pick.player.status = 'eliminated'
+                    logger.info("ELIMINATED: %s (picked %s)", pick.player.name, pick.team_picked)
+                eliminations.append({
+                    'player_id': pick.player_id,
+                    'player_name': pick.player.name,
+                    'team_picked': pick.team_picked
+                })
+
+        # Mark round as completed
+        round_obj.status = 'completed'
+
+        # Add results_sent marker (idempotent)
+        if not already_finalized:
+            add_marker(round_obj, 'results_sent')
+            logger.info("Added results_sent marker to round %s", round_id)
+
+        db.session.commit()
+
+        # CRITICAL: Call centralized evaluator for WINNER/ROLLOVER/CONTINUE
+        logger.info("Calling centralized evaluator...")
+        outcome = _evaluate_game_state_after_round_standalone(round_obj)
+
+        logger.info("=" * 60)
+        logger.info("FINALIZE ROUND OUTCOME: %s", outcome)
+        logger.info("=" * 60)
+
+        # Determine if a new round was created (for rollover)
+        new_round_created = False
+        new_cycle_number = round_obj.cycle_number or 1
+        new_round_number = round_obj.round_number
+
+        if outcome == 'rollover':
+            # Check if a new round was created for the next cycle
+            next_cycle = new_cycle_number + 1
+            new_round = Round.query.filter_by(cycle_number=next_cycle, round_number=1).first()
+            if new_round:
+                new_round_created = True
+                new_cycle_number = next_cycle
+                new_round_number = 1
+                logger.info("Rollover created new round: Cycle %s Round %s (id=%s)",
+                            new_cycle_number, new_round_number, new_round.id)
+
+        # Get final player counts
+        active_count = Player.query.filter_by(status='active').count()
+        eliminated_count = Player.query.filter_by(status='eliminated').count()
+        winner_count = Player.query.filter_by(status='winner').count()
+
+        return jsonify({
+            'success': True,
+            'outcome': outcome,
+            'new_round_created': new_round_created,
+            'cycle_number': new_cycle_number,
+            'round_number': new_round_number,
+            'eliminations': eliminations,
+            'survivors': survivors,
+            'summary': {
+                'active_players': active_count,
+                'eliminated_players': eliminated_count,
+                'winners': winner_count,
+                'total_eliminations_this_round': len(eliminations),
+                'total_survivors_this_round': len(survivors)
+            }
+        })
+
+    except Exception as e:
+        import traceback
+        logger.error("Error in finalize_round: %s", e)
+        logger.error(traceback.format_exc())
+        db.session.rollback()
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
 @app.route('/api/admin/start-new-game', methods=['POST'])
 @admin_required
 def start_new_game():

@@ -1240,6 +1240,9 @@ document.addEventListener('DOMContentLoaded', function() {
             <div class="modal-footer">
                 <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
                 <button type="button" class="btn btn-success" id="processResultsBtn" disabled>Process Results & Eliminate Players</button>
+                <button type="button" class="btn btn-warning" id="finalizeRoundBtn" disabled>
+                    <i class="fas fa-flag-checkered me-2"></i>Finalize Results
+                </button>
             </div>
         </div>
     </div>
@@ -2068,12 +2071,14 @@ document.addEventListener('DOMContentLoaded', function() {
     document.getElementById('resultsRoundSelect').addEventListener('change', function() {
         const roundId = this.value;
         const processBtn = document.getElementById('processResultsBtn');
+        const finalizeBtn = document.getElementById('finalizeRoundBtn');
         const roundInfo = document.getElementById('resultsRoundInfo');
         const fixturesDiv = document.getElementById('roundFixtures');
         const picksDiv = document.getElementById('playerPicks');
-        
+
         if (!roundId) {
             processBtn.disabled = true;
+            finalizeBtn.disabled = true;
             roundInfo.innerHTML = '';
             fixturesDiv.innerHTML = '';
             picksDiv.innerHTML = '';
@@ -2187,7 +2192,8 @@ document.addEventListener('DOMContentLoaded', function() {
                     }
                     
                     processBtn.disabled = picks.length === 0;
-                    
+                    finalizeBtn.disabled = picks.length === 0;
+
                     // Add event listener to auto-populate button (after it's created)
                     const autoPopulateBtn = document.getElementById('autoPopulateBtn');
                     if (autoPopulateBtn) {
@@ -2223,15 +2229,17 @@ document.addEventListener('DOMContentLoaded', function() {
                 } else {
                     roundInfo.innerHTML = '<div class="alert alert-danger">Error loading round data</div>';
                     processBtn.disabled = true;
+                    finalizeBtn.disabled = true;
                 }
             })
             .catch(error => {
                 console.error('Error loading round data:', error);
                 roundInfo.innerHTML = '<div class="alert alert-danger">Error loading data</div>';
                 processBtn.disabled = true;
+                finalizeBtn.disabled = true;
             });
     });
-    
+
     // Handle process results
     document.getElementById('processResultsBtn').addEventListener('click', function() {
         const roundId = document.getElementById('resultsRoundSelect').value;
@@ -2317,7 +2325,98 @@ document.addEventListener('DOMContentLoaded', function() {
             this.textContent = 'Process Results & Eliminate Players';
         });
     });
-    
+
+    // Handle finalize round - runs full pipeline with evaluator
+    document.getElementById('finalizeRoundBtn').addEventListener('click', function() {
+        const roundId = document.getElementById('resultsRoundSelect').value;
+
+        if (!roundId) {
+            alert('Please select a round');
+            return;
+        }
+
+        // Check that all fixtures have scores entered
+        const scoreInputs = document.querySelectorAll('.score-input');
+        let fixturesWithScores = {};
+
+        scoreInputs.forEach(input => {
+            const fixtureId = input.getAttribute('data-fixture-id');
+            const score = input.value.trim();
+
+            if (!fixturesWithScores[fixtureId]) {
+                fixturesWithScores[fixtureId] = { home: false, away: false };
+            }
+            if (score !== '' && !isNaN(parseInt(score))) {
+                fixturesWithScores[fixtureId][input.getAttribute('data-type')] = true;
+            }
+        });
+
+        // Count fixtures missing scores
+        let missingScores = 0;
+        for (const fixtureId in fixturesWithScores) {
+            const fixture = fixturesWithScores[fixtureId];
+            if (!fixture.home || !fixture.away) {
+                missingScores++;
+            }
+        }
+
+        if (missingScores > 0) {
+            alert(`${missingScores} fixture(s) are missing scores. Please enter all scores first using "Process Results & Eliminate Players" or manually enter them before finalizing.`);
+            return;
+        }
+
+        if (!confirm(`This will FINALIZE Round and run the full pipeline:\n\n1. Process all eliminations\n2. Mark round completed\n3. Check for WINNER/ROLLOVER/CONTINUE\n\nIf all players are eliminated, a ROLLOVER will trigger (new cycle, all players reset).\n\nProceed?`)) {
+            return;
+        }
+
+        this.disabled = true;
+        this.innerHTML = '<i class="fas fa-spinner fa-spin me-2"></i>Finalizing...';
+
+        fetch('/api/admin/finalize-round', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({ round_id: parseInt(roundId) })
+        })
+        .then(response => response.json())
+        .then(data => {
+            if (data.success) {
+                let message = `Round Finalized!\n\n`;
+                message += `Outcome: ${data.outcome.toUpperCase()}\n`;
+                message += `Eliminated: ${data.summary.total_eliminations_this_round}\n`;
+                message += `Survivors: ${data.summary.total_survivors_this_round}\n\n`;
+
+                if (data.outcome === 'winner') {
+                    message += `WINNER DECLARED! Competition complete.\n`;
+                    message += `Winner notifications sent.`;
+                } else if (data.outcome === 'rollover') {
+                    message += `ROLLOVER! All players eliminated.\n`;
+                    message += `All players reset to active.\n`;
+                    if (data.new_round_created) {
+                        message += `New round created: Cycle ${data.cycle_number} Round ${data.round_number}`;
+                    }
+                } else {
+                    message += `Game continues with ${data.summary.active_players} active players.\n`;
+                    message += `Admin must create next round manually.`;
+                }
+
+                alert(message);
+                document.getElementById('resultsModal').querySelector('[data-bs-dismiss="modal"]').click();
+                location.reload();
+            } else {
+                alert('Error finalizing round: ' + data.error);
+            }
+        })
+        .catch(error => {
+            alert('Error finalizing round: ' + error);
+        })
+        .finally(() => {
+            this.disabled = false;
+            this.innerHTML = '<i class="fas fa-flag-checkered me-2"></i>Finalize Results';
+        });
+    });
+
     // Reset results modal when hidden
     document.getElementById('resultsModal').addEventListener('hidden.bs.modal', function() {
         document.getElementById('resultsRoundSelect').value = '';
@@ -2325,8 +2424,9 @@ document.addEventListener('DOMContentLoaded', function() {
         document.getElementById('roundFixtures').innerHTML = '';
         document.getElementById('playerPicks').innerHTML = '';
         document.getElementById('processResultsBtn').disabled = true;
+        document.getElementById('finalizeRoundBtn').disabled = true;
     });
-    
+
     // Re-attach event listeners after sorting
     function attachPlayerEventListeners() {
         // Implementation here...
