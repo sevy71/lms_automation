@@ -704,9 +704,14 @@ def resend_round_announcement(round_id):
 @admin_required
 def seed_random_picks():
     """
-    DEBUG HELPER: Seed random picks for testing.
+    Admin helper: Seed DETERMINISTIC picks for testing.
 
-    Assigns a random unique team to each eligible player who doesn't have a pick yet.
+    Assigns teams using the deterministic selection strategy:
+    1. Round 1: Arsenal (if available)
+    2. Otherwise: First team from preference list (Arsenal, Man City, Liverpool, etc.)
+    3. Fallback: Alphabetically first available team
+    4. Last resort: Random (only if no other option)
+
     RESPECTS THE RULE: No team can be picked twice in the same cycle.
 
     Query params:
@@ -714,7 +719,6 @@ def seed_random_picks():
         count: Max number of picks to create (default: all eligible players)
         only_missing: If 1, only create picks for players missing picks (default: 1)
     """
-    import random
     from lms_automation.team_utils import normalize_team_name
 
     round_id = request.args.get('round_id', type=int)
@@ -737,13 +741,10 @@ def seed_random_picks():
         return redirect(url_for('admin_dashboard'))
 
     # Build set of available teams from fixtures (use original names for display)
-    teams_in_round = []
-    teams_in_round_canonical = set()
+    teams_in_round = set()
     for fixture in fixtures:
-        teams_in_round.append(fixture.home_team)
-        teams_in_round.append(fixture.away_team)
-        teams_in_round_canonical.add(normalize_team_name(fixture.home_team))
-        teams_in_round_canonical.add(normalize_team_name(fixture.away_team))
+        teams_in_round.add(fixture.home_team)
+        teams_in_round.add(fixture.away_team)
 
     # Get eligible players
     eligible_players = get_eligible_players_for_round(round_obj)
@@ -772,16 +773,20 @@ def seed_random_picks():
     skipped_no_available = 0
     now = datetime.utcnow()
     current_cycle = round_obj.cycle_number or 1
+    current_round_number = round_obj.round_number or 1
+
+    # Track picks by reason for summary
+    reason_counts = {}
 
     # Debug: log what we're doing
-    print(f"[SEED-RANDOM] Round {round_obj.round_number}, cycle={current_cycle}, teams_in_round={len(teams_in_round_canonical)}")
-    print(f"[SEED-RANDOM] Teams available: {teams_in_round_canonical}")
+    print(f"[SEED-DETERMINISTIC] Round {current_round_number}, cycle={current_cycle}, teams_in_round={len(teams_in_round)}")
+    print(f"[SEED-DETERMINISTIC] Teams available: {teams_in_round}")
 
     for player in players_to_seed:
-        # Check if pick already exists (defensive)
+        # Check if pick already exists (defensive - idempotent)
         existing = Pick.query.filter_by(player_id=player.id, round_id=round_id).first()
         if existing:
-            print(f"[SEED-RANDOM] Player {player.id} ({player.name}): already has pick, skipping")
+            print(f"[SEED-DETERMINISTIC] Player {player.id} ({player.name}): already has pick, skipping")
             continue
 
         # Get teams already used by this player in this cycle
@@ -793,53 +798,59 @@ def seed_random_picks():
             )
         ).all()
 
-        used_teams_canonical = set()
+        used_teams = set()
         for pick in cycle_picks:
-            used_teams_canonical.add(normalize_team_name(pick.team_picked))
-
-        # Debug: log used teams
-        print(f"[SEED-RANDOM] Player {player.id} ({player.name}): cycle_picks={len(cycle_picks)}, used_teams={used_teams_canonical}")
+            used_teams.add(normalize_team_name(pick.team_picked))
 
         # Calculate available teams for this player (not used in this cycle)
-        available_canonical = teams_in_round_canonical - used_teams_canonical
+        available_teams = set()
+        for team in teams_in_round:
+            if normalize_team_name(team) not in used_teams:
+                available_teams.add(team)
 
-        print(f"[SEED-RANDOM] Player {player.id} ({player.name}): available={len(available_canonical)} teams")
+        print(f"[SEED-DETERMINISTIC] Player {player.id} ({player.name}): cycle_picks={len(cycle_picks)}, used={len(used_teams)}, available={len(available_teams)}")
 
-        if not available_canonical:
+        if not available_teams:
             # Player has used all teams in this round's fixtures during this cycle
             skipped_no_available += 1
-            print(f"[SEED-RANDOM] Player {player.id} ({player.name}): NO AVAILABLE TEAMS, skipping")
+            print(f"[SEED-DETERMINISTIC] Player {player.id} ({player.name}): NO AVAILABLE TEAMS, skipping")
             continue
 
-        # Pick a random team from available teams
-        available_list = list(available_canonical)
-        selected_canonical = random.choice(available_list)
+        # Use deterministic selection
+        selected_team, auto_reason = _deterministic_team_selection(
+            available_teams, current_round_number, current_cycle
+        )
 
-        # Find the original team name (for display purposes)
-        selected_team = selected_canonical  # Default to canonical
-        for team in teams_in_round:
-            if normalize_team_name(team) == selected_canonical:
-                selected_team = team
-                break
+        if not selected_team:
+            skipped_no_available += 1
+            print(f"[SEED-DETERMINISTIC] Player {player.id} ({player.name}): selection failed, skipping")
+            continue
 
-        print(f"[SEED-RANDOM] Player {player.id} ({player.name}): SELECTED '{selected_team}' from {len(available_list)} options")
+        print(f"[SEED-DETERMINISTIC] Player {player.id} ({player.name}): SELECTED '{selected_team}' reason='{auto_reason}'")
 
         pick = Pick(
             player_id=player.id,
             round_id=round_id,
             team_picked=selected_team,
             auto_assigned=True,
-            auto_reason='debug_random_seed',
+            auto_reason=auto_reason,
             timestamp=now
         )
         db.session.add(pick)
         picks_created += 1
+        reason_counts[auto_reason] = reason_counts.get(auto_reason, 0) + 1
 
     db.session.commit()
 
-    msg = f'Seeded {picks_created} random picks for round {round_obj.round_number} (cycle {current_cycle})'
+    # Build summary message
+    msg = f'Seeded {picks_created} deterministic picks for Round {current_round_number} (Cycle {current_cycle})'
+    if reason_counts:
+        reason_summary = ', '.join([f'{reason}: {count}' for reason, count in reason_counts.items()])
+        msg += f' [{reason_summary}]'
     if skipped_no_available:
         msg += f' (skipped {skipped_no_available} players with no available teams)'
+
+    print(f"[SEED-DETERMINISTIC] Summary: {msg}")
     flash(msg, 'success')
     return redirect(url_for('admin_dashboard'))
 
@@ -1901,19 +1912,85 @@ def _opposing_team_from_past_pick(pick: Pick) -> str:
     except Exception:
         return None
 
+
+# Fixed preference list for deterministic auto-picks (popular/strong teams first)
+TEAM_PREFERENCE_LIST = [
+    'Arsenal', 'Man City', 'Liverpool', 'Chelsea', 'Man Utd', 'Tottenham',
+    'Newcastle', 'Aston Villa', 'Brighton', 'West Ham', 'Bournemouth',
+    'Fulham', 'Brentford', 'Crystal Palace', 'Wolves', 'Nottingham Forest',
+    'Everton', 'Leicester', 'Ipswich', 'Southampton'
+]
+
+
+def _deterministic_team_selection(available_teams: set, round_number: int, cycle_number: int) -> tuple:
+    """
+    Deterministic team selection for auto-picks.
+
+    Args:
+        available_teams: Set of team names available for picking (canonical or original)
+        round_number: The round number within the cycle
+        cycle_number: The current cycle number
+
+    Returns:
+        tuple: (selected_team, auto_reason)
+        - auto_reason values:
+            - 'missed_deadline_default_arsenal': Round 1, Arsenal available
+            - 'missed_deadline_preference': Team from preference list
+            - 'missed_deadline_fallback_first_available': First alphabetically from available
+            - 'missed_deadline_random_last_resort': No teams available (random fallback)
+    """
+    from lms_automation.team_utils import normalize_team_name
+    import random
+
+    if not available_teams:
+        return None, 'missed_deadline_random_last_resort'
+
+    # Normalize available teams for comparison
+    available_canonical = {normalize_team_name(t): t for t in available_teams}
+
+    # RULE 1: Round 1 of any cycle - default to Arsenal if available
+    if round_number == 1:
+        arsenal_canonical = normalize_team_name('Arsenal')
+        if arsenal_canonical in available_canonical:
+            print(f"[DETERMINISTIC] Round 1 - Arsenal default selected")
+            return available_canonical[arsenal_canonical], 'missed_deadline_default_arsenal'
+
+    # RULE 2: Check preference list in order
+    for preferred_team in TEAM_PREFERENCE_LIST:
+        preferred_canonical = normalize_team_name(preferred_team)
+        if preferred_canonical in available_canonical:
+            print(f"[DETERMINISTIC] Preference list match: {preferred_team}")
+            return available_canonical[preferred_canonical], 'missed_deadline_preference'
+
+    # RULE 3: Alphabetically first available team (stable sort)
+    sorted_teams = sorted(available_teams, key=lambda t: normalize_team_name(t).lower())
+    if sorted_teams:
+        selected = sorted_teams[0]
+        print(f"[DETERMINISTIC] Fallback to first alphabetically: {selected}")
+        return selected, 'missed_deadline_fallback_first_available'
+
+    # RULE 4: Last resort - random (should never happen if available_teams is not empty)
+    available_list = list(available_teams)
+    selected = random.choice(available_list)
+    print(f"[DETERMINISTIC] Random last resort: {selected}")
+    return selected, 'missed_deadline_random_last_resort'
+
 @app.route('/api/admin/rounds/<int:round_id>/apply-missed-picks', methods=['POST'])
 @admin_required
 def apply_missed_picks(round_id):
     """Admin-triggered: After cutoff (1h before first kickoff), auto-pick for active players without a pick.
 
-    Logic:
+    Deterministic Logic:
     - Determine cutoff = (first_kickoff_at or derived earliest kickoff) - 1 hour.
     - For each active player with no pick in this round:
-        1) Walk their past picks from most recent to oldest; when a past pick is a WIN, take the opposing (losing) team
-           from that match if it's playing this round and not yet used this cycle.
-        2) Otherwise, pick the first eligible team (alphabetically) that they haven't used this cycle.
-    - Mark pick.auto_assigned = True, pick.auto_reason = 'missed_deadline'.
+        1) Round 1: Default to Arsenal if available
+        2) Otherwise: First team from preference list (Arsenal, Man City, Liverpool, etc.)
+        3) Fallback: Alphabetically first available team
+        4) Last resort: Random (only if no other option)
+    - Mark pick.auto_assigned = True, pick.auto_reason = descriptive reason.
     """
+    from lms_automation.team_utils import normalize_team_name
+
     try:
         round_obj = Round.query.get_or_404(round_id)
 
@@ -1935,59 +2012,89 @@ def apply_missed_picks(round_id):
         applied = []
         skipped = []
 
+        current_cycle = round_obj.cycle_number or 1
+        current_round_number = round_obj.round_number or 1
+
+        # Track reason counts for summary
+        reason_counts = {}
+
+        print(f"[APPLY-MISSED-PICKS] Round {current_round_number}, Cycle {current_cycle}, eligible_teams={len(eligible_teams)}")
+
         for player in active_players:
-            # Skip if player already has a pick for this round
+            # Skip if player already has a pick for this round (idempotent)
             existing_pick = Pick.query.filter_by(player_id=player.id, round_id=round_obj.id).first()
             if existing_pick:
                 skipped.append({'player': player.name, 'reason': 'already_picked'})
                 continue
 
-            used_teams = _teams_used_this_cycle(player.id, round_obj.cycle_number or 1)
+            # Get teams used by this player in this cycle (normalized for comparison)
+            used_teams_normalized = set()
+            cycle_picks = Pick.query.filter_by(player_id=player.id).join(Round).filter(
+                Round.cycle_number == current_cycle
+            ).all()
+            for pick in cycle_picks:
+                used_teams_normalized.add(normalize_team_name(pick.team_picked))
 
-            # Strategy 1: past winning picks → opposing team of that match
-            candidate = None
-            past_picks = Pick.query.filter_by(player_id=player.id).join(Round).order_by(Round.round_number.desc()).all()
-            for past in past_picks:
-                if past.is_winner is True:
-                    opp = _opposing_team_from_past_pick(past)
-                    if opp and (opp in eligible_teams) and (opp not in used_teams):
-                        candidate = opp
-                        break
+            # Calculate available teams (not used in this cycle)
+            available_teams = set()
+            for team in eligible_teams:
+                if normalize_team_name(team) not in used_teams_normalized:
+                    available_teams.add(team)
 
-            # Strategy 2: first eligible team alphabetically not yet used this cycle
-            if not candidate:
-                remaining = sorted([t for t in eligible_teams if t not in used_teams])
-                if remaining:
-                    candidate = remaining[0]
+            print(f"[APPLY-MISSED-PICKS] Player {player.id} ({player.name}): used={len(used_teams_normalized)}, available={len(available_teams)}")
 
-            if not candidate:
+            if not available_teams:
                 skipped.append({'player': player.name, 'reason': 'no_eligible_team'})
                 continue
 
+            # Use deterministic selection
+            candidate, auto_reason = _deterministic_team_selection(
+                available_teams, current_round_number, current_cycle
+            )
+
+            if not candidate:
+                skipped.append({'player': player.name, 'reason': 'selection_failed'})
+                continue
+
+            print(f"[APPLY-MISSED-PICKS] Player {player.id} ({player.name}): SELECTED '{candidate}' reason='{auto_reason}'")
+
             if not dry_run:
-                # Create auto pick
-                pick = Pick(player_id=player.id, round_id=round_obj.id, team_picked=candidate)
+                # Create auto pick with descriptive reason
+                pick = Pick(
+                    player_id=player.id,
+                    round_id=round_obj.id,
+                    team_picked=candidate,
+                    auto_assigned=True,
+                    auto_reason=auto_reason,
+                    timestamp=datetime.utcnow()
+                )
                 db.session.add(pick)
                 db.session.flush()
-                # Audit
-                log_auto_pick(pick, reason='missed_deadline')
 
-            applied.append({'player': player.name, 'team': candidate})
+            applied.append({'player': player.name, 'team': candidate, 'reason': auto_reason})
+            reason_counts[auto_reason] = reason_counts.get(auto_reason, 0) + 1
 
         if not dry_run:
             db.session.commit()
+
+        # Log summary
+        print(f"[APPLY-MISSED-PICKS] Summary: applied={len(applied)}, skipped={len(skipped)}, reasons={reason_counts}")
 
         return jsonify({
             'success': True,
             'round_id': round_obj.id,
             'round_number': round_obj.round_number,
+            'cycle_number': current_cycle,
             'applied_count': len(applied),
             'applied': applied,
             'skipped': skipped,
+            'reason_counts': reason_counts,
             'dry_run': dry_run
         })
     except Exception as e:
         db.session.rollback()
+        import traceback
+        print(f"[APPLY-MISSED-PICKS] ERROR: {e}\n{traceback.format_exc()}")
         return jsonify({'success': False, 'error': str(e)}), 500
 
 @app.route('/send_picks')

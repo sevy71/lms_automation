@@ -2161,34 +2161,36 @@ class LMSScheduler:
         else:
             round_obj.special_note = "results_sent"
 
+    # Fixed preference list for deterministic auto-picks (popular/strong teams first)
+    TEAM_PREFERENCE_LIST = [
+        'Arsenal', 'Man City', 'Liverpool', 'Chelsea', 'Man Utd', 'Tottenham',
+        'Newcastle', 'Aston Villa', 'Brighton', 'West Ham', 'Bournemouth',
+        'Fulham', 'Brentford', 'Crystal Palace', 'Wolves', 'Nottingham Forest',
+        'Everton', 'Leicester', 'Ipswich', 'Southampton'
+    ]
+
     def _get_auto_pick_team(self, player, round_obj):
         """
         Get auto-pick team for a player who missed the deadline.
 
+        DETERMINISTIC Selection Algorithm:
+        1. Round 1 of any cycle: Default to Arsenal if available
+        2. Otherwise: First team from preference list (Arsenal, Man City, Liverpool, etc.)
+        3. Fallback: Alphabetically first available team (stable sort)
+        4. Last resort: Random (only if no other option - should never happen)
+
         IMPORTANT: All team names are CANONICAL (normalized).
-        This ensures correct alphabetical ordering:
-        - 'Arsenal' comes before 'Bournemouth' (NOT 'AFC Bournemouth')
-        - Consistent, deterministic selection across all players
-
-        Selection algorithm (as per game rules):
-
-        STEP 1 - ROLLBACK RULE (Primary):
-        - Walk the player's past picks from most recent → oldest
-        - Find the opposing team from that historical fixture
-        - If that opposing team is:
-          - eligible in the current round (playing this matchday)
-          - not already used by the player in this cycle
-        → assign it
-
-        STEP 2 - ALPHABETICAL FALLBACK (Secondary):
-        - If rollback fails, choose the alphabetically first eligible team
-        - Based on canonical short team names
-        - This fallback may assign the same team to multiple players
-        - This behavior is explicitly allowed and documented
+        This ensures correct alphabetical ordering and consistent matching.
 
         Returns tuple: (canonical_team_name, auto_reason)
-        - auto_reason: 'rollback_opponent' or 'fallback_alpha_first'
+        - auto_reason: 'missed_deadline_default_arsenal', 'missed_deadline_preference',
+                       'missed_deadline_fallback_first_available', 'missed_deadline_random_last_resort'
         """
+        import random
+
+        current_cycle = round_obj.cycle_number or 1
+        current_round_number = round_obj.round_number or 1
+
         # Get teams in round - normalize to canonical names
         fixtures = Fixture.query.filter_by(round_id=round_obj.id).all()
         teams_in_round_canonical = set()
@@ -2200,7 +2202,7 @@ class LMSScheduler:
         # Get teams used by player in this cycle (normalized)
         used_teams_canonical = set()
         cycle_picks = Pick.query.filter_by(player_id=player.id).join(Round).filter(
-            Round.cycle_number == (round_obj.cycle_number or 1)
+            Round.cycle_number == current_cycle
         ).order_by(Round.round_number.desc()).all()
 
         for pick in cycle_picks:
@@ -2211,6 +2213,7 @@ class LMSScheduler:
 
         logger.info(
             f"  Auto-pick for player_id={player.id} ({player.name}): "
+            f"Round {current_round_number}, Cycle {current_cycle}, "
             f"teams_in_round={len(teams_in_round_canonical)}, "
             f"teams_used={len(used_teams_canonical)}, "
             f"available={len(available_canonical)}"
@@ -2223,54 +2226,45 @@ class LMSScheduler:
             )
             return None, None
 
-        # STEP 1: ROLLBACK RULE
-        # Walk through player's historical picks (most recent first across ALL cycles)
-        # Find an opponent team that is eligible in current round
-        all_historical_picks = Pick.query.filter_by(player_id=player.id).join(Round).order_by(
-            Round.round_number.desc()
-        ).all()
-
-        for historical_pick in all_historical_picks:
-            historical_team_canonical = normalize_team_name(historical_pick.team_picked)
-
-            # Find the fixture from that historical round to identify opponent
-            historical_fixtures = Fixture.query.filter_by(round_id=historical_pick.round_id).all()
-            opponent_canonical = None
-
-            for hf in historical_fixtures:
-                home_canonical = normalize_team_name(hf.home_team)
-                away_canonical = normalize_team_name(hf.away_team)
-
-                if home_canonical == historical_team_canonical:
-                    opponent_canonical = away_canonical
-                    break
-                elif away_canonical == historical_team_canonical:
-                    opponent_canonical = home_canonical
-                    break
-
-            if opponent_canonical and opponent_canonical in available_canonical:
-                # Found a valid rollback pick - return CANONICAL name
+        # RULE 1: Round 1 of any cycle - default to Arsenal if available
+        if current_round_number == 1:
+            arsenal_canonical = normalize_team_name('Arsenal')
+            if arsenal_canonical in available_canonical:
                 logger.info(
-                    f"  AUTO-PICK ROLLBACK: player_id={player.id} ({player.name}) -> "
-                    f"'{opponent_canonical}' (opponent of '{historical_pick.team_picked}' "
-                    f"from Round {historical_pick.round.round_number})"
+                    f"  AUTO-PICK DEFAULT ARSENAL: player_id={player.id} ({player.name}) -> "
+                    f"'Arsenal' (Round 1 default)"
                 )
-                return opponent_canonical, 'rollback_opponent'
+                return arsenal_canonical, 'missed_deadline_default_arsenal'
 
-        # STEP 2: ALPHABETICAL FALLBACK
-        # No rollback candidate found - use alphabetically first available team
-        # CRITICAL: This sort is on CANONICAL names, so:
-        #   'Arsenal' < 'Bournemouth' (NOT 'AFC Bournemouth')
-        available_sorted = sorted(available_canonical)
-        selected_canonical = available_sorted[0]  # Alphabetically first
+        # RULE 2: Check preference list in order
+        for preferred_team in self.TEAM_PREFERENCE_LIST:
+            preferred_canonical = normalize_team_name(preferred_team)
+            if preferred_canonical in available_canonical:
+                logger.info(
+                    f"  AUTO-PICK PREFERENCE: player_id={player.id} ({player.name}) -> "
+                    f"'{preferred_canonical}' (from preference list)"
+                )
+                return preferred_canonical, 'missed_deadline_preference'
 
-        logger.info(
-            f"  AUTO-PICK ALPHABETICAL FALLBACK: player_id={player.id} ({player.name}) -> "
-            f"'{selected_canonical}' (first of {len(available_sorted)} available teams alphabetically: "
-            f"{available_sorted[:5]}{'...' if len(available_sorted) > 5 else ''})"
+        # RULE 3: Alphabetically first available team (stable sort)
+        available_sorted = sorted(available_canonical, key=str.lower)
+        if available_sorted:
+            selected_canonical = available_sorted[0]
+            logger.info(
+                f"  AUTO-PICK FALLBACK FIRST: player_id={player.id} ({player.name}) -> "
+                f"'{selected_canonical}' (first of {len(available_sorted)} alphabetically: "
+                f"{available_sorted[:5]}{'...' if len(available_sorted) > 5 else ''})"
+            )
+            return selected_canonical, 'missed_deadline_fallback_first_available'
+
+        # RULE 4: Last resort - random (should never happen if available_canonical is not empty)
+        available_list = list(available_canonical)
+        selected = random.choice(available_list)
+        logger.warning(
+            f"  AUTO-PICK RANDOM LAST RESORT: player_id={player.id} ({player.name}) -> "
+            f"'{selected}' (random from {len(available_list)} teams)"
         )
-
-        return selected_canonical, 'fallback_alpha_first'
+        return selected, 'missed_deadline_random_last_resort'
 
     def _send_telegram_message(self, telegram_id, message, button_url=None, button_text="Make Your Pick"):
         """Send message via Telegram bot with optional inline button"""
