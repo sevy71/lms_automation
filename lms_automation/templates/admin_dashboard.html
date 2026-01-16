@@ -1788,7 +1788,8 @@ document.addEventListener('DOMContentLoaded', function() {
             const defaults = gameState.next_round_defaults;
             roundNumberInput.value = defaults.round_number || 1;
             cycleNumberInput.value = defaults.cycle_number || 1;
-            console.log('[Create Round Modal] Setting defaults: cycle=' + cycleNumberInput.value + ', round=' + roundNumberInput.value);
+            console.log('[Create Round Modal] Game state received:', JSON.stringify(gameState, null, 2));
+            console.log('[Create Round Modal] Setting defaults: cycle=' + cycleNumberInput.value + ', round=' + roundNumberInput.value + ', suggestion=' + defaults.suggestion);
 
             // Show info message based on game state
             if (modalInfoDiv) {

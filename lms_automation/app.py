@@ -1401,8 +1401,10 @@ def get_game_state():
             else:
                 last_round_outcome = 'continue'
 
-        # Compute next round defaults
+        # Compute next round defaults using cycle-scoped queries
         next_round_defaults = {}
+        defaults_reason = 'unknown'
+
         if game_ended:
             # After winner: suggest next cycle round 1
             next_round_defaults = {
@@ -1411,33 +1413,64 @@ def get_game_state():
                 'pl_matchday': ((last_completed_round.pl_matchday or 0) % 38) + 1,
                 'suggestion': 'start_new_game'
             }
+            defaults_reason = 'winner'
         elif last_round_outcome == 'rollover':
-            # After rollover: round was auto-created, suggest round 2
+            # After rollover: system auto-created cycle+1 round 1
+            # Query to find the actual max round in the new cycle
+            rollover_cycle = current_cycle
+            max_round_in_cycle = db.session.query(db.func.max(Round.round_number)).filter(
+                Round.cycle_number == rollover_cycle
+            ).scalar() or 0
+
+            # Suggest the next round after the auto-created one
             next_round_defaults = {
-                'cycle_number': current_cycle,
-                'round_number': 2,
+                'cycle_number': rollover_cycle,
+                'round_number': max_round_in_cycle + 1,
                 'pl_matchday': ((current_round.pl_matchday if current_round else 0) % 38) + 1,
                 'suggestion': 'continue'
             }
-        elif current_round:
-            # Normal continuation: next round in same cycle
+            defaults_reason = 'rollover'
+        elif last_completed_round and last_round_outcome == 'continue':
+            # Normal continuation: query max round_number in current cycle
+            max_round_in_cycle = db.session.query(db.func.max(Round.round_number)).filter(
+                Round.cycle_number == current_cycle
+            ).scalar() or 0
+
+            # Get the last round's matchday for computing next matchday
+            last_matchday = last_completed_round.pl_matchday or 0
+
             next_round_defaults = {
                 'cycle_number': current_cycle,
-                'round_number': current_round.round_number + 1,
+                'round_number': max_round_in_cycle + 1,
+                'pl_matchday': ((last_matchday) % 38) + 1,
+                'suggestion': 'continue'
+            }
+            defaults_reason = 'continuation'
+        elif current_round:
+            # There's an active/pending round: suggest the next one after it
+            max_round_in_cycle = db.session.query(db.func.max(Round.round_number)).filter(
+                Round.cycle_number == current_cycle
+            ).scalar() or 0
+
+            next_round_defaults = {
+                'cycle_number': current_cycle,
+                'round_number': max_round_in_cycle + 1,
                 'pl_matchday': ((current_round.pl_matchday or 0) % 38) + 1,
                 'suggestion': 'continue'
             }
+            defaults_reason = 'active_round_exists'
         else:
-            # No current round: suggest starting fresh
+            # No rounds at all: suggest starting fresh
             next_round_defaults = {
                 'cycle_number': current_cycle,
                 'round_number': 1,
                 'pl_matchday': 1,
                 'suggestion': 'create_first_round'
             }
+            defaults_reason = 'no_rounds'
 
         logger.info(f"  game_ended={game_ended}, last_round_outcome={last_round_outcome}")
-        logger.info(f"  next_round_defaults: cycle={next_round_defaults.get('cycle_number')}, round={next_round_defaults.get('round_number')}, suggestion={next_round_defaults.get('suggestion')}")
+        logger.info(f"  game-state defaults: cycle={next_round_defaults.get('cycle_number')} round={next_round_defaults.get('round_number')} reason={defaults_reason}")
 
         return jsonify({
             'success': True,
