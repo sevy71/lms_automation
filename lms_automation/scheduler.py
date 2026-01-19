@@ -747,6 +747,14 @@ class LMSScheduler:
                             eliminated_players.append(f"{pick.player.name}(id={pick.player.id}, pick={pick.team_picked})")
 
                         elif pick.is_winner == True:
+                            # CRITICAL: Ensure winning player's status is 'active' (not 'eliminated' or stale)
+                            # This prevents the bug where survivors=1 but active_count=0 triggers rollover
+                            if pick.player.status != 'active':
+                                logger.info(
+                                    f"  WINNER STATUS FIX: {pick.player.name} was '{pick.player.status}', "
+                                    f"setting to 'active'"
+                                )
+                                pick.player.status = 'active'
                             winners_count += 1
                             winning_players.append(f"{pick.player.name}(id={pick.player.id}, pick={pick.team_picked})")
 
@@ -861,11 +869,27 @@ class LMSScheduler:
         logger.info("=== GAME STATE EVALUATION START ===")
         logger.info(f"Evaluating after Round {completed_round.round_number} (cycle={completed_round.cycle_number})")
 
-        # Count active players GLOBALLY (not per-round)
+        # Count players by status GLOBALLY (not per-round) - AUTHORITATIVE COUNTS
         active_players = Player.query.filter_by(status='active').all()
         active_count = len(active_players)
+        eliminated_count = Player.query.filter_by(status='eliminated').count()
+        winner_count = Player.query.filter_by(status='winner').count()
 
-        logger.info(f"Active players globally: {active_count}")
+        # Determine outcome based on active_count
+        if active_count == 1:
+            outcome = 'winner'
+        elif active_count == 0:
+            outcome = 'rollover'
+        else:
+            outcome = 'continue'
+
+        # AUTHORITATIVE LOG - single source of truth for debugging
+        logger.info(
+            "GAME STATE EVAL: round_id=%s cycle=%s round=%s active_count=%s "
+            "eliminated_count=%s winner_count=%s outcome=%s",
+            completed_round.id, completed_round.cycle_number, completed_round.round_number,
+            active_count, eliminated_count, winner_count, outcome
+        )
 
         # ==================== WINNER CHECK ====================
         # EXACTLY 1 player remains active

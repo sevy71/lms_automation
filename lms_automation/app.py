@@ -1228,6 +1228,27 @@ def manual_process_results():
         }), 500
 
 
+@app.route('/api/admin/round-readiness/<int:round_id>', methods=['GET'])
+@admin_required
+def get_round_readiness(round_id):
+    """
+    Check if a round is ready to be finalized based on relevant fixtures.
+
+    This endpoint allows the admin UI to check readiness before attempting
+    to finalize. It returns detailed information about which fixtures are
+    pending and which teams they affect.
+
+    Returns JSON with:
+        - ready: bool - True if round can be finalized
+        - picked_teams: list of distinct teams picked this round
+        - relevant_fixtures: list of fixtures that involve picked teams
+        - pending_relevant: list of relevant fixtures still pending
+        - message: human-readable status message
+    """
+    readiness = check_round_readiness(round_id)
+    return jsonify(readiness)
+
+
 @app.route('/api/admin/finalize-round', methods=['POST'])
 @admin_required
 def finalize_round():
@@ -1304,21 +1325,7 @@ def finalize_round():
                 'error': 'Round has no fixtures'
             }), 400
 
-        # GUARD 2: Check all fixtures have scores (completed)
-        incomplete = [f for f in fixtures if f.home_score is None or f.away_score is None]
-        if incomplete:
-            logger.warning("FINALIZE ROUND BLOCKED: %d fixtures missing scores", len(incomplete))
-            return jsonify({
-                'success': False,
-                'error': f'{len(incomplete)} fixtures missing scores - enter all scores via Manual Entry first'
-            }), 400
-
-        # Mark all fixtures as completed if they have scores
-        for fx in fixtures:
-            if fx.status != 'completed':
-                fx.status = 'completed'
-
-        # GUARD 3: Check picks exist
+        # GUARD 2: Check picks exist (needed for readiness check)
         picks = Pick.query.filter_by(round_id=round_id).all()
         if not picks:
             logger.warning("FINALIZE ROUND BLOCKED: No picks in round %s", round_id)
@@ -1326,6 +1333,31 @@ def finalize_round():
                 'success': False,
                 'error': 'Round has no picks'
             }), 400
+
+        # GUARD 3: Check RELEVANT fixtures readiness (not all fixtures)
+        # This allows finalizing before the full matchday is complete
+        readiness = check_round_readiness(round_id)
+        if not readiness['ready']:
+            logger.warning(
+                "FINALIZE ROUND BLOCKED: Relevant fixtures not ready. round_id=%s message=%s",
+                round_id, readiness['message']
+            )
+            return jsonify({
+                'success': False,
+                'error': readiness['message'],
+                'readiness_details': {
+                    'picked_teams': readiness['picked_teams'],
+                    'relevant_fixtures_count': len(readiness['relevant_fixtures']),
+                    'pending_relevant': readiness['pending_relevant']
+                }
+            }), 400
+
+        # Mark RELEVANT fixtures as completed if they have scores
+        # (Non-relevant fixtures may still be pending, but that's OK)
+        for fx in fixtures:
+            if fx.home_score is not None and fx.away_score is not None:
+                if fx.status != 'completed':
+                    fx.status = 'completed'
 
         # Idempotency check: results_sent marker
         already_finalized = has_marker(round_obj, 'results_sent')
@@ -1337,9 +1369,14 @@ def finalize_round():
         # Import team normalization
         from lms_automation.team_utils import normalize_team_name
 
-        # Build fixture outcome map
+        # Build fixture outcome map (only from fixtures with scores)
+        # Non-relevant fixtures may not have scores yet, and that's OK
         fixture_outcomes = {}
         for fx in fixtures:
+            # Skip fixtures without scores (non-relevant or incomplete)
+            if fx.home_score is None or fx.away_score is None:
+                continue
+
             home_norm = normalize_team_name(fx.home_team)
             away_norm = normalize_team_name(fx.away_team)
 
@@ -1366,6 +1403,12 @@ def finalize_round():
 
             if is_winner:
                 pick.is_eliminated = False
+                # CRITICAL: Ensure winning player's status is 'active' (not 'eliminated' or stale)
+                # This prevents the bug where survivors=1 but active_count=0 triggers rollover
+                if pick.player.status != 'active':
+                    logger.info("WINNER STATUS FIX: %s was '%s', setting to 'active'",
+                                pick.player.name, pick.player.status)
+                    pick.player.status = 'active'
                 survivors.append({
                     'player_id': pick.player_id,
                     'player_name': pick.player.name,
@@ -1869,6 +1912,168 @@ def _auto_create_rollover_round(next_cycle: int, previous_matchday: int = None) 
         }
 
 
+def check_round_readiness(round_id):
+    """
+    Check if a round is ready to be finalized based on RELEVANT fixtures only.
+
+    Definition of "relevant fixtures":
+    - Fixtures whose home_team OR away_team matches ANY team picked in that round.
+    - A round is ready when ALL relevant fixtures are completed with scores.
+
+    This allows finalizing a round before all PL matchday fixtures are done,
+    as long as the fixtures that matter for LMS eliminations are complete.
+
+    Args:
+        round_id: The ID of the round to check
+
+    Returns:
+        dict with:
+            - ready: bool - True if round can be finalized
+            - picked_teams: list of distinct teams picked this round
+            - relevant_fixtures: list of fixtures that involve picked teams
+            - pending_relevant: list of relevant fixtures still pending
+            - message: human-readable status message
+
+    IMPORTANT: This function is idempotent and read-only.
+    """
+    import logging
+    from lms_automation.team_utils import normalize_team_name
+
+    logger = logging.getLogger(__name__)
+
+    round_obj = Round.query.get(round_id)
+    if not round_obj:
+        return {
+            'ready': False,
+            'picked_teams': [],
+            'relevant_fixtures': [],
+            'pending_relevant': [],
+            'message': f'Round {round_id} not found'
+        }
+
+    # Get all picks for this round
+    picks = Pick.query.filter_by(round_id=round_id).all()
+    if not picks:
+        logger.info(
+            "ROUND READY CHECK: round_id=%s picked_teams=0 relevant_fixtures=0 "
+            "pending_relevant=0 ready=false (no picks)",
+            round_id
+        )
+        return {
+            'ready': False,
+            'picked_teams': [],
+            'relevant_fixtures': [],
+            'pending_relevant': [],
+            'message': 'No picks in round - cannot finalize'
+        }
+
+    # Get distinct teams picked (normalized) - ignore NULL/empty picks
+    picked_teams_normalized = set()
+    for pick in picks:
+        if pick.team_picked:
+            picked_teams_normalized.add(normalize_team_name(pick.team_picked))
+
+    if not picked_teams_normalized:
+        logger.info(
+            "ROUND READY CHECK: round_id=%s picked_teams=0 relevant_fixtures=0 "
+            "pending_relevant=0 ready=false (no valid teams picked)",
+            round_id
+        )
+        return {
+            'ready': False,
+            'picked_teams': [],
+            'relevant_fixtures': [],
+            'pending_relevant': [],
+            'message': 'No valid teams picked in round'
+        }
+
+    # Get all fixtures for this round
+    fixtures = Fixture.query.filter_by(round_id=round_id).all()
+    if not fixtures:
+        logger.info(
+            "ROUND READY CHECK: round_id=%s picked_teams=%s relevant_fixtures=0 "
+            "pending_relevant=0 ready=false (no fixtures)",
+            round_id, len(picked_teams_normalized)
+        )
+        return {
+            'ready': False,
+            'picked_teams': list(picked_teams_normalized),
+            'relevant_fixtures': [],
+            'pending_relevant': [],
+            'message': 'No fixtures in round'
+        }
+
+    # Find relevant fixtures (those involving picked teams)
+    relevant_fixtures = []
+    for fx in fixtures:
+        home_norm = normalize_team_name(fx.home_team)
+        away_norm = normalize_team_name(fx.away_team)
+        if home_norm in picked_teams_normalized or away_norm in picked_teams_normalized:
+            relevant_fixtures.append(fx)
+
+    # Find pending relevant fixtures (not completed OR missing scores)
+    # Treat POSTPONED/SCHEDULED as not ready
+    pending_relevant = []
+    for fx in relevant_fixtures:
+        is_completed = (
+            fx.status == 'completed' and
+            fx.home_score is not None and
+            fx.away_score is not None
+        )
+        if not is_completed:
+            pending_relevant.append({
+                'fixture_id': fx.id,
+                'home_team': fx.home_team,
+                'away_team': fx.away_team,
+                'status': fx.status,
+                'has_scores': fx.home_score is not None and fx.away_score is not None
+            })
+
+    ready = len(pending_relevant) == 0 and len(relevant_fixtures) > 0
+
+    # AUTHORITATIVE LOG
+    logger.info(
+        "ROUND READY CHECK: round_id=%s picked_teams=%s relevant_fixtures=%s "
+        "pending_relevant=%s ready=%s",
+        round_id, len(picked_teams_normalized), len(relevant_fixtures),
+        len(pending_relevant), ready
+    )
+
+    if ready:
+        message = f'Round ready: all {len(relevant_fixtures)} relevant fixtures completed'
+    else:
+        if len(relevant_fixtures) == 0:
+            message = f'No fixtures involve the {len(picked_teams_normalized)} picked teams'
+        else:
+            pending_teams = set()
+            for pf in pending_relevant:
+                pending_teams.add(pf['home_team'])
+                pending_teams.add(pf['away_team'])
+            pending_teams_in_picks = pending_teams & picked_teams_normalized
+            message = (
+                f'{len(pending_relevant)} relevant fixture(s) still pending. '
+                f'Waiting for: {", ".join(sorted(pending_teams_in_picks)) if pending_teams_in_picks else "fixtures to complete"}'
+            )
+
+    return {
+        'ready': ready,
+        'picked_teams': list(picked_teams_normalized),
+        'relevant_fixtures': [
+            {
+                'fixture_id': fx.id,
+                'home_team': fx.home_team,
+                'away_team': fx.away_team,
+                'status': fx.status,
+                'home_score': fx.home_score,
+                'away_score': fx.away_score
+            }
+            for fx in relevant_fixtures
+        ],
+        'pending_relevant': pending_relevant,
+        'message': message
+    }
+
+
 def _evaluate_game_state_after_round_standalone(completed_round) -> str:
     """
     Standalone version of centralized game state evaluation for use in app.py.
@@ -1903,11 +2108,27 @@ def _evaluate_game_state_after_round_standalone(completed_round) -> str:
     logger.info("=== GAME STATE EVALUATION START (manual API) ===")
     logger.info(f"Evaluating after Round {completed_round.round_number} (cycle={completed_round.cycle_number})")
 
-    # Count active players GLOBALLY (not per-round)
+    # Count players by status GLOBALLY (not per-round) - AUTHORITATIVE COUNTS
     active_players = Player.query.filter_by(status='active').all()
     active_count = len(active_players)
+    eliminated_count = Player.query.filter_by(status='eliminated').count()
+    winner_count = Player.query.filter_by(status='winner').count()
 
-    logger.info(f"Active players globally: {active_count}")
+    # Determine outcome based on active_count
+    if active_count == 1:
+        outcome = 'winner'
+    elif active_count == 0:
+        outcome = 'rollover'
+    else:
+        outcome = 'continue'
+
+    # AUTHORITATIVE LOG - single source of truth for debugging
+    logger.info(
+        "GAME STATE EVAL: round_id=%s cycle=%s round=%s active_count=%s "
+        "eliminated_count=%s winner_count=%s outcome=%s",
+        completed_round.id, completed_round.cycle_number, completed_round.round_number,
+        active_count, eliminated_count, winner_count, outcome
+    )
 
     # Helper to add marker
     def add_marker(round_obj, marker):
