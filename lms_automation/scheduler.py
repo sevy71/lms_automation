@@ -9,7 +9,7 @@ States:
 -------
 - pending      : Round created, awaiting fixtures/tokens/activation
 - active       : Round accepting picks; players can submit/edit picks
-- picks_locked : All picks in OR deadline passed + autopick applied; no more edits
+- picks_locked : deadline_passed AND (all picks in OR autopick applied); no more edits
                  (tracked via special_note containing 'picks_locked')
 - completed    : All fixtures finished AND eliminations processed
 
@@ -17,7 +17,8 @@ PHASE MARKERS (in special_note):
 --------------------------------
 - tokens_generated : All eligible players have tokens for this round
 - announced        : Initial "round is live" announcement attempted for all eligible players
-- picks_locked     : All picks are in (manual or auto); no more edits allowed
+- picks_locked     : Deadline passed AND all picks are in (manual or auto); no more edits allowed
+- admin_locked     : Admin triggered manual lock (bypasses deadline check)
 - picks_published  : "Picks locked" notification sent
 - results_sent     : Round results notification sent
 
@@ -32,9 +33,10 @@ active -> announced:
   BY: send_new_round_announcements job (marks 'announced' after attempting all)
 
 announced -> picks_locked:
-  WHEN: (picks_count == eligible_count) OR (deadline_passed AND autopick_applied)
+  WHEN: (deadline_passed OR admin_locked) AND (picks_count >= eligible_count OR autopick_applied)
   BY: check_all_picks_submitted OR apply_missed_picks
   GUARD: MUST have 'announced' marker (or SKIP_ANNOUNCEMENT_GATE=true)
+  GUARD: MUST have deadline_passed OR admin_locked (prevents early lock!)
 
 picks_locked -> completed:
   WHEN: ALL of:
@@ -53,9 +55,12 @@ CRITICAL INVARIANTS:
 2. NEVER mark round completed if picks_count < eligible_count AND deadline not passed
 3. NEVER mark round completed if any fixture is still scheduled/live/postponed
 4. is_winner=False MUST always mean is_eliminated=True (enforced by invariant job)
+   GUARD: Invariant job only enforces for completed rounds with fixture scores!
 5. Auto-picks MUST be applied before eliminations if deadline has passed
 6. NEVER allow picks_locked without tokens_generated (unless SKIP_ANNOUNCEMENT_GATE)
 7. NEVER allow picks_locked without announced marker (unless SKIP_ANNOUNCEMENT_GATE)
+8. NEVER allow picks_locked without deadline_passed (unless admin_locked)
+9. NEVER eliminate players via invariant job if round not completed/finalized
 
 IDEMPOTENCY RULES:
 ------------------
@@ -64,6 +69,7 @@ IDEMPOTENCY RULES:
 - apply_missed_picks: Only insert if no pick exists for (player_id, round_id)
 - process_eliminations: Only set is_eliminated=True if is_winner=False AND not already eliminated
 - check_all_picks_submitted: Only send notification once (check special_note)
+- enforce_global_elimination_invariant: Only enforces for completed rounds with scores
 - Notifications: All use special_note markers to prevent duplicate sends
 """
 
@@ -304,7 +310,6 @@ class LMSScheduler:
                 if not api:
                     logger.warning("Football API unavailable, skipping fixture updates")
                     return
-                season = os.environ.get('FOOTBALL_SEASON') or os.environ.get('SEASON')
 
                 # Get active rounds
                 active_rounds = Round.query.filter_by(status='active').all()
@@ -318,9 +323,11 @@ class LMSScheduler:
                     if not round_obj.pl_matchday:
                         continue
 
+                    # Use round's api_season_year for the API call
+                    season_param = str(round_obj.get_api_season_year()) if round_obj.get_api_season_year() else None
                     api_data = api.get_premier_league_fixtures(
                         matchday=round_obj.pl_matchday,
-                        season=season
+                        season=season_param
                     )
 
                     if api_data and 'matches' in api_data:
@@ -374,7 +381,6 @@ class LMSScheduler:
                 api = self._get_api()
                 if not api:
                     return
-                season = os.environ.get('FOOTBALL_SEASON') or os.environ.get('SEASON')
 
                 rounds = Round.query.filter(Round.status.in_(['pending', 'active'])).all()
                 created = 0
@@ -386,9 +392,11 @@ class LMSScheduler:
                         skipped += 1
                         continue
 
+                    # Use round's api_season_year for the API call
+                    season_param = str(round_obj.get_api_season_year()) if round_obj.get_api_season_year() else None
                     fixtures_data = api.get_premier_league_fixtures(
                         matchday=round_obj.pl_matchday,
-                        season=season
+                        season=season_param
                     )
                     formatted = api.format_fixtures_for_db(fixtures_data, round_obj.pl_matchday)
                     if not formatted:
@@ -1117,10 +1125,11 @@ class LMSScheduler:
                 logger.warning("ROLLOVER: Football API unavailable")
                 return 0
 
-            season = os.environ.get('FOOTBALL_SEASON') or os.environ.get('SEASON')
+            # Use round's api_season_year for the API call
+            season_param = str(round_obj.get_api_season_year()) if round_obj.get_api_season_year() else None
             fixtures_data = api.get_premier_league_fixtures(
                 matchday=round_obj.pl_matchday,
-                season=season
+                season=season_param
             )
             formatted = api.format_fixtures_for_db(fixtures_data, round_obj.pl_matchday)
 
@@ -1387,11 +1396,20 @@ class LMSScheduler:
 
         Invariant: is_winner=False MUST mean is_eliminated=True
 
+        CRITICAL GUARDS (to prevent premature elimination):
+        - Only enforce for rounds where status='completed' OR special_note contains 'results_sent'
+        - Only enforce if fixtures_completed > 0 AND at least one fixture has scores
+        - Unresolved picks (is_winner=False, is_eliminated=False) are ALLOWED while fixtures
+          are still in progress - this is the normal state before results come in.
+
         This catches any historical violations that might have slipped through,
         ensuring data integrity across the entire database.
         """
         with self.app.app_context():
             try:
+                logger.info("=" * 60)
+                logger.info("=== GLOBAL ELIMINATION INVARIANT CHECK START ===")
+
                 # Find ALL picks that violate the invariant (across all rounds)
                 violating_picks = Pick.query.filter_by(
                     is_winner=False,
@@ -1399,44 +1417,111 @@ class LMSScheduler:
                 ).all()
 
                 if not violating_picks:
-                    logger.debug("Global elimination invariant check: OK (0 violations)")
+                    logger.info("Global elimination invariant check: OK (0 potential violations)")
+                    logger.info("=== GLOBAL ELIMINATION INVARIANT CHECK COMPLETE ===")
+                    logger.info("=" * 60)
                     return
 
-                # LOUDLY log the violation
-                logger.error("=" * 60)
-                logger.error("!!! GLOBAL ELIMINATION INVARIANT VIOLATION DETECTED !!!")
-                logger.error(f"Found {len(violating_picks)} picks with is_winner=False AND is_eliminated=False")
-                logger.error("Auto-correcting now...")
-                logger.error("=" * 60)
-
-                # Auto-correct each violation
-                corrected_count = 0
+                # Group picks by round for evaluation
+                picks_by_round = {}
                 for pick in violating_picks:
-                    player = pick.player
-                    round_obj = pick.round
+                    round_id = pick.round_id
+                    if round_id not in picks_by_round:
+                        picks_by_round[round_id] = []
+                    picks_by_round[round_id].append(pick)
 
-                    logger.error(
-                        f"  AUTO-CORRECTING: pick_id={pick.id}, round={round_obj.round_number}, "
-                        f"player='{player.name}' (id={player.id}), team='{pick.team_picked}' "
-                        f"-> setting is_eliminated=True, player.status='eliminated'"
+                logger.info(f"Found {len(violating_picks)} picks with is_winner=False AND is_eliminated=False "
+                           f"across {len(picks_by_round)} round(s)")
+
+                corrected_count = 0
+                skipped_count = 0
+
+                for round_id, round_picks in picks_by_round.items():
+                    round_obj = Round.query.get(round_id)
+                    if not round_obj:
+                        logger.warning(f"  Round {round_id}: not found, skipping {len(round_picks)} picks")
+                        skipped_count += len(round_picks)
+                        continue
+
+                    # Get fixture status for this round
+                    fixtures = Fixture.query.filter_by(round_id=round_id).all()
+                    fixtures_total = len(fixtures)
+                    fixtures_completed = len([f for f in fixtures if f.status == 'completed'])
+                    scores_present = any(
+                        f.home_score is not None and f.away_score is not None
+                        for f in fixtures
                     )
 
-                    # Fix the pick
-                    pick.is_eliminated = True
+                    # Check if round is finalized (safe to enforce invariant)
+                    round_completed = round_obj.status == 'completed'
+                    results_sent = self._has_marker(round_obj, 'results_sent')
 
-                    # Fix the player status
-                    if player.status != 'eliminated':
-                        player.status = 'eliminated'
+                    # Log decision inputs for visibility
+                    logger.info(
+                        f"  Round {round_obj.round_number} (id={round_id}): "
+                        f"round.status='{round_obj.status}', results_sent={results_sent}, "
+                        f"fixtures_total={fixtures_total}, fixtures_completed={fixtures_completed}, "
+                        f"scores_present={scores_present}, potential_violations={len(round_picks)}"
+                    )
 
-                    corrected_count += 1
+                    # GUARD 1: Only enforce if round is completed OR results have been sent
+                    if not round_completed and not results_sent:
+                        logger.info(
+                            f"  GUARD SKIP: Round {round_obj.round_number} not finalized "
+                            f"(status='{round_obj.status}', results_sent={results_sent}). "
+                            f"Skipping {len(round_picks)} picks - they may still be pending results."
+                        )
+                        skipped_count += len(round_picks)
+                        continue
+
+                    # GUARD 2: Only enforce if fixtures have actually been played (scores exist)
+                    if fixtures_completed == 0 or not scores_present:
+                        logger.info(
+                            f"  GUARD SKIP: Round {round_obj.round_number} has no completed fixtures with scores "
+                            f"(fixtures_completed={fixtures_completed}, scores_present={scores_present}). "
+                            f"Skipping {len(round_picks)} picks."
+                        )
+                        skipped_count += len(round_picks)
+                        continue
+
+                    # All guards passed - these are genuine violations in a completed round
+                    logger.warning(
+                        f"  VIOLATION CONFIRMED: Round {round_obj.round_number} is finalized but has "
+                        f"{len(round_picks)} picks with is_winner=False AND is_eliminated=False"
+                    )
+
+                    for pick in round_picks:
+                        player = pick.player
+
+                        logger.warning(
+                            f"    AUTO-CORRECTING: pick_id={pick.id}, round={round_obj.round_number}, "
+                            f"player='{player.name}' (id={player.id}), team='{pick.team_picked}' "
+                            f"-> setting is_eliminated=True, player.status='eliminated'"
+                        )
+
+                        # Fix the pick
+                        pick.is_eliminated = True
+
+                        # Fix the player status
+                        if player.status != 'eliminated':
+                            player.status = 'eliminated'
+
+                        corrected_count += 1
 
                 db.session.commit()
 
-                logger.error(f"Global invariant enforcement: Auto-corrected {corrected_count} violations")
-                logger.error("=" * 60)
+                logger.info("-" * 40)
+                logger.info(
+                    f"Global invariant enforcement summary: "
+                    f"corrected={corrected_count}, skipped={skipped_count} (pending rounds)"
+                )
+                logger.info("=== GLOBAL ELIMINATION INVARIANT CHECK COMPLETE ===")
+                logger.info("=" * 60)
 
             except Exception as e:
                 logger.error(f"Error in global invariant enforcement: {e}")
+                import traceback
+                logger.error(f"Traceback:\n{traceback.format_exc()}")
                 db.session.rollback()
 
     def send_due_reminders(self):
@@ -1987,17 +2072,19 @@ class LMSScheduler:
         """
         Check if all eligible players have submitted picks for active rounds.
 
-        When all picks are submitted:
+        When all picks are submitted AND deadline has passed:
         1. Mark the round as "picks_locked" in special_note (prevents further edits)
         2. Publish picks so everyone can see who picked what
+
+        CRITICAL GUARD: Picks should ONLY lock when:
+        - deadline_passed == True (kickoff - 1 hour has passed), OR
+        - Admin has triggered manual lock (special_note contains 'admin_locked')
 
         PHASE GUARD: Requires 'tokens_generated' marker before allowing picks_locked.
         This ensures tokens were created (prerequisite for announcements).
 
         IMPORTANT: This job does NOT complete rounds. It only marks them as picks_locked.
         Round completion is handled by process_eliminations after fixtures complete.
-
-        This enables early visibility when players are eager to see picks.
         """
         with self.app.app_context():
             try:
@@ -2007,29 +2094,61 @@ class LMSScheduler:
                 # Check if announcement gate is disabled (emergency bypass)
                 skip_announcement_gate = os.environ.get('SKIP_ANNOUNCEMENT_GATE', 'false').lower() == 'true'
 
+                now = datetime.utcnow()
+
                 active_rounds = Round.query.filter_by(status='active').all()
 
                 for round_obj in active_rounds:
                     # Log phase status for debugging
                     phase_status = self._get_phase_status(round_obj)
-                    logger.info(
-                        f"Round {round_obj.round_number} (id={round_obj.id}): phase={phase_status}"
-                    )
 
                     # Get eligible players for this round
                     eligible_players = self._get_eligible_players_for_round(round_obj)
                     eligible_count = len(eligible_players)
 
-                    if eligible_count == 0:
-                        logger.info(f"Round {round_obj.round_number}: No eligible players, skipping")
-                        continue
-
                     # Count picks submitted for this round
                     picks_count = Pick.query.filter_by(round_id=round_obj.id).count()
 
+                    # Determine deadline status
+                    kickoff = round_obj.first_kickoff_at
+                    kickoff_source = "first_kickoff_at field"
+
+                    if not kickoff:
+                        # Fallback: calculate from fixtures
+                        fixtures = Fixture.query.filter_by(round_id=round_obj.id).all()
+                        for fixture in fixtures:
+                            if fixture.date and fixture.time:
+                                dt = datetime.combine(fixture.date, fixture.time)
+                                if kickoff is None or dt < kickoff:
+                                    kickoff = dt
+                        kickoff_source = "calculated from fixtures"
+
+                    # Ensure kickoff is naive UTC for comparison
+                    if kickoff and kickoff.tzinfo is not None:
+                        kickoff = kickoff.replace(tzinfo=None)
+
+                    deadline = kickoff - timedelta(hours=1) if kickoff else None
+                    deadline_passed = deadline and now >= deadline
+
+                    # Check for admin manual lock
+                    admin_locked = self._has_marker(round_obj, 'admin_locked')
+
+                    # Already locked check
+                    already_locked = self._has_marker(round_obj, 'picks_locked')
+
+                    # Log comprehensive decision inputs (Task C logging)
                     logger.info(
-                        f"Round {round_obj.round_number}: picks={picks_count}/{eligible_count} eligible"
+                        f"Round {round_obj.round_number} (id={round_obj.id}): "
+                        f"phase={phase_status}, picks={picks_count}/{eligible_count}, "
+                        f"now_utc={now.strftime('%Y-%m-%d %H:%M')}, "
+                        f"deadline_utc={deadline.strftime('%Y-%m-%d %H:%M') if deadline else 'None'}, "
+                        f"deadline_passed={deadline_passed}, admin_locked={admin_locked}, "
+                        f"already_locked={already_locked}"
                     )
+
+                    if eligible_count == 0:
+                        logger.info(f"  -> No eligible players, skipping")
+                        continue
 
                     # Check if all eligible players have picks
                     if picks_count >= eligible_count:
@@ -2037,27 +2156,41 @@ class LMSScheduler:
                         # This ensures the proper flow: tokens -> announcements -> picks
                         if not skip_announcement_gate and not self._has_marker(round_obj, 'tokens_generated'):
                             logger.warning(
-                                f"Round {round_obj.round_number}: GUARD BLOCK - Cannot mark picks_locked "
+                                f"  -> GUARD BLOCK: Cannot mark picks_locked "
                                 f"without 'tokens_generated' marker. Waiting for token generation."
                             )
                             continue
 
-                        # All picks are in! Mark as locked and notify
+                        # CRITICAL GUARD: Only lock picks if deadline has passed OR admin triggered lock
+                        if not deadline_passed and not admin_locked:
+                            logger.info(
+                                f"  -> GUARD SKIP: All {picks_count} picks submitted but deadline NOT passed. "
+                                f"Picks will lock when deadline passes (or admin triggers manual lock). "
+                                f"Time until deadline: {deadline - now if deadline else 'N/A'}"
+                            )
+                            continue
+
+                        # All conditions met - mark as locked and notify
 
                         # Mark as picks_locked (idempotent - check if already set)
-                        if not self._has_marker(round_obj, 'picks_locked'):
+                        if not already_locked:
                             self._add_marker(round_obj, 'picks_locked')
+                            lock_reason = "deadline_passed" if deadline_passed else "admin_locked"
                             logger.info(
-                                f"Round {round_obj.round_number}: ALL PICKS SUBMITTED! "
-                                f"({picks_count}/{eligible_count}) - marked as PICKS_LOCKED"
+                                f"  -> PICKS LOCKED! ({picks_count}/{eligible_count}) "
+                                f"reason={lock_reason}"
                             )
                         else:
                             logger.debug(
-                                f"Round {round_obj.round_number}: Already marked as picks_locked"
+                                f"  -> Already marked as picks_locked"
                             )
 
                         # Send notification that picks are now visible (idempotent)
                         self._send_picks_published_notification(round_obj)
+                    else:
+                        logger.info(
+                            f"  -> Waiting for more picks ({picks_count}/{eligible_count})"
+                        )
 
                 db.session.commit()
                 logger.info("=== ALL PICKS CHECK JOB COMPLETE ===")
@@ -2065,6 +2198,8 @@ class LMSScheduler:
 
             except Exception as e:
                 logger.error(f"Error checking all picks: {e}")
+                import traceback
+                logger.error(f"Traceback:\n{traceback.format_exc()}")
                 db.session.rollback()
 
     def _send_picks_published_notification(self, round_obj):
