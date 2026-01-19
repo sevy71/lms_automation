@@ -184,6 +184,15 @@ def _ensure_minimum_schema():
                     rounds_missing.append((
                         'cycle_number', 'INTEGER NULL'
                     ))
+                # Season tracking columns (season locked per game feature)
+                if 'season_id' not in round_cols:
+                    rounds_missing.append((
+                        'season_id', 'VARCHAR(10) NULL'
+                    ))
+                if 'api_season_year' not in round_cols:
+                    rounds_missing.append((
+                        'api_season_year', 'INTEGER NULL'
+                    ))
                 for name, type_sql in rounds_missing:
                     try:
                         db.session.execute(text(f'ALTER TABLE rounds ADD COLUMN {name} {type_sql};'))
@@ -541,9 +550,13 @@ def get_picks_grid_data():
                 'picks': player_picks
             })
 
+        # Build round_status map: { round_number: status }
+        round_status = {r.round_number: r.status for r in rounds}
+
         return jsonify({
             'success': True,
             'rounds': [r.round_number for r in rounds],
+            'round_status': round_status,
             'players': players_data,
             'current_cycle': current_cycle,
             'available_cycles': available_cycles
@@ -978,7 +991,6 @@ def manual_process_results():
                 from lms_automation.team_utils import normalize_team_name
 
                 api = FootballDataAPI()
-                season = os.environ.get('FOOTBALL_SEASON') or os.environ.get('SEASON')
 
                 # Get rounds to update
                 if specific_round_id:
@@ -990,9 +1002,11 @@ def manual_process_results():
                     if not round_obj.pl_matchday:
                         continue
 
+                    # Use round's api_season_year for the API call
+                    season_param = str(round_obj.get_api_season_year()) if round_obj.get_api_season_year() else None
                     api_data = api.get_premier_league_fixtures(
                         matchday=round_obj.pl_matchday,
-                        season=season
+                        season=season_param
                     )
 
                     if api_data and 'matches' in api_data:
@@ -1580,10 +1594,27 @@ def start_new_game():
             else:
                 pl_matchday = 1
 
-        logger.info(f"Creating new game: Cycle {next_cycle}, Round 1, Matchday {pl_matchday}")
+        # ✅ NEW GAME: Use DEFAULT season or allow override from request
+        # (Unlike rollover, new game after winner uses current season defaults)
+        from lms_automation.models import get_default_season_id, get_default_api_season_year
+        season_id = data.get('season_id') or get_default_season_id()
+        api_season_year = data.get('api_season_year')
+        if api_season_year is not None:
+            api_season_year = int(api_season_year)
+        else:
+            api_season_year = get_default_api_season_year()
 
-        # Create the round using the helper function
-        result = _auto_create_rollover_round(next_cycle, pl_matchday - 1 if pl_matchday > 1 else 38)
+        logger.info(f"Creating new game: Cycle {next_cycle}, Round 1, Matchday {pl_matchday}, Season {season_id}, API Year {api_season_year}")
+
+        # Create the round using the helper function with explicit season values
+        # NOTE: We pass override_* to ensure new game uses defaults, NOT inherit from previous cycle
+        result = _auto_create_rollover_round(
+            next_cycle,
+            pl_matchday - 1 if pl_matchday > 1 else 38,
+            inherit_season_from_cycle=None,  # Don't inherit - this is a NEW game
+            override_season_id=season_id,
+            override_api_season_year=api_season_year
+        )
 
         # Override matchday if specifically requested
         if requested_matchday and result.get('success'):
@@ -1602,6 +1633,8 @@ def start_new_game():
                 'round_number': 1,
                 'round_id': result.get('round_id'),
                 'pl_matchday': result.get('pl_matchday', pl_matchday),
+                'season_id': result.get('season_id', season_id),
+                'api_season_year': result.get('api_season_year', api_season_year),
                 'fixtures_added': result.get('fixtures_added', 0),
                 'announcement': result.get('announcement', {}),
                 'message': f'Started Cycle {next_cycle} Round 1!'
@@ -1614,6 +1647,132 @@ def start_new_game():
 
     except Exception as e:
         current_app.logger.exception("start-new-game failed")
+        db.session.rollback()
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@app.route('/api/admin/set-cycle-api-season', methods=['POST'])
+@admin_required
+def set_cycle_api_season():
+    """
+    Admin endpoint to change the api_season_year for a cycle (spillover handling).
+
+    When a game (cycle) spills into the next PL season, this endpoint allows
+    updating the api_season_year for FUTURE rounds in the same cycle without
+    rewriting historical rounds.
+
+    Request body:
+        - cycle_number: int (required) - The cycle to update
+        - api_season_year: int (required) - The new API season year (e.g., 2026)
+
+    Behavior:
+        - Updates api_season_year for all pending/active rounds in the specified cycle
+        - Does NOT modify completed rounds (preserves history)
+        - Future rounds created in this cycle will inherit the new api_season_year
+
+    Returns JSON with:
+        - success: bool
+        - cycle_number: The cycle that was updated
+        - api_season_year: The new API season year
+        - rounds_updated: Number of rounds updated
+        - error: Error message (if success=False)
+    """
+    import logging
+    logger = logging.getLogger(__name__)
+
+    logger.info("=" * 60)
+    logger.info("=== SET CYCLE API SEASON ENDPOINT ===")
+    logger.info("=" * 60)
+
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({
+                'success': False,
+                'error': 'Request body is required'
+            }), 400
+
+        cycle_number = data.get('cycle_number')
+        api_season_year = data.get('api_season_year')
+
+        if cycle_number is None:
+            return jsonify({
+                'success': False,
+                'error': 'cycle_number is required'
+            }), 400
+
+        if api_season_year is None:
+            return jsonify({
+                'success': False,
+                'error': 'api_season_year is required'
+            }), 400
+
+        try:
+            cycle_number = int(cycle_number)
+            api_season_year = int(api_season_year)
+        except ValueError:
+            return jsonify({
+                'success': False,
+                'error': 'cycle_number and api_season_year must be integers'
+            }), 400
+
+        # Validate api_season_year is reasonable (between 2020 and 2050)
+        if api_season_year < 2020 or api_season_year > 2050:
+            return jsonify({
+                'success': False,
+                'error': 'api_season_year must be between 2020 and 2050'
+            }), 400
+
+        # Find rounds in the specified cycle that are NOT completed
+        rounds_to_update = Round.query.filter(
+            Round.cycle_number == cycle_number,
+            Round.status.in_(['pending', 'active'])
+        ).all()
+
+        if not rounds_to_update:
+            # Check if the cycle exists at all
+            cycle_exists = Round.query.filter_by(cycle_number=cycle_number).first()
+            if not cycle_exists:
+                return jsonify({
+                    'success': False,
+                    'error': f'Cycle {cycle_number} does not exist'
+                }), 404
+
+            return jsonify({
+                'success': True,
+                'cycle_number': cycle_number,
+                'api_season_year': api_season_year,
+                'rounds_updated': 0,
+                'message': f'No pending/active rounds in Cycle {cycle_number} to update. '
+                           f'Future rounds in this cycle will use api_season_year={api_season_year}.'
+            })
+
+        # Update the rounds
+        updated_count = 0
+        for round_obj in rounds_to_update:
+            old_year = round_obj.api_season_year
+            round_obj.api_season_year = api_season_year
+            logger.info(f"Updated Round {round_obj.id} (Cycle {cycle_number} R{round_obj.round_number}): "
+                       f"api_season_year {old_year} -> {api_season_year}")
+            updated_count += 1
+
+        db.session.commit()
+
+        logger.info(f"Successfully updated {updated_count} rounds in Cycle {cycle_number} to api_season_year={api_season_year}")
+
+        return jsonify({
+            'success': True,
+            'cycle_number': cycle_number,
+            'api_season_year': api_season_year,
+            'rounds_updated': updated_count,
+            'message': f'Updated {updated_count} pending/active round(s) in Cycle {cycle_number} to use api_season_year={api_season_year}'
+        })
+
+    except Exception as e:
+        current_app.logger.exception("set-cycle-api-season failed")
         db.session.rollback()
         return jsonify({
             'success': False,
@@ -1678,52 +1837,72 @@ def get_game_state():
                 last_round_outcome = 'continue'
 
         # Compute next round defaults using cycle-scoped queries
+        # Also include season_id and api_season_year for display and creation
+        from lms_automation.models import get_default_season_id, get_default_api_season_year
+
         next_round_defaults = {}
         defaults_reason = 'unknown'
 
+        # Get current season info from the current/latest round in this cycle
+        current_season_id = None
+        current_api_season_year = None
+        if current_round:
+            current_season_id = current_round.get_season_id()
+            current_api_season_year = current_round.get_api_season_year()
+        elif last_completed_round:
+            current_season_id = last_completed_round.get_season_id()
+            current_api_season_year = last_completed_round.get_api_season_year()
+        else:
+            current_season_id = get_default_season_id()
+            current_api_season_year = get_default_api_season_year()
+
         if game_ended:
-            # After winner: suggest next cycle round 1
+            # After winner: suggest next cycle round 1 with DEFAULT season
+            # (New game starts fresh, not inheriting from previous game)
             next_round_defaults = {
                 'cycle_number': (last_completed_round.cycle_number or 1) + 1,
                 'round_number': 1,
                 'pl_matchday': ((last_completed_round.pl_matchday or 0) % 38) + 1,
+                'season_id': get_default_season_id(),
+                'api_season_year': get_default_api_season_year(),
                 'suggestion': 'start_new_game'
             }
             defaults_reason = 'winner'
         elif last_round_outcome == 'rollover':
             # After rollover: system auto-created cycle+1 round 1
-            # Query to find the actual max round in the new cycle
+            # Inherits season from previous cycle (same competition)
             rollover_cycle = current_cycle
             max_round_in_cycle = db.session.query(db.func.max(Round.round_number)).filter(
                 Round.cycle_number == rollover_cycle
             ).scalar() or 0
 
-            # Suggest the next round after the auto-created one
             next_round_defaults = {
                 'cycle_number': rollover_cycle,
                 'round_number': max_round_in_cycle + 1,
                 'pl_matchday': ((current_round.pl_matchday if current_round else 0) % 38) + 1,
+                'season_id': current_season_id,
+                'api_season_year': current_api_season_year,
                 'suggestion': 'continue'
             }
             defaults_reason = 'rollover'
         elif last_completed_round and last_round_outcome == 'continue':
-            # Normal continuation: query max round_number in current cycle
+            # Normal continuation: inherit season from current cycle
             max_round_in_cycle = db.session.query(db.func.max(Round.round_number)).filter(
                 Round.cycle_number == current_cycle
             ).scalar() or 0
-
-            # Get the last round's matchday for computing next matchday
             last_matchday = last_completed_round.pl_matchday or 0
 
             next_round_defaults = {
                 'cycle_number': current_cycle,
                 'round_number': max_round_in_cycle + 1,
                 'pl_matchday': ((last_matchday) % 38) + 1,
+                'season_id': current_season_id,
+                'api_season_year': current_api_season_year,
                 'suggestion': 'continue'
             }
             defaults_reason = 'continuation'
         elif current_round:
-            # There's an active/pending round: suggest the next one after it
+            # There's an active/pending round: inherit season from it
             max_round_in_cycle = db.session.query(db.func.max(Round.round_number)).filter(
                 Round.cycle_number == current_cycle
             ).scalar() or 0
@@ -1732,15 +1911,19 @@ def get_game_state():
                 'cycle_number': current_cycle,
                 'round_number': max_round_in_cycle + 1,
                 'pl_matchday': ((current_round.pl_matchday or 0) % 38) + 1,
+                'season_id': current_season_id,
+                'api_season_year': current_api_season_year,
                 'suggestion': 'continue'
             }
             defaults_reason = 'active_round_exists'
         else:
-            # No rounds at all: suggest starting fresh
+            # No rounds at all: suggest starting fresh with defaults
             next_round_defaults = {
                 'cycle_number': current_cycle,
                 'round_number': 1,
                 'pl_matchday': 1,
+                'season_id': get_default_season_id(),
+                'api_season_year': get_default_api_season_year(),
                 'suggestion': 'create_first_round'
             }
             defaults_reason = 'no_rounds'
@@ -1751,11 +1934,15 @@ def get_game_state():
         return jsonify({
             'success': True,
             'current_cycle': current_cycle,
+            'season_id': current_season_id,
+            'api_season_year': current_api_season_year,
             'current_round': {
                 'id': current_round.id,
                 'round_number': current_round.round_number,
                 'status': current_round.status,
-                'pl_matchday': current_round.pl_matchday
+                'pl_matchday': current_round.pl_matchday,
+                'season_id': current_round.get_season_id(),
+                'api_season_year': current_round.get_api_season_year()
             } if current_round else None,
             'active_players': active_count,
             'eliminated_players': eliminated_count,
@@ -1779,21 +1966,32 @@ def get_game_state():
         }), 500
 
 
-def _auto_create_rollover_round(next_cycle: int, previous_matchday: int = None) -> dict:
+def _auto_create_rollover_round(
+    next_cycle: int,
+    previous_matchday: int = None,
+    inherit_season_from_cycle: int = None,
+    override_season_id: str = None,
+    override_api_season_year: int = None
+) -> dict:
     """
-    Auto-create a new round for rollover (Cycle N, Round 1).
+    Auto-create a new round for rollover or new game (Cycle N, Round 1).
 
-    This is called after a ROLLOVER when all players are eliminated.
-    Creates a new cycle's round 1, loads fixtures, generates tokens, and announces.
+    This is called after:
+    - ROLLOVER: All players eliminated -> new cycle inherits season from previous
+    - START NEW GAME: Winner declared -> new cycle uses default season (or overrides)
 
     Args:
         next_cycle: The new cycle number to create
         previous_matchday: The PL matchday from the previous round (used to determine next matchday)
+        inherit_season_from_cycle: The cycle number to inherit season from (for rollover)
+        override_season_id: Explicit season_id to use (for start new game)
+        override_api_season_year: Explicit api_season_year to use (for start new game)
 
     Returns:
         dict: {success: bool, round_id: int, fixtures_added: int, announcement: dict, error: str}
     """
     import logging
+    from lms_automation.models import get_default_season_id, get_default_api_season_year
     logger = logging.getLogger(__name__)
 
     logger.info(f"_auto_create_rollover_round: Creating Cycle {next_cycle} Round 1")
@@ -1831,20 +2029,48 @@ def _auto_create_rollover_round(next_cycle: int, previous_matchday: int = None) 
 
         logger.info(f"Using PL Matchday {pl_matchday} for rollover round")
 
-        # Create the new round
+        # ✅ Determine season_id and api_season_year
+        # Priority: explicit overrides > inherit from previous cycle > defaults
+        season_id = override_season_id
+        api_season_year = override_api_season_year
+
+        if season_id is None or api_season_year is None:
+            # Try to inherit from specified cycle (for rollover)
+            if inherit_season_from_cycle:
+                previous_cycle = inherit_season_from_cycle
+                prev_cycle_round = Round.query.filter_by(cycle_number=previous_cycle).order_by(Round.id.desc()).first()
+                if prev_cycle_round:
+                    if season_id is None:
+                        season_id = prev_cycle_round.get_season_id()
+                    if api_season_year is None:
+                        api_season_year = prev_cycle_round.get_api_season_year()
+                    logger.info(f"Inherited season from Cycle {previous_cycle}: season_id={season_id}, api_season_year={api_season_year}")
+
+        # Fallback to defaults if still not set
+        if not season_id:
+            season_id = get_default_season_id()
+        if not api_season_year:
+            api_season_year = get_default_api_season_year()
+        logger.info(f"Final season values: season_id={season_id}, api_season_year={api_season_year}")
+
+        # Create the new round with season fields
         new_round = Round(
             round_number=1,
             cycle_number=next_cycle,
             pl_matchday=pl_matchday,
-            status='active'  # Active immediately for rollover
+            status='active',  # Active immediately for rollover
+            season_id=season_id,
+            api_season_year=api_season_year
         )
         db.session.add(new_round)
         db.session.flush()  # Get the ID
 
-        # Fetch and populate fixtures
+        # Fetch and populate fixtures using the round's api_season_year
         from lms_automation.football_api import FootballDataAPI
         api = FootballDataAPI()
-        fixtures_data = api.get_premier_league_fixtures(pl_matchday)
+        season_param = str(new_round.get_api_season_year()) if new_round.get_api_season_year() else None
+        logger.info(f"Fetching fixtures for matchday {pl_matchday}, season={season_param}")
+        fixtures_data = api.get_premier_league_fixtures(pl_matchday, season=season_param)
         formatted_fixtures = api.format_fixtures_for_db(fixtures_data, pl_matchday)
 
         fixtures_added = 0
@@ -1897,6 +2123,8 @@ def _auto_create_rollover_round(next_cycle: int, previous_matchday: int = None) 
             'cycle_number': next_cycle,
             'round_number': 1,
             'pl_matchday': pl_matchday,
+            'season_id': new_round.get_season_id(),
+            'api_season_year': new_round.get_api_season_year(),
             'fixtures_added': fixtures_added,
             'announcement': announcement_result
         }
@@ -2291,8 +2519,13 @@ def _evaluate_game_state_after_round_standalone(completed_round) -> str:
         db.session.commit()
 
         # AUTO-CREATE next cycle round 1 (even in MANUAL_MODE - this is a rollover)
+        # IMPORTANT: Rollover inherits season from previous cycle (same season competition continues)
         logger.info(f"Auto-creating Cycle {next_cycle} Round 1...")
-        rollover_result = _auto_create_rollover_round(next_cycle, completed_round.pl_matchday)
+        rollover_result = _auto_create_rollover_round(
+            next_cycle,
+            completed_round.pl_matchday,
+            inherit_season_from_cycle=completed_round.cycle_number or 1
+        )
         if rollover_result.get('success'):
             logger.info(f"Rollover round created: id={rollover_result.get('round_id')}, fixtures={rollover_result.get('fixtures_added')}")
         else:
@@ -2806,9 +3039,11 @@ def handle_rounds():
         return jsonify([{
             'id': r.id,
             'round_number': r.round_number,
-            'cycle_number': r.cycle_number,  # ✅ NEW
+            'cycle_number': r.cycle_number,
             'status': r.status,
-            'pl_matchday': r.pl_matchday,    # ✅ nice to include too
+            'pl_matchday': r.pl_matchday,
+            'season_id': r.get_season_id(),
+            'api_season_year': r.get_api_season_year(),
             'start_date': r.start_date.isoformat() if r.start_date else None,
             'end_date': r.end_date.isoformat() if r.end_date else None,
             'first_kickoff_at': r.first_kickoff_at.isoformat() if r.first_kickoff_at else None,
@@ -2875,24 +3110,58 @@ def handle_rounds():
             if start_date and end_date and start_date >= end_date:
                 return jsonify({'success': False, 'error': 'End date must be after start date'}), 400
 
-            # ✅ Create new round (cycle_number now set)
+            # ✅ Determine season_id and api_season_year
+            # Priority: request override > inherit from existing round in cycle > defaults
+            from lms_automation.models import get_default_season_id, get_default_api_season_year
+
+            season_id = data.get('season_id')
+            api_season_year = data.get('api_season_year')
+
+            if season_id is None or api_season_year is None:
+                # Try to inherit from existing round in this cycle
+                existing_cycle_round = Round.query.filter_by(cycle_number=cycle_number).order_by(Round.id.desc()).first()
+                if existing_cycle_round:
+                    # Inherit from existing round in this cycle
+                    if season_id is None:
+                        season_id = existing_cycle_round.get_season_id()
+                    if api_season_year is None:
+                        api_season_year = existing_cycle_round.get_api_season_year()
+                    app.logger.info(f"  Inherited season from cycle {cycle_number}: season_id={season_id}, api_season_year={api_season_year}")
+                else:
+                    # New cycle - use defaults
+                    if season_id is None:
+                        season_id = get_default_season_id()
+                    if api_season_year is None:
+                        api_season_year = get_default_api_season_year()
+                    app.logger.info(f"  Using default season: season_id={season_id}, api_season_year={api_season_year}")
+
+            # Ensure api_season_year is an integer
+            if api_season_year is not None:
+                api_season_year = int(api_season_year)
+
+            # ✅ Create new round (cycle_number and season fields now set)
             new_round = Round(
                 round_number=round_number,
                 cycle_number=cycle_number,
                 pl_matchday=pl_matchday,
                 start_date=start_date,
                 end_date=end_date,
-                status=data.get('status', 'pending')
+                status=data.get('status', 'pending'),
+                season_id=season_id,
+                api_season_year=api_season_year
             )
 
             db.session.add(new_round)
             db.session.flush()  # Get the ID before committing
 
-            # Fetch and populate fixtures
+            # Fetch and populate fixtures using round's api_season_year
             try:
                 from lms_automation.football_api import FootballDataAPI
                 api = FootballDataAPI()
-                fixtures_data = api.get_premier_league_fixtures(pl_matchday)
+                # Use the round's api_season_year for API call
+                season_param = str(new_round.get_api_season_year()) if new_round.get_api_season_year() else None
+                app.logger.info(f"  Fetching fixtures for matchday {pl_matchday}, season={season_param}")
+                fixtures_data = api.get_premier_league_fixtures(pl_matchday, season=season_param)
                 formatted_fixtures = api.format_fixtures_for_db(fixtures_data, pl_matchday)
 
                 if formatted_fixtures:
@@ -2937,6 +3206,8 @@ def handle_rounds():
                         'round_number': new_round.round_number,
                         'cycle_number': new_round.cycle_number,
                         'pl_matchday': new_round.pl_matchday,
+                        'season_id': new_round.get_season_id(),
+                        'api_season_year': new_round.get_api_season_year(),
                         'fixtures_added': len(formatted_fixtures),
                         'announcement': announcement_result
                     })
@@ -2993,10 +3264,13 @@ def get_available_matchdays():
         # Optional: Try to get real data from API if available
         try:
             from lms_automation.football_api import FootballDataAPI
+            from lms_automation.models import get_default_api_season_year
             api = FootballDataAPI()
             print("Attempting to get real matchday data from API...")
-            
-            fixtures_data = api.get_premier_league_fixtures(season='2025')
+
+            # Use default api_season_year (from env or computed from date)
+            default_season = get_default_api_season_year()
+            fixtures_data = api.get_premier_league_fixtures(season=str(default_season))
             if fixtures_data and fixtures_data.get('matches'):
                 print(f"Got {len(fixtures_data['matches'])} matches from API")
                 
@@ -3056,10 +3330,13 @@ def get_matchday_info(matchday):
         # Try to get real API data to enhance the info
         try:
             from lms_automation.football_api import FootballDataAPI
+            from lms_automation.models import get_default_api_season_year
             api = FootballDataAPI()
             print(f"Attempting to get real data for matchday {matchday}")
-            
-            fixtures_data = api.get_premier_league_fixtures(matchday=matchday, season='2025')
+
+            # Use default api_season_year (from env or computed from date)
+            default_season = get_default_api_season_year()
+            fixtures_data = api.get_premier_league_fixtures(matchday=matchday, season=str(default_season))
             matches = fixtures_data.get('matches', [])
             
             if matches:
@@ -3207,11 +3484,12 @@ def add_fixtures_to_round(round_id):
         if existing_fixtures > 0:
             return jsonify({'success': False, 'error': f'Round already has {existing_fixtures} fixtures'}), 400
         
-        # Try to get fixtures from API
+        # Try to get fixtures from API using round's api_season_year
         try:
             from lms_automation.football_api import FootballDataAPI
             api = FootballDataAPI()
-            fixtures_data = api.get_premier_league_fixtures(round_obj.pl_matchday)
+            season_param = str(round_obj.get_api_season_year()) if round_obj.get_api_season_year() else None
+            fixtures_data = api.get_premier_league_fixtures(round_obj.pl_matchday, season=season_param)
             formatted_fixtures = api.format_fixtures_for_db(fixtures_data, round_obj.pl_matchday)
             
             if formatted_fixtures:
@@ -3364,11 +3642,12 @@ def auto_populate_results(round_id):
         if not fixtures:
             return jsonify({'success': False, 'error': 'No fixtures found for this round'}), 400
         
-        # Get updated results from API
+        # Get updated results from API using round's api_season_year
         from lms_automation.football_api import FootballDataAPI
         api = FootballDataAPI()
-        fixtures_data = api.get_premier_league_fixtures(round_obj.pl_matchday)
-        
+        season_param = str(round_obj.get_api_season_year()) if round_obj.get_api_season_year() else None
+        fixtures_data = api.get_premier_league_fixtures(round_obj.pl_matchday, season=season_param)
+
         if not fixtures_data or not fixtures_data.get('matches'):
             return jsonify({'success': False, 'error': 'Unable to fetch results from football API'}), 500
         

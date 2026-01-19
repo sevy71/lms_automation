@@ -450,6 +450,7 @@ let currentRoundNumber = null;
 let showAllMobileRounds = false; // player view compaction toggle
 let currentCycle = null; // currently selected cycle
 let availableCycles = []; // list of all cycles
+let roundStatusMap = {}; // { round_number: status } e.g. { 1: "completed", 2: "active" }
 
 document.addEventListener('DOMContentLoaded', function() {
     const gridContainer = document.getElementById('grid-container');
@@ -474,6 +475,7 @@ document.addEventListener('DOMContentLoaded', function() {
                     gridData = data;
                     currentCycle = data.current_cycle;
                     availableCycles = data.available_cycles || [1];
+                    roundStatusMap = data.round_status || {};
 
                     // Populate cycle selector (only once or when cycles change)
                     if (cycleSelect && cycleSelect.options.length !== availableCycles.length) {
@@ -916,20 +918,24 @@ document.addEventListener('DOMContentLoaded', function() {
 
         const team = pickData.team;
         const isWinner = pickData.is_winner;
-        
+        const isEliminated = pickData.is_eliminated;
+        const roundStatus = roundStatusMap[roundNumber] || 'pending';
+        const roundCompleted = roundStatus === 'completed';
+
         let displayClass = 'pick-pending';
         let statusText = '? Pending';
-        
+
         if (isWinner === true) {
             displayClass = 'pick-winner';
             statusText = '✓ Won';
-        } else if (isWinner === false) {
+        } else if (isEliminated === true || (roundCompleted && isWinner === false)) {
+            // Only show as loser if explicitly eliminated OR round is completed and not a winner
             displayClass = 'pick-loser';
             statusText = '✗ Lost';
         }
-        
+
         const teamAbbrev = getTeamAbbreviation(team);
-        
+
         return {
             display: teamAbbrev,
             class: displayClass,
