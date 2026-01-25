@@ -25,26 +25,22 @@ def ensure_season_columns():
 
     This is a safety net in case Alembic migrations don't run properly.
     """
+    logger.info("=== CHECKING SEASON COLUMNS ===")
     with app.app_context():
         try:
-            # Check if columns exist by trying to query them
-            db.session.execute(text("SELECT season_id, api_season_year FROM rounds LIMIT 1"))
-            logger.info("Season tracking columns already exist")
+            # First, just try to add the columns - IF NOT EXISTS handles duplicates
+            logger.info("Attempting to add season columns (IF NOT EXISTS)...")
+            db.session.execute(text(
+                "ALTER TABLE rounds ADD COLUMN IF NOT EXISTS season_id VARCHAR(10)"
+            ))
+            db.session.execute(text(
+                "ALTER TABLE rounds ADD COLUMN IF NOT EXISTS api_season_year INTEGER"
+            ))
+            db.session.commit()
+            logger.info("=== SEASON COLUMNS ENSURED ===")
         except Exception as e:
-            logger.warning(f"Season columns missing, adding them: {e}")
-            try:
-                # Add columns if they don't exist (PostgreSQL syntax)
-                db.session.execute(text(
-                    "ALTER TABLE rounds ADD COLUMN IF NOT EXISTS season_id VARCHAR(10)"
-                ))
-                db.session.execute(text(
-                    "ALTER TABLE rounds ADD COLUMN IF NOT EXISTS api_season_year INTEGER"
-                ))
-                db.session.commit()
-                logger.info("Season tracking columns added successfully")
-            except Exception as add_err:
-                logger.error(f"Failed to add season columns: {add_err}")
-                db.session.rollback()
+            logger.error(f"=== FAILED TO ENSURE SEASON COLUMNS: {e} ===")
+            db.session.rollback()
 
 
 def main():
