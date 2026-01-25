@@ -58,8 +58,16 @@ else:
 print(f"Database URI set to: {app.config['SQLALCHEMY_DATABASE_URI']}")
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
-# Import models and db
-from lms_automation.extensions import db
+# Import extensions first to get engine options
+from lms_automation.extensions import db, get_engine_options, wait_for_db
+
+# Apply connection pool settings for PostgreSQL resilience
+# This ensures the app survives brief Postgres restarts on Railway
+app.config['SQLALCHEMY_ENGINE_OPTIONS'] = get_engine_options()
+if app.config['SQLALCHEMY_ENGINE_OPTIONS']:
+    print(f"Applying connection pool settings: {app.config['SQLALCHEMY_ENGINE_OPTIONS']}")
+
+# Import models and db (db already imported above)
 from lms_automation.models import Player, Round, Fixture, Pick, PickToken, ReminderSchedule
 from lms_automation.telegram_service import telegram_service
 from lms_automation.eligibility import get_eligible_players_for_round
@@ -68,9 +76,14 @@ from lms_automation.eligibility import get_eligible_players_for_round
 # Initialize db with app
 db.init_app(app)
 
-with app.app_context():
+# Initialize Flask-Migrate (doesn't require DB connection)
+migrate = Migrate(app, db)
 
-    migrate = Migrate(app, db)
+# Verify database connection with retry logic at startup
+# This prevents crash loops if Postgres is briefly unavailable during Railway restarts
+_db_ready = wait_for_db(app, max_retries=5, base_delay=2)
+if not _db_ready:
+    print("WARNING: Could not establish initial database connection. App will retry on first request.")
 
 # --- Game policy configuration ---
 # Postponement policy thresholds (minutes)

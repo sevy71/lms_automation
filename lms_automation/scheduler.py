@@ -113,6 +113,20 @@ class LMSScheduler:
             logger.error("Football API unavailable: %s", e)
             return None
 
+    def _ensure_db_session(self):
+        """
+        Ensure db session is healthy before job execution.
+
+        Called at the start of scheduler jobs to handle stale connections.
+        The pool_pre_ping setting handles most cases, but this provides
+        an extra safety net for long-running operations.
+        """
+        try:
+            # Remove any stale session state from previous job runs
+            db.session.remove()
+        except Exception as e:
+            logger.warning(f"Error cleaning up DB session: {e}")
+
     def start(self):
         """Start the scheduler with all jobs.
 
@@ -396,6 +410,7 @@ class LMSScheduler:
         - Continues polling if any fixtures remain incomplete
         """
         with self.app.app_context():
+            self._ensure_db_session()  # Clean up stale connections
             try:
                 logger.info("=== FIXTURE UPDATE JOB START ===")
                 api = self._get_api()
@@ -480,6 +495,7 @@ class LMSScheduler:
     def sync_fixtures(self):
         """Sync fixtures from Football API without changing round status"""
         with self.app.app_context():
+            self._ensure_db_session()  # Clean up stale connections
             try:
                 logger.info("Syncing fixtures from Football API...")
                 api = self._get_api()
@@ -683,6 +699,7 @@ class LMSScheduler:
         7. Checks for winner/rollover conditions
         """
         with self.app.app_context():
+            self._ensure_db_session()  # Clean up stale connections
             try:
                 logger.info("=" * 60)
                 logger.info("=== ELIMINATION PROCESSING JOB START ===")
@@ -1510,6 +1527,7 @@ class LMSScheduler:
         ensuring data integrity across the entire database.
         """
         with self.app.app_context():
+            self._ensure_db_session()  # Clean up stale connections
             try:
                 logger.info("=" * 60)
                 logger.info("=== GLOBAL ELIMINATION INVARIANT CHECK START ===")
@@ -1637,6 +1655,7 @@ class LMSScheduler:
         - Never remind eliminated players
         """
         with self.app.app_context():
+            self._ensure_db_session()  # Clean up stale connections
             try:
                 logger.info("=== REMINDER JOB START ===")
 
@@ -1773,6 +1792,7 @@ class LMSScheduler:
         consistent behavior between scheduled and immediate announcements.
         """
         with self.app.app_context():
+            self._ensure_db_session()  # Clean up stale connections
             try:
                 logger.info("=" * 60)
                 logger.info("=== ROUND ANNOUNCEMENT JOB START ===")
@@ -1815,6 +1835,7 @@ class LMSScheduler:
         This marker is required before round activation and announcements.
         """
         with self.app.app_context():
+            self._ensure_db_session()  # Clean up stale connections
             try:
                 logger.info("=" * 60)
                 logger.info("=== TOKEN GENERATION JOB START ===")
@@ -1917,6 +1938,7 @@ class LMSScheduler:
         It only requires players.status='active' and no existing pick for the round.
         """
         with self.app.app_context():
+            self._ensure_db_session()  # Clean up stale connections
             try:
                 logger.info("=" * 60)
                 logger.info("=== AUTO-PICK JOB START ===")
@@ -2099,6 +2121,7 @@ class LMSScheduler:
         ensuring tokens exist for all eligible players before the round goes active.
         """
         with self.app.app_context():
+            self._ensure_db_session()  # Clean up stale connections
             try:
                 logger.info("=" * 60)
                 logger.info("=== ROUND ORCHESTRATOR JOB START ===")
@@ -2191,6 +2214,7 @@ class LMSScheduler:
         Round completion is handled by process_eliminations after fixtures complete.
         """
         with self.app.app_context():
+            self._ensure_db_session()  # Clean up stale connections
             try:
                 logger.info("=" * 60)
                 logger.info("=== ALL PICKS CHECK JOB START ===")
