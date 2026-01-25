@@ -1,8 +1,11 @@
+# Railway Nixpacks configuration
+providers = ["python"]
+
 [phases.setup]
-nixPkgs = ["python312"]
+nixPkgs = ["python312", "python312Packages.pip"]
 
 [phases.install]
-cmds = ["pip install -r requirements.txt"]
+cmds = ["python -m pip install -r requirements.txt"]
 
 [start]
 cmd = "python -m flask --app lms_automation.app:app db upgrade && python run_with_scheduler.py"
