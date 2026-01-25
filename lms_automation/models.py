@@ -21,7 +21,7 @@ class Player(db.Model):
 
 class Round(db.Model):
     __tablename__ = 'rounds'
-    
+
     id = db.Column(db.Integer, primary_key=True)
     round_number = db.Column(db.Integer, nullable=False)
     pl_matchday = db.Column(db.Integer, nullable=True)  # Premier League matchday (1-38)
@@ -32,12 +32,87 @@ class Round(db.Model):
     special_measure = db.Column(db.String(50), nullable=True)  # universal_bye, frozen, void, override
     special_note = db.Column(db.Text, nullable=True)
     cycle_number = db.Column(db.Integer, default=1)
-    
+
+    # Season tracking fields (for "season locked per game" feature)
+    # season_id: Human-readable season identifier (e.g., "2025/26") - locked per cycle/game
+    # api_season_year: Integer year for football-data API calls (e.g., 2025) - can be overridden for spillover
+    season_id = db.Column(db.String(10), nullable=True)  # e.g., "2025/26"
+    api_season_year = db.Column(db.Integer, nullable=True)  # e.g., 2025
+
     fixtures = db.relationship('Fixture', backref='round', lazy=True)
     picks = db.relationship('Pick', backref='round', lazy=True)
-    
+
     def __repr__(self):
         return f'<Round {self.round_number} (PL MD {self.pl_matchday})>'
+
+    def get_season_id(self):
+        """Get season_id, falling back to default if not set."""
+        if self.season_id:
+            return self.season_id
+        return get_default_season_id()
+
+    def get_api_season_year(self):
+        """Get api_season_year, falling back to default if not set."""
+        if self.api_season_year:
+            return self.api_season_year
+        return get_default_api_season_year()
+
+
+def get_default_season_id():
+    """
+    Get the default season_id from environment or compute from current date.
+
+    Environment variable: DEFAULT_SEASON_ID (e.g., "2025/26")
+    Fallback: Compute based on current date (Aug-Jul season boundary)
+    """
+    import os
+    from datetime import datetime
+
+    env_season = os.environ.get('DEFAULT_SEASON_ID')
+    if env_season:
+        return env_season
+
+    # Compute from current date: PL season runs Aug to May
+    # If we're in Aug-Dec, season is YYYY/YY+1; if Jan-Jul, season is YYYY-1/YY
+    now = datetime.utcnow()
+    year = now.year
+    month = now.month
+
+    if month >= 8:  # Aug onwards: new season starts
+        start_year = year
+    else:  # Jan-Jul: still in previous season
+        start_year = year - 1
+
+    end_year_short = (start_year + 1) % 100
+    return f"{start_year}/{end_year_short:02d}"
+
+
+def get_default_api_season_year():
+    """
+    Get the default api_season_year from environment or compute from current date.
+
+    Environment variable: DEFAULT_API_SEASON_YEAR (e.g., 2025)
+    Fallback: Compute based on current date (Aug-Jul season boundary)
+    """
+    import os
+    from datetime import datetime
+
+    env_year = os.environ.get('DEFAULT_API_SEASON_YEAR')
+    if env_year:
+        try:
+            return int(env_year)
+        except ValueError:
+            pass
+
+    # Compute from current date
+    now = datetime.utcnow()
+    year = now.year
+    month = now.month
+
+    if month >= 8:  # Aug onwards: new season starts
+        return year
+    else:  # Jan-Jul: still in previous season
+        return year - 1
 
 class Fixture(db.Model):
     __tablename__ = 'fixtures'
