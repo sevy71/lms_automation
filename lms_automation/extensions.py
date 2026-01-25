@@ -28,13 +28,21 @@ def get_engine_options():
     if 'sqlite' in database_uri.lower() or not database_uri:
         return {}
 
-    # PostgreSQL (Railway) - use conservative pooling
+    # PostgreSQL (Railway) - minimal pooling for stability
+    # Railway free tier Postgres has limited connections (~20-25 max)
     return {
         'pool_pre_ping': True,       # Test connections before use
-        'pool_recycle': 300,         # Recycle connections every 5 minutes
-        'pool_size': 5,              # Conservative pool size
-        'max_overflow': 5,           # Allow 5 extra connections under load
+        'pool_recycle': 180,         # Recycle connections every 3 minutes
+        'pool_size': 2,              # Minimal pool size for stability
+        'max_overflow': 3,           # Allow 3 extra connections under load (5 total max)
         'pool_timeout': 30,          # Wait up to 30s for connection
+        'connect_args': {
+            'connect_timeout': 10,   # Fail fast if DB unreachable
+            'keepalives': 1,         # Enable TCP keepalives
+            'keepalives_idle': 30,   # Start keepalives after 30s idle
+            'keepalives_interval': 10,  # Keepalive every 10s
+            'keepalives_count': 5,   # Give up after 5 failed keepalives
+        }
     }
 
 
