@@ -301,8 +301,100 @@ class LMSScheduler:
             self.scheduler.shutdown()
             logger.info("Scheduler stopped")
 
+    def _get_fixture_update_window(self, round_obj):
+        """
+        Calculate the time window during which we should poll for fixture results.
+
+        Returns (window_start, window_end) tuple or (None, None) if no fixtures.
+
+        Logic:
+        - Games typically last ~2 hours
+        - Start polling 2 hours after the earliest kick-off (when first games might finish)
+        - Continue polling until 3 hours after the latest kick-off (buffer for delays)
+
+        Example: If fixtures kick off at 15:00, 17:30, and 20:00:
+        - Earliest kickoff: 15:00 → window_start = 17:00
+        - Latest kickoff: 20:00 → window_end = 23:00
+        - Update window: 17:00 to 23:00
+        """
+        fixtures = Fixture.query.filter_by(round_id=round_obj.id).all()
+        if not fixtures:
+            return None, None
+
+        kickoff_times = []
+        for fixture in fixtures:
+            if fixture.date and fixture.time:
+                dt = datetime.combine(fixture.date, fixture.time)
+                kickoff_times.append(dt)
+
+        if not kickoff_times:
+            return None, None
+
+        earliest_kickoff = min(kickoff_times)
+        latest_kickoff = max(kickoff_times)
+
+        # Start polling 2 hours after earliest kick-off (when first games should be finishing)
+        window_start = earliest_kickoff + timedelta(hours=2)
+        # Stop polling 3 hours after latest kick-off (buffer for delays, extra time, etc.)
+        window_end = latest_kickoff + timedelta(hours=3)
+
+        return window_start, window_end
+
+    def _is_within_update_window(self, round_obj, now=None):
+        """
+        Check if current time is within the fixture update window for a round.
+
+        Returns True if we should poll for results, False otherwise.
+        Also returns True if all fixtures are not yet completed (to catch stragglers).
+        """
+        if now is None:
+            now = datetime.utcnow()
+
+        # Ensure now is naive for comparison
+        if now.tzinfo is not None:
+            now = now.replace(tzinfo=None)
+
+        window_start, window_end = self._get_fixture_update_window(round_obj)
+
+        if window_start is None:
+            # No fixtures with kick-off times, fall back to always polling
+            logger.debug(f"Round {round_obj.round_number}: No kickoff times found, will poll")
+            return True
+
+        # Check if any fixtures are still incomplete - if so, keep polling regardless of window
+        incomplete_fixtures = Fixture.query.filter_by(round_id=round_obj.id).filter(
+            Fixture.status != 'completed'
+        ).count()
+
+        if incomplete_fixtures > 0 and now > window_start:
+            # We're past the start time and have incomplete fixtures, keep polling
+            logger.debug(
+                f"Round {round_obj.round_number}: {incomplete_fixtures} incomplete fixtures, "
+                f"continuing to poll (past window_start={window_start.strftime('%Y-%m-%d %H:%M')})"
+            )
+            return True
+
+        # Check if we're within the calculated window
+        in_window = window_start <= now <= window_end
+
+        if not in_window:
+            logger.debug(
+                f"Round {round_obj.round_number}: Outside update window "
+                f"({window_start.strftime('%Y-%m-%d %H:%M')} to {window_end.strftime('%Y-%m-%d %H:%M')}), "
+                f"current time: {now.strftime('%Y-%m-%d %H:%M')}"
+            )
+
+        return in_window
+
     def update_fixture_results(self):
-        """Poll Football API for fixture results and update database"""
+        """Poll Football API for fixture results and update database.
+
+        Uses smart scheduling based on fixture kick-off times:
+        - Only polls during the window when games are expected to finish
+        - Window starts 2 hours after earliest kick-off (when first games finish)
+        - Window ends 3 hours after latest kick-off (buffer for delays)
+        - Continues polling if any fixtures remain incomplete
+        """
         with self.app.app_context():
             try:
                 logger.info("=== FIXTURE UPDATE JOB START ===")
@@ -322,6 +414,18 @@ class LMSScheduler:
                 for round_obj in active_rounds:
                     if not round_obj.pl_matchday:
                         continue
+
+                    # Check if we're within the update window for this round
+                    if not self._is_within_update_window(round_obj):
+                        window_start, window_end = self._get_fixture_update_window(round_obj)
+                        if window_start:
+                            logger.info(
+                                f"Round {round_obj.round_number}: Skipping API poll - outside update window "
+                                f"({window_start.strftime('%Y-%m-%d %H:%M')} to {window_end.strftime('%Y-%m-%d %H:%M')})"
+                            )
+                        continue
+
+                    logger.info(f"Round {round_obj.round_number}: Within update window, polling API for results")
 
                     # Use round's api_season_year for the API call
                     season_param = str(round_obj.get_api_season_year()) if round_obj.get_api_season_year() else None
