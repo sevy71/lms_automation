@@ -133,12 +133,6 @@
                         </span>
                         {% endif %}
                     </div>
-                    <!-- Season Info (fetched via JS) -->
-                    <div class="col-12 mb-3" id="seasonInfoDisplay">
-                        <small class="text-muted">Season: <span id="currentSeasonId">Loading...</span></small>
-                        <br>
-                        <small class="text-muted">(API Year: <span id="currentApiSeasonYear">-</span>)</small>
-                    </div>
                     <div class="col-12 mb-3">
                         <h3 class="text-primary mb-0">{{ players|length }}</h3>
                         <small class="text-muted">Total Players</small>
@@ -164,12 +158,6 @@
                         {% endif %}
                     </div>
                     {% endif %}
-                    <!-- Advanced: API Season Override -->
-                    <div class="col-12 mt-3 pt-3 border-top">
-                        <button class="btn btn-outline-secondary btn-sm" data-bs-toggle="modal" data-bs-target="#apiSeasonOverrideModal">
-                            <i class="fas fa-cog"></i> API Season Override
-                        </button>
-                    </div>
                 </div>
             </div>
         </div>
