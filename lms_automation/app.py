@@ -44,20 +44,27 @@ def to_local(dt: datetime) -> datetime:
         return dt
 
 # --- Database configuration ---
-database_uri = os.environ.get('DATABASE_PUBLIC_URL') or os.environ.get('DATABASE_URL')
-if database_uri:
-    # SQLAlchemy prefers 'postgresql' over 'postgres'
-    app.config['SQLALCHEMY_DATABASE_URI'] = database_uri.replace('postgres://', 'postgresql://')
-    print("Using DATABASE_PUBLIC_URL" if os.environ.get('DATABASE_PUBLIC_URL') else "Using DATABASE_URL")
+database_uri = (os.environ.get("DATABASE_URL") or os.environ.get("DATABASE_PUBLIC_URL") or "").strip()
+
+if not database_uri:
+    # local dev fallback (relative path, not absolute)
+    database_uri = "sqlite:///../instance/lms.db"
+    db_source = "LOCAL_SQLITE"
 else:
-    app.config['SQLALCHEMY_DATABASE_URI'] = (
-        'sqlite:////Users/antoniosirignanonew/Projects/LMS2_telegram_experiment/instance/lms.db'
-    )
-    print("Using local SQLite database (absolute path).")
+    db_source = "DATABASE_URL" if os.environ.get("DATABASE_URL") else "DATABASE_PUBLIC_URL"
 
-print(f"Database URI set to: {app.config['SQLALCHEMY_DATABASE_URI']}")
-app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+# Guard: sometimes people paste "DATABASE_URL = postgresql://..."
+if database_uri.lower().startswith("database_url"):
+    database_uri = database_uri.split("=", 1)[1].strip()
 
+# SQLAlchemy prefers postgresql:// not postgres://
+database_uri = database_uri.replace("postgres://", "postgresql://", 1)
+
+app.config["SQLALCHEMY_DATABASE_URI"] = database_uri
+app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+
+print(f"[DB CONFIG] Source: {db_source}")
+print(f"[DB CONFIG] URI: {app.config['SQLALCHEMY_DATABASE_URI']}")
 # Import extensions first to get engine options
 from lms_automation.extensions import db, get_engine_options, wait_for_db
 
