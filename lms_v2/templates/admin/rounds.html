@@ -17,7 +17,13 @@
         <form method="POST" action="{{ url_for('admin.create_round') }}" class="row g-3">
             <div class="col-md-4">
                 <label class="form-label">PL Matchday (1-38)</label>
-                <input type="number" class="form-control" name="pl_matchday" min="1" max="38">
+                <select class="form-select" name="pl_matchday" id="matchdaySelect">
+                    <option value="">Select matchday...</option>
+                    {% for i in range(1, 39) %}
+                    <option value="{{ i }}">Matchday {{ i }}</option>
+                    {% endfor %}
+                </select>
+                <small class="text-muted" id="matchdayInfo">Select a matchday to see fixture dates</small>
             </div>
             <div class="col-md-4 d-flex align-items-end">
                 <button type="submit" class="btn btn-primary">Create Round</button>
@@ -86,4 +92,41 @@
         </table>
     </div>
 </div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+document.getElementById('matchdaySelect').addEventListener('change', function() {
+    const matchday = this.value;
+    const infoEl = document.getElementById('matchdayInfo');
+
+    if (!matchday) {
+        infoEl.textContent = 'Select a matchday to see fixture dates';
+        infoEl.className = 'text-muted';
+        return;
+    }
+
+    infoEl.textContent = 'Loading fixtures...';
+    infoEl.className = 'text-muted';
+
+    fetch(`{{ url_for('api.get_matchday_info') }}?matchday=${matchday}`)
+        .then(response => response.json())
+        .then(data => {
+            if (data.error) {
+                infoEl.textContent = data.error;
+                infoEl.className = 'text-danger';
+            } else if (data.fixtures === 0) {
+                infoEl.textContent = 'No fixtures found for this matchday';
+                infoEl.className = 'text-warning';
+            } else {
+                infoEl.innerHTML = `<strong>${data.fixtures} fixtures</strong>: ${data.date_range}`;
+                infoEl.className = 'text-success';
+            }
+        })
+        .catch(err => {
+            infoEl.textContent = 'Error loading fixture info';
+            infoEl.className = 'text-danger';
+        });
+});
+</script>
 {% endblock %}

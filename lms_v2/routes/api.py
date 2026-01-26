@@ -146,3 +146,46 @@ def get_pick_token_for_telegram(telegram_id):
         'round_number': active_round.round_number,
         'is_valid': token.is_valid
     })
+
+
+@api_bp.route('/matchday-info')
+@api_admin_required
+def get_matchday_info():
+    """Get fixture date range for a PL matchday."""
+    matchday = request.args.get('matchday', type=int)
+    if not matchday or matchday < 1 or matchday > 38:
+        return jsonify({'error': 'Invalid matchday'}), 400
+
+    from lms_v2.football_api import FootballAPI
+    api = FootballAPI()
+
+    if not api.is_configured:
+        return jsonify({'error': 'Football API not configured'})
+
+    fixtures = api.get_matchday_fixtures(matchday)
+    if not fixtures:
+        return jsonify({'fixtures': 0, 'date_range': 'No data'})
+
+    # Get date range
+    kickoffs = [f['kickoff'] for f in fixtures if f['kickoff']]
+    if not kickoffs:
+        return jsonify({
+            'fixtures': len(fixtures),
+            'date_range': 'Dates TBD'
+        })
+
+    first = min(kickoffs)
+    last = max(kickoffs)
+
+    # Format date range
+    if first.date() == last.date():
+        date_range = first.strftime('%a %d %b %Y')
+    else:
+        date_range = f"{first.strftime('%a %d %b')} - {last.strftime('%a %d %b %Y')}"
+
+    return jsonify({
+        'fixtures': len(fixtures),
+        'date_range': date_range,
+        'first_kickoff': first.isoformat(),
+        'last_kickoff': last.isoformat()
+    })
