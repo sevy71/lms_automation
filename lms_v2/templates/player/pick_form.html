@@ -1,0 +1,63 @@
+{% extends "base.html" %}
+
+{% block title %}Make Your Pick - LMS{% endblock %}
+
+{% block content %}
+<div class="row justify-content-center mt-4">
+    <div class="col-md-8">
+        <div class="card">
+            <div class="card-header">
+                <h5 class="mb-0">Make Your Pick - Round {{ round.round_number }}</h5>
+            </div>
+            <div class="card-body">
+                <p class="lead">Hi {{ player.name }}! Choose your team for this round.</p>
+
+                {% if fixtures %}
+                <div class="mb-4">
+                    <h6>This Round's Fixtures:</h6>
+                    <div class="row">
+                        {% for fixture in fixtures %}
+                        <div class="col-md-6 mb-2">
+                            <small class="text-muted">
+                                {{ fixture.home_team }} vs {{ fixture.away_team }}
+                                {% if fixture.kickoff %}
+                                <br>{{ fixture.kickoff.strftime('%a %d %b, %H:%M') }}
+                                {% endif %}
+                            </small>
+                        </div>
+                        {% endfor %}
+                    </div>
+                </div>
+                {% endif %}
+
+                <form method="POST" action="{{ url_for('player.submit_pick', token=token) }}">
+                    <div class="mb-3">
+                        <label class="form-label"><strong>Select Your Team:</strong></label>
+                        <div class="row">
+                            {% for team in available_teams %}
+                            <div class="col-md-4 mb-2">
+                                <div class="form-check">
+                                    <input class="form-check-input" type="radio" name="team"
+                                           id="team_{{ loop.index }}" value="{{ team }}" required>
+                                    <label class="form-check-label" for="team_{{ loop.index }}">
+                                        {{ team }}
+                                    </label>
+                                </div>
+                            </div>
+                            {% endfor %}
+                        </div>
+                    </div>
+
+                    {% if used_teams %}
+                    <div class="alert alert-warning">
+                        <small><strong>Already used this cycle:</strong> {{ used_teams|join(', ') }}</small>
+                    </div>
+                    {% endif %}
+
+                    <button type="submit" class="btn btn-primary btn-lg w-100">Submit Pick</button>
+                </form>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}

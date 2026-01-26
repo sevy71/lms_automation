@@ -1,0 +1,83 @@
+{% extends "base.html" %}
+
+{% block title %}Rounds - LMS Admin{% endblock %}
+
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-4">
+    <h2>Rounds</h2>
+    <a href="{{ url_for('admin.dashboard') }}" class="btn btn-outline-secondary">← Back</a>
+</div>
+
+<!-- Create Round Form -->
+<div class="card mb-4">
+    <div class="card-header">
+        <h5 class="mb-0">Create New Round</h5>
+    </div>
+    <div class="card-body">
+        <form method="POST" action="{{ url_for('admin.create_round') }}" class="row g-3">
+            <div class="col-md-4">
+                <label class="form-label">PL Matchday (1-38)</label>
+                <input type="number" class="form-control" name="pl_matchday" min="1" max="38">
+            </div>
+            <div class="col-md-4 d-flex align-items-end">
+                <button type="submit" class="btn btn-primary">Create Round</button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<!-- Rounds Table -->
+<div class="card">
+    <div class="card-header">
+        <h5 class="mb-0">All Rounds</h5>
+    </div>
+    <div class="card-body">
+        <table class="table table-hover">
+            <thead>
+                <tr>
+                    <th>Round</th>
+                    <th>Cycle</th>
+                    <th>PL Matchday</th>
+                    <th>Status</th>
+                    <th>First Kickoff</th>
+                    <th>Created</th>
+                    <th>Actions</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for round in rounds %}
+                <tr>
+                    <td>{{ round.round_number }}</td>
+                    <td>{{ round.cycle_number }}</td>
+                    <td>{{ round.pl_matchday or '-' }}</td>
+                    <td>
+                        <span class="badge bg-{{ 'success' if round.status == 'active' else 'secondary' if round.status == 'completed' else 'warning' }}">
+                            {{ round.status }}
+                        </span>
+                    </td>
+                    <td>{{ round.first_kickoff.strftime('%Y-%m-%d %H:%M') if round.first_kickoff else '-' }}</td>
+                    <td>{{ round.created_at.strftime('%Y-%m-%d') }}</td>
+                    <td>
+                        {% if round.status == 'pending' %}
+                        <form method="POST" action="{{ url_for('admin.activate_round', round_id=round.id) }}"
+                              onsubmit="return confirm('Activate Round {{ round.round_number }}? This will generate tokens and start automation.');"
+                              style="display:inline;">
+                            <button type="submit" class="btn btn-sm btn-success">Activate</button>
+                        </form>
+                        {% elif round.status == 'active' %}
+                        <span class="text-muted">Running</span>
+                        {% else %}
+                        <span class="text-muted">Complete</span>
+                        {% endif %}
+                    </td>
+                </tr>
+                {% else %}
+                <tr>
+                    <td colspan="7" class="text-muted">No rounds yet</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</div>
+{% endblock %}

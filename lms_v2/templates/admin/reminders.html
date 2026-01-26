@@ -1,0 +1,80 @@
+{% extends "base.html" %}
+
+{% block title %}Reminders - LMS Admin{% endblock %}
+
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-4">
+    <h2>Reminders</h2>
+    <a href="{{ url_for('admin.dashboard') }}" class="btn btn-outline-secondary">← Back</a>
+</div>
+
+<div class="row">
+    <div class="col-md-6">
+        <div class="card">
+            <div class="card-header">
+                <h5 class="mb-0">Pending ({{ pending|length }})</h5>
+            </div>
+            <div class="card-body">
+                <table class="table table-sm">
+                    <thead>
+                        <tr>
+                            <th>Player</th>
+                            <th>Round</th>
+                            <th>Type</th>
+                            <th>Scheduled</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for reminder in pending %}
+                        <tr>
+                            <td>{{ reminder.player.name }}</td>
+                            <td>R{{ reminder.round.round_number }}</td>
+                            <td>{{ reminder.reminder_type }}</td>
+                            <td>{{ reminder.scheduled_for.strftime('%m-%d %H:%M') }}</td>
+                        </tr>
+                        {% else %}
+                        <tr>
+                            <td colspan="4" class="text-muted">No pending reminders</td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <div class="col-md-6">
+        <div class="card">
+            <div class="card-header">
+                <h5 class="mb-0">Recently Sent</h5>
+            </div>
+            <div class="card-body">
+                <table class="table table-sm">
+                    <thead>
+                        <tr>
+                            <th>Player</th>
+                            <th>Round</th>
+                            <th>Type</th>
+                            <th>Sent</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for reminder in sent %}
+                        <tr>
+                            <td>{{ reminder.player.name }}</td>
+                            <td>R{{ reminder.round.round_number }}</td>
+                            <td>{{ reminder.reminder_type }}</td>
+                            <td>{{ reminder.sent_at.strftime('%m-%d %H:%M') }}</td>
+                        </tr>
+                        {% else %}
+                        <tr>
+                            <td colspan="4" class="text-muted">No sent reminders</td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}

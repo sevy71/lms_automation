@@ -1,0 +1,46 @@
+{% extends "base.html" %}
+
+{% block title %}LMS - Last Man Standing{% endblock %}
+
+{% block content %}
+<div class="row justify-content-center mt-5">
+    <div class="col-md-8 text-center">
+        <h1 class="display-4">⚽ Last Man Standing</h1>
+        <p class="lead">Premier League Prediction Game</p>
+        <hr class="my-4">
+        <p>Pick a team each round. If your team wins, you survive. If they lose or draw, you're out!</p>
+        <p>The last player standing wins the cycle.</p>
+        <div class="mt-4">
+            <a href="{{ url_for('player.register') }}" class="btn btn-primary btn-lg me-2">Register to Play</a>
+            <a href="{{ url_for('admin.login') }}" class="btn btn-outline-secondary btn-lg">Admin Login</a>
+        </div>
+    </div>
+</div>
+
+<div class="row mt-5">
+    <div class="col-md-4">
+        <div class="card">
+            <div class="card-body text-center">
+                <h5 class="card-title">📋 Rules</h5>
+                <p class="card-text">Pick one Premier League team each round. You can only use each team once per cycle.</p>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-4">
+        <div class="card">
+            <div class="card-body text-center">
+                <h5 class="card-title">⏰ Deadlines</h5>
+                <p class="card-text">Submit your pick before the first match kicks off. Late picks are auto-assigned.</p>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-4">
+        <div class="card">
+            <div class="card-body text-center">
+                <h5 class="card-title">🏆 Winning</h5>
+                <p class="card-text">Survive until you're the last one standing. Max 20 rounds per cycle.</p>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}

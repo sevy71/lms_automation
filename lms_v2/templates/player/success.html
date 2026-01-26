@@ -1,0 +1,19 @@
+{% extends "base.html" %}
+
+{% block title %}Pick Submitted - LMS{% endblock %}
+
+{% block content %}
+<div class="row justify-content-center mt-5">
+    <div class="col-md-6 text-center">
+        <div class="card">
+            <div class="card-body">
+                <h1 class="display-1 text-success">✓</h1>
+                <h3>Pick Submitted!</h3>
+                <p class="lead">Thanks {{ player.name }}!</p>
+                <p>You picked <strong>{{ team }}</strong> for Round {{ round.round_number }}.</p>
+                <p class="text-muted">Good luck!</p>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}

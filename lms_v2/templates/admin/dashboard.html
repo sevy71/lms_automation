@@ -1,0 +1,120 @@
+{% extends "base.html" %}
+
+{% block title %}Admin Dashboard - LMS{% endblock %}
+
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-4">
+    <h2>Dashboard</h2>
+    <div>
+        <a href="{{ url_for('admin.players') }}" class="btn btn-outline-primary me-2">Players</a>
+        <a href="{{ url_for('admin.rounds') }}" class="btn btn-outline-primary me-2">Rounds</a>
+        <a href="{{ url_for('admin.picks_grid') }}" class="btn btn-outline-primary me-2">Picks Grid</a>
+        <a href="{{ url_for('admin.reminders') }}" class="btn btn-outline-primary">Reminders</a>
+    </div>
+</div>
+
+<!-- Stats Cards -->
+<div class="row mb-4">
+    <div class="col-md-3">
+        <div class="card text-center">
+            <div class="card-body">
+                <h3 class="text-primary">{{ total_players }}</h3>
+                <p class="mb-0">Total Players</p>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-3">
+        <div class="card text-center">
+            <div class="card-body">
+                <h3 class="text-success">{{ active_players }}</h3>
+                <p class="mb-0">Active Players</p>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-3">
+        <div class="card text-center">
+            <div class="card-body">
+                <h3 class="text-danger">{{ eliminated_players }}</h3>
+                <p class="mb-0">Eliminated</p>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-3">
+        <div class="card text-center">
+            <div class="card-body">
+                <h3 class="text-warning">{{ picks_pending }}</h3>
+                <p class="mb-0">Picks Pending</p>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Active Round -->
+<div class="row mb-4">
+    <div class="col-12">
+        <div class="card">
+            <div class="card-header">
+                <h5 class="mb-0">Current Round</h5>
+            </div>
+            <div class="card-body">
+                {% if active_round %}
+                <div class="row">
+                    <div class="col-md-6">
+                        <p><strong>Round:</strong> {{ active_round.round_number }} (Cycle {{ active_round.cycle_number }})</p>
+                        <p><strong>PL Matchday:</strong> {{ active_round.pl_matchday or 'Not set' }}</p>
+                        <p><strong>Status:</strong> <span class="badge bg-success">{{ active_round.status }}</span></p>
+                    </div>
+                    <div class="col-md-6">
+                        <p><strong>Picks Submitted:</strong> {{ picks_submitted }} / {{ active_players }}</p>
+                        <p><strong>First Kickoff:</strong> {{ active_round.first_kickoff.strftime('%Y-%m-%d %H:%M') if active_round.first_kickoff else 'Not set' }}</p>
+                    </div>
+                </div>
+                {% else %}
+                <p class="text-muted mb-0">No active round. <a href="{{ url_for('admin.rounds') }}">Create one</a>.</p>
+                {% endif %}
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Recent Rounds -->
+<div class="row">
+    <div class="col-12">
+        <div class="card">
+            <div class="card-header">
+                <h5 class="mb-0">Recent Rounds</h5>
+            </div>
+            <div class="card-body">
+                <table class="table table-sm">
+                    <thead>
+                        <tr>
+                            <th>Round</th>
+                            <th>Cycle</th>
+                            <th>Matchday</th>
+                            <th>Status</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for round in recent_rounds %}
+                        <tr>
+                            <td>{{ round.round_number }}</td>
+                            <td>{{ round.cycle_number }}</td>
+                            <td>{{ round.pl_matchday or '-' }}</td>
+                            <td>
+                                <span class="badge bg-{{ 'success' if round.status == 'active' else 'secondary' if round.status == 'completed' else 'warning' }}">
+                                    {{ round.status }}
+                                </span>
+                            </td>
+                        </tr>
+                        {% else %}
+                        <tr>
+                            <td colspan="4" class="text-muted">No rounds yet</td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}

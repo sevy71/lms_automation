@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+
+{% block title %}Register - LMS{% endblock %}
+
+{% block content %}
+<div class="row justify-content-center mt-5">
+    <div class="col-md-6">
+        <div class="card">
+            <div class="card-header">
+                <h5 class="mb-0">Register to Play</h5>
+            </div>
+            <div class="card-body">
+                <form method="POST">
+                    <div class="mb-3">
+                        <label for="name" class="form-label">Your Name</label>
+                        <input type="text" class="form-control" id="name" name="name" required>
+                    </div>
+                    <div class="mb-3">
+                        <label for="telegram_id" class="form-label">Telegram ID (optional)</label>
+                        <input type="text" class="form-control" id="telegram_id" name="telegram_id"
+                               placeholder="For receiving reminders">
+                        <small class="text-muted">Message @userinfobot on Telegram to get your ID</small>
+                    </div>
+                    <button type="submit" class="btn btn-primary w-100">Register</button>
+                </form>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}

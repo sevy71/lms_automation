@@ -1,1 +1,1 @@
-web: python -m flask --app lms_automation.app:app db upgrade && python run_with_scheduler.py
+web: flask --app lms_v2.app:app db upgrade && python -m lms_v2.run
