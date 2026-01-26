@@ -31,7 +31,14 @@ def create_app():
     Migrate(app, db)
 
     # Wait for database with retry
-    wait_for_db(app)
+    if wait_for_db(app):
+        # Create tables if they don't exist
+        with app.app_context():
+            try:
+                db.create_all()
+                logger.info("Database tables created/verified")
+            except Exception as e:
+                logger.error(f"Error creating tables: {e}")
 
     # Register blueprints
     from lms_v2.routes.admin import admin_bp
