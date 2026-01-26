@@ -63,6 +63,21 @@ def create_app():
         except Exception as e:
             return jsonify({'status': 'unhealthy', 'database': str(e)}), 500
 
+    # Reset database (one-time use to fix schema mismatch)
+    @app.route('/reset-db/<secret>')
+    def reset_db(secret):
+        if secret != 'confirm-reset-2026':
+            return jsonify({'error': 'Invalid secret'}), 403
+        try:
+            db.drop_all()
+            db.create_all()
+            # Seed with test players
+            from lms_v2.seed import seed_players
+            seed_players()
+            return jsonify({'status': 'Database reset complete', 'message': 'All tables recreated with 20 test players'})
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
+
     return app
 
 
