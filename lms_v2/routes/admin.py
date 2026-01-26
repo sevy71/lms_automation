@@ -199,3 +199,58 @@ def reminders():
     pending = Reminder.query.filter(Reminder.sent_at.is_(None)).order_by(Reminder.scheduled_for).all()
     sent = Reminder.query.filter(Reminder.sent_at.isnot(None)).order_by(Reminder.sent_at.desc()).limit(50).all()
     return render_template('admin/reminders.html', pending=pending, sent=sent)
+
+
+@admin_bp.route('/rounds/<int:round_id>/sync-fixtures', methods=['POST'])
+@admin_required
+def sync_fixtures(round_id):
+    """Manually sync fixtures for a round from Football API."""
+    from datetime import timedelta
+    from lms_v2.football_api import FootballAPI
+
+    round_obj = Round.query.get_or_404(round_id)
+
+    if not round_obj.pl_matchday:
+        flash('Round has no PL matchday set', 'error')
+        return redirect(url_for('admin.rounds'))
+
+    api = FootballAPI()
+    if not api.is_configured:
+        flash('Football API not configured (missing token)', 'error')
+        return redirect(url_for('admin.rounds'))
+
+    fixtures_data = api.get_matchday_fixtures(round_obj.pl_matchday)
+    if not fixtures_data:
+        flash('No fixtures returned from API', 'warning')
+        return redirect(url_for('admin.rounds'))
+
+    first_kickoff = None
+    created = 0
+    updated = 0
+
+    for f in fixtures_data:
+        fixture = Fixture.query.filter_by(api_id=f['id']).first()
+        if not fixture:
+            fixture = Fixture(api_id=f['id'], round_id=round_obj.id)
+            db.session.add(fixture)
+            created += 1
+        else:
+            updated += 1
+
+        fixture.home_team = f['home_team']
+        fixture.away_team = f['away_team']
+        fixture.kickoff = f['kickoff']
+        fixture.status = f['status']
+        fixture.home_score = f.get('home_score')
+        fixture.away_score = f.get('away_score')
+
+        if f['kickoff'] and (not first_kickoff or f['kickoff'] < first_kickoff):
+            first_kickoff = f['kickoff']
+
+    if first_kickoff:
+        round_obj.first_kickoff = first_kickoff
+        round_obj.deadline = first_kickoff - timedelta(hours=1)
+
+    db.session.commit()
+    flash(f'Fixtures synced: {created} created, {updated} updated', 'success')
+    return redirect(url_for('admin.rounds'))

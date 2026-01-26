@@ -17,7 +17,8 @@ class FootballAPI:
     PL_COMPETITION_ID = 2021  # Premier League
 
     def __init__(self):
-        self.token = os.environ.get('FOOTBALL_DATA_API_TOKEN')
+        # Support both variable names
+        self.token = os.environ.get('FOOTBALL_DATA_API_TOKEN') or os.environ.get('FOOTBALL_API_TOKEN')
 
     @property
     def is_configured(self):

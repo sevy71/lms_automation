@@ -58,6 +58,12 @@
                     <td>{{ round.first_kickoff.strftime('%Y-%m-%d %H:%M') if round.first_kickoff else '-' }}</td>
                     <td>{{ round.created_at.strftime('%Y-%m-%d') }}</td>
                     <td>
+                        {% if round.pl_matchday %}
+                        <form method="POST" action="{{ url_for('admin.sync_fixtures', round_id=round.id) }}"
+                              style="display:inline;">
+                            <button type="submit" class="btn btn-sm btn-outline-info me-1">Sync</button>
+                        </form>
+                        {% endif %}
                         {% if round.status == 'pending' %}
                         <form method="POST" action="{{ url_for('admin.activate_round', round_id=round.id) }}"
                               onsubmit="return confirm('Activate Round {{ round.round_number }}? This will generate tokens and start automation.');"

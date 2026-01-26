@@ -47,8 +47,8 @@ class Config:
     # Telegram
     TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
 
-    # Football Data API
-    FOOTBALL_API_TOKEN = os.environ.get('FOOTBALL_DATA_API_TOKEN')
+    # Football Data API (support both variable names)
+    FOOTBALL_API_TOKEN = os.environ.get('FOOTBALL_DATA_API_TOKEN') or os.environ.get('FOOTBALL_API_TOKEN')
     FOOTBALL_API_BASE = 'https://api.football-data.org/v4'
     PL_COMPETITION_ID = 2021  # Premier League
 
