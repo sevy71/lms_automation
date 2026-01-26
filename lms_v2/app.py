@@ -69,13 +69,18 @@ def create_app():
         if secret != 'confirm-reset-2026':
             return jsonify({'error': 'Invalid secret'}), 403
         try:
-            db.drop_all()
+            # Drop all tables with CASCADE to handle foreign keys
+            db.session.execute(db.text('DROP SCHEMA public CASCADE'))
+            db.session.execute(db.text('CREATE SCHEMA public'))
+            db.session.commit()
+            # Recreate tables
             db.create_all()
             # Seed with test players
             from lms_v2.seed import seed_players
             seed_players()
             return jsonify({'status': 'Database reset complete', 'message': 'All tables recreated with 20 test players'})
         except Exception as e:
+            db.session.rollback()
             return jsonify({'error': str(e)}), 500
 
     return app
