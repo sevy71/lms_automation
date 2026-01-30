@@ -2793,10 +2793,29 @@ def apply_missed_picks(round_id):
                 skipped.append({'player': player.name, 'reason': 'no_eligible_team'})
                 continue
 
-            # Use deterministic selection
-            candidate, auto_reason = _deterministic_team_selection(
-                available_teams, current_round_number, current_cycle
-            )
+            # Preferred rule (as per game): previous round that lost
+            # If player survived last round, use the LOSING opponent team from their last winning pick.
+            candidate = None
+            auto_reason = None
+            if current_round_number >= 2:
+                try:
+                    prev_pick = Pick.query.filter_by(player_id=player.id).join(Round).filter(
+                        Round.cycle_number == current_cycle,
+                        Round.round_number == (current_round_number - 1)
+                    ).first()
+                    if prev_pick and prev_pick.is_winner is True:
+                        opponent = _opposing_team_from_past_pick(prev_pick)
+                        if opponent and opponent in available_teams:
+                            candidate = opponent
+                            auto_reason = 'missed_deadline_prev_round_loser'
+                except Exception as e:
+                    print(f"[APPLY-MISSED-PICKS] Prev-loser selection failed for player {player.id}: {e}")
+
+            # Fallback: deterministic preference list selection
+            if not candidate:
+                candidate, auto_reason = _deterministic_team_selection(
+                    available_teams, current_round_number, current_cycle
+                )
 
             if not candidate:
                 skipped.append({'player': player.name, 'reason': 'selection_failed'})

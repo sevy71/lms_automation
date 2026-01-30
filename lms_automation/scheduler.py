@@ -2543,7 +2543,38 @@ class LMSScheduler:
                 )
                 return arsenal_canonical, 'missed_deadline_default_arsenal'
 
-        # RULE 2: Check preference list in order
+        # RULE 2 (NEW): "previous round that lost" (as per your game rules)
+        # If the player survived the previous round, the team that LOST that fixture is the OPPONENT
+        # of the player's last winning pick. Use that team if it's available this round.
+        if current_round_number >= 2:
+            try:
+                prev_pick = Pick.query.filter_by(player_id=player.id).join(Round).filter(
+                    Round.cycle_number == current_cycle,
+                    Round.round_number == (current_round_number - 1)
+                ).first()
+
+                if prev_pick and prev_pick.is_winner is True:
+                    # Find opponent team from previous pick's fixture
+                    prev_round = prev_pick.round
+                    opponent = None
+                    for fx in (prev_round.fixtures or []):
+                        if normalize_team_name(fx.home_team) == normalize_team_name(prev_pick.team_picked):
+                            opponent = normalize_team_name(fx.away_team)
+                            break
+                        if normalize_team_name(fx.away_team) == normalize_team_name(prev_pick.team_picked):
+                            opponent = normalize_team_name(fx.home_team)
+                            break
+
+                    if opponent and opponent in available_canonical:
+                        logger.info(
+                            f"  AUTO-PICK PREV-LOSER: player_id={player.id} ({player.name}) -> '{opponent}' "
+                            f"(opponent of last winning pick {normalize_team_name(prev_pick.team_picked)})"
+                        )
+                        return opponent, 'missed_deadline_prev_round_loser'
+            except Exception as e:
+                logger.warning(f"  Prev-loser auto-pick check failed for player_id={player.id}: {e}")
+
+        # RULE 3: Check preference list in order
         for preferred_team in self.TEAM_PREFERENCE_LIST:
             preferred_canonical = normalize_team_name(preferred_team)
             if preferred_canonical in available_canonical:
