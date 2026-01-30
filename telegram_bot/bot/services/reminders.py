@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List
 
 
-@dataclass(slots=True)
+@dataclass
 class ReminderPlan:
     """Represents reminders ready to send through Telegram."""
 

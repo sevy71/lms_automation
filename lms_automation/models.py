@@ -2,6 +2,7 @@ from datetime import datetime, timedelta
 from lms_automation.extensions import db
 import secrets
 import string
+import os
 
 
 class Player(db.Model):
@@ -15,13 +16,14 @@ class Player(db.Model):
     unreachable = db.Column(db.Boolean, default=False)
 
     picks = db.relationship('Pick', backref='player', lazy=True)
-    
+
     def __repr__(self):
         return f'<Player {self.name}>'
 
+
 class Round(db.Model):
     __tablename__ = 'rounds'
-    
+
     id = db.Column(db.Integer, primary_key=True)
     round_number = db.Column(db.Integer, nullable=False)
     pl_matchday = db.Column(db.Integer, nullable=True)  # Premier League matchday (1-38)
@@ -32,16 +34,25 @@ class Round(db.Model):
     special_measure = db.Column(db.String(50), nullable=True)  # universal_bye, frozen, void, override
     special_note = db.Column(db.Text, nullable=True)
     cycle_number = db.Column(db.Integer, default=1)
-    
+
     fixtures = db.relationship('Fixture', backref='round', lazy=True)
     picks = db.relationship('Pick', backref='round', lazy=True)
-    
+
     def __repr__(self):
         return f'<Round {self.round_number} (PL MD {self.pl_matchday})>'
 
+    def get_season_id(self):
+        """Compatibility helper: rounds table may contain season_id column."""
+        return getattr(self, 'season_id', None)
+
+    def get_api_season_year(self):
+        """Compatibility helper: rounds table may contain api_season_year column."""
+        return getattr(self, 'api_season_year', None)
+
+
 class Fixture(db.Model):
     __tablename__ = 'fixtures'
-    
+
     id = db.Column(db.Integer, primary_key=True)
     round_id = db.Column(db.Integer, db.ForeignKey('rounds.id'), nullable=False)
     event_id = db.Column(db.String(50), nullable=True)  # External API event ID
@@ -52,13 +63,14 @@ class Fixture(db.Model):
     home_score = db.Column(db.Integer, nullable=True)
     away_score = db.Column(db.Integer, nullable=True)
     status = db.Column(db.String(20), default='scheduled')  # scheduled, live, completed, postponed
-    
+
     def __repr__(self):
         return f'<Fixture {self.home_team} vs {self.away_team}>'
 
+
 class Pick(db.Model):
     __tablename__ = 'picks'
-    
+
     id = db.Column(db.Integer, primary_key=True)
     player_id = db.Column(db.Integer, db.ForeignKey('players.id'), nullable=False)
     round_id = db.Column(db.Integer, db.ForeignKey('rounds.id'), nullable=False)
@@ -67,19 +79,20 @@ class Pick(db.Model):
     is_eliminated = db.Column(db.Boolean, default=False)
     timestamp = db.Column(db.DateTime, default=datetime.utcnow)
     last_edited_at = db.Column(db.DateTime, nullable=True)
-    
+
     # Audit fields for auto-pick/postponement policy
     auto_assigned = db.Column(db.Boolean, default=False)
     auto_reason = db.Column(db.String(50), nullable=True)  # missed_deadline, postponement_early, postponement_late, etc.
     postponed_event_id = db.Column(db.String(50), nullable=True)
     announcement_time = db.Column(db.DateTime, nullable=True)
-    
+
     def __repr__(self):
         return f'<Pick {self.player.name} - {self.team_picked}>'
 
+
 class PickToken(db.Model):
     __tablename__ = 'pick_tokens'
-    
+
     id = db.Column(db.Integer, primary_key=True)
     player_id = db.Column(db.Integer, db.ForeignKey('players.id'), nullable=False)
     round_id = db.Column(db.Integer, db.ForeignKey('rounds.id'), nullable=False)
@@ -89,20 +102,20 @@ class PickToken(db.Model):
     expires_at = db.Column(db.DateTime, nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     used_at = db.Column(db.DateTime, nullable=True)
-    
+
     # Relationships
     player = db.relationship('Player', backref='pick_tokens', lazy=True)
     round = db.relationship('Round', backref='pick_tokens', lazy=True)
-    
+
     def __repr__(self):
         return f'<PickToken {self.token[:8]}... for {self.player.name if self.player else "Unknown"}>'
-    
+
     @staticmethod
     def generate_token():
         """Generate a secure random token"""
         alphabet = string.ascii_letters + string.digits
         return ''.join(secrets.choice(alphabet) for _ in range(32))
-    
+
     @staticmethod
     def create_for_player_round(player_id, round_id, expires_hours=168, force_new=False):  # default kept for fallback when no deadline
         """Create or fetch a pick token for a player and round.
@@ -140,7 +153,7 @@ class PickToken(db.Model):
 
         db.session.add(token)
         return token
-    
+
     def is_valid(self):
         """Check if token is valid (not exceeded edit limit and not expired)"""
         if self.edit_count >= 2:
@@ -148,28 +161,29 @@ class PickToken(db.Model):
         if self.expires_at and datetime.utcnow() > self.expires_at:
             return False
         return True
-    
+
     def mark_used(self):
         """Increment edit count and update used_at timestamp"""
         self.edit_count += 1
         self.used_at = datetime.utcnow()
         if self.edit_count >= 2:
             self.is_used = True
-    
+
     def get_pick_url(self, base_url='https://localhost:5000'):
         """Get the full pick URL for this token"""
         # Ensure base_url is clean and properly formatted
         base_url = base_url.rstrip('/')
-        
+
         # Ensure base_url has protocol (critical for mobile WhatsApp)
         if not base_url.startswith(('http://', 'https://')):
             base_url = f"https://{base_url}"
-            
+
         return f"{base_url}/pick/{self.token}"
+
 
 class ReminderSchedule(db.Model):
     __tablename__ = 'reminder_schedules'
-    
+
     id = db.Column(db.Integer, primary_key=True)
     player_id = db.Column(db.Integer, db.ForeignKey('players.id'), nullable=False)
     round_id = db.Column(db.Integer, db.ForeignKey('rounds.id'), nullable=False)
@@ -178,14 +192,14 @@ class ReminderSchedule(db.Model):
     sent_at = db.Column(db.DateTime, nullable=True)
     is_sent = db.Column(db.Boolean, default=False)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    
+
     # Relationships
     player = db.relationship('Player', backref='reminder_schedules')
     round = db.relationship('Round', backref='reminder_schedules')
-    
+
     def __repr__(self):
         return f'<ReminderSchedule {self.reminder_type} for {self.player.name} R{self.round.round_number}>'
-    
+
     @staticmethod
     def create_reminders_for_round(round_id):
         """Create reminder schedules for all active players in a round.
@@ -213,29 +227,29 @@ class ReminderSchedule(db.Model):
                 anchor_time = None
         if not anchor_time:
             return False
-        
+
         active_players = Player.query.filter_by(status='active').all()
-        
+
         # Calculate reminder times relative to anchor
         four_hour_reminder = anchor_time - timedelta(hours=4)
         two_hour_reminder = anchor_time - timedelta(hours=2)
-        
+
         reminders_created = 0
-        
+
         for player in active_players:
             # Check if reminders already exist
             existing_4h = ReminderSchedule.query.filter_by(
-                player_id=player.id, 
-                round_id=round_id, 
+                player_id=player.id,
+                round_id=round_id,
                 reminder_type='4_hour'
             ).first()
-            
+
             existing_2h = ReminderSchedule.query.filter_by(
-                player_id=player.id, 
-                round_id=round_id, 
+                player_id=player.id,
+                round_id=round_id,
                 reminder_type='2_hour'
             ).first()
-            
+
             # Create 4-hour reminder (create even if scheduled time is in the past so it shows as due)
             if not existing_4h:
                 reminder_4h = ReminderSchedule(
@@ -246,7 +260,7 @@ class ReminderSchedule(db.Model):
                 )
                 db.session.add(reminder_4h)
                 reminders_created += 1
-            
+
             # Create 2-hour reminder (create even if scheduled time is in the past so it shows as due)
             if not existing_2h:
                 reminder_2h = ReminderSchedule(
@@ -257,10 +271,10 @@ class ReminderSchedule(db.Model):
                 )
                 db.session.add(reminder_2h)
                 reminders_created += 1
-        
+
         db.session.commit()
         return reminders_created
-    
+
     @staticmethod
     def get_pending_reminders():
         """Get all reminders that are due and haven't been sent"""
@@ -268,9 +282,44 @@ class ReminderSchedule(db.Model):
             ReminderSchedule.is_sent == False,
             ReminderSchedule.scheduled_time <= datetime.utcnow()
         ).all()
-    
+
     def mark_as_sent(self):
         """Mark reminder as sent"""
         self.is_sent = True
         self.sent_at = datetime.utcnow()
         db.session.commit()
+
+
+# ---------------------------------------------------------------------------
+# Season helpers (required by lms_automation.app)
+# ---------------------------------------------------------------------------
+
+def get_default_api_season_year() -> int:
+    """Return default season year for Football API.
+
+    Uses env vars (FOOTBALL_SEASON/SEASON) if provided.
+    Fallback: season year is the year the season starts (Jul+ => current year).
+    """
+    v = os.environ.get('FOOTBALL_SEASON') or os.environ.get('SEASON')
+    if v:
+        try:
+            return int(v)
+        except ValueError:
+            pass
+
+    now = datetime.utcnow()
+    return now.year if now.month >= 7 else now.year - 1
+
+
+def get_default_season_id() -> str:
+    """Return default internal season_id.
+
+    Uses SEASON_ID if provided, else derives from api season year.
+    Example: 2025 -> "2025-26".
+    """
+    season_id = os.environ.get('SEASON_ID')
+    if season_id:
+        return season_id
+
+    y = get_default_api_season_year()
+    return f"{y}-{str(y + 1)[-2:]}"

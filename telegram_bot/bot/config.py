@@ -6,7 +6,7 @@ import os
 from dataclasses import dataclass
 
 
-@dataclass(slots=True)
+@dataclass
 class BotConfig:
     """Container for runtime configuration."""
 

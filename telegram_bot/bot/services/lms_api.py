@@ -12,7 +12,7 @@ class LMSAPIError(RuntimeError):
     """Raised when an LMS API call fails."""
 
 
-@dataclass(slots=True)
+@dataclass
 class LMSClient:
     """HTTP client used by the bot to talk to the LMS REST endpoints."""
 
