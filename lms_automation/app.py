@@ -2816,11 +2816,12 @@ def apply_missed_picks(round_id):
                 except Exception as e:
                     print(f"[APPLY-MISSED-PICKS] Prev-loser (step-back) selection failed for player {player.id}: {e}")
 
-            # Fallback: deterministic preference list selection
+            # Fallback: first eligible team alphabetically among teams not yet used this cycle
             if not candidate:
-                candidate, auto_reason = _deterministic_team_selection(
-                    available_teams, current_round_number, current_cycle
-                )
+                sorted_teams = sorted(list(available_teams), key=lambda t: normalize_team_name(t).lower())
+                if sorted_teams:
+                    candidate = sorted_teams[0]
+                    auto_reason = 'missed_deadline_fallback_alpha'
 
             if not candidate:
                 skipped.append({'player': player.name, 'reason': 'selection_failed'})

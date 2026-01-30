@@ -2513,35 +2513,9 @@ class LMSScheduler:
             )
             return None, None
 
-        # RULE 1 (MODIFIED): Round 1 of any cycle
-        # For mock players, pick RANDOM to avoid deterministic wipeouts and premature winners.
-        # We identify mocks primarily by unreachable=True (explicit), with a safe fallback:
-        # if telegram_id is missing (common for mocks in test), treat as mock.
-        if current_round_number == 1:
-            is_mock = False
-            try:
-                is_mock = bool(getattr(player, 'unreachable', False))
-            except Exception:
-                is_mock = False
-            if not is_mock:
-                # Fallback heuristic for test environments
-                is_mock = not bool(getattr(player, 'telegram_id', None))
-
-            if is_mock:
-                choice = random.choice(sorted(list(available_canonical)))
-                logger.info(
-                    f"  AUTO-PICK ROUND1 RANDOM (mock): player_id={player.id} ({player.name}) -> '{choice}'"
-                )
-                return choice, 'round1_mock_random'
-
-            # Non-mock players (real participants) keep the original deterministic Round 1 default
-            arsenal_canonical = normalize_team_name('Arsenal')
-            if arsenal_canonical in available_canonical:
-                logger.info(
-                    f"  AUTO-PICK DEFAULT ARSENAL: player_id={player.id} ({player.name}) -> "
-                    f"'Arsenal' (Round 1 default)"
-                )
-                return arsenal_canonical, 'missed_deadline_default_arsenal'
+        # RULE 1: Walk back through player's prior WINNING picks (most recent → oldest)
+        # and take the opposing team (the loser in that past match) if it's eligible this round.
+        # (Eligibility already encoded by available_canonical.)
 
         # RULE 2 (UPDATED): "previous round that lost" with step-back
         # Target = opponent team from the player's most recent WINNING pick.
@@ -2582,26 +2556,15 @@ class LMSScheduler:
             except Exception as e:
                 logger.warning(f"  Prev-loser auto-pick (step-back) failed for player_id={player.id}: {e}")
 
-        # RULE 3: Check preference list in order
-        for preferred_team in self.TEAM_PREFERENCE_LIST:
-            preferred_canonical = normalize_team_name(preferred_team)
-            if preferred_canonical in available_canonical:
-                logger.info(
-                    f"  AUTO-PICK PREFERENCE: player_id={player.id} ({player.name}) -> "
-                    f"'{preferred_canonical}' (from preference list)"
-                )
-                return preferred_canonical, 'missed_deadline_preference'
-
-        # RULE 3: Alphabetically first available team (stable sort)
+        # RULE 2: Fallback — first eligible team alphabetically among teams not yet used this cycle
         available_sorted = sorted(available_canonical, key=str.lower)
         if available_sorted:
             selected_canonical = available_sorted[0]
             logger.info(
-                f"  AUTO-PICK FALLBACK FIRST: player_id={player.id} ({player.name}) -> "
-                f"'{selected_canonical}' (first of {len(available_sorted)} alphabetically: "
-                f"{available_sorted[:5]}{'...' if len(available_sorted) > 5 else ''})"
+                f"  AUTO-PICK FALLBACK ALPHA: player_id={player.id} ({player.name}) -> "
+                f"'{selected_canonical}' (first of {len(available_sorted)} alphabetically)"
             )
-            return selected_canonical, 'missed_deadline_fallback_first_available'
+            return selected_canonical, 'missed_deadline_fallback_alpha'
 
         # RULE 4: Last resort - random (should never happen if available_canonical is not empty)
         available_list = list(available_canonical)
