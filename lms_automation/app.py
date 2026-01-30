@@ -92,6 +92,9 @@ _db_ready = wait_for_db(app, max_retries=5, base_delay=2)
 if not _db_ready:
     print("WARNING: Could not establish initial database connection. App will retry on first request.")
 
+# Track whether we've applied the fallback schema ensure.
+_schema_ensured = False
+
 # --- Game policy configuration ---
 # Postponement policy thresholds (minutes)
 app.config.setdefault('POSTPONEMENT_LENIENCY_MINUTES', 60)   # early postponement window
@@ -178,6 +181,10 @@ def _auto_run_migrations_if_enabled():
 from sqlalchemy import inspect, text
 
 def _ensure_minimum_schema():
+    """Best-effort schema patching for environments without migrations.
+
+    IMPORTANT: this must be *called* (or wired into a startup hook). Defining it isn't enough.
+    """
     try:
         with app.app_context():
             engine = db.engine
@@ -251,6 +258,28 @@ def _ensure_minimum_schema():
     except Exception as e:
         db.session.rollback()
         app.logger.warning(f'Schema ensure fallback encountered an error: {e}')
+
+
+# Ensure minimum schema at startup (and lazily on first request if DB wasn't ready)
+try:
+    if _db_ready:
+        _ensure_minimum_schema()
+        _schema_ensured = True
+except Exception as e:
+    app.logger.warning(f"Startup schema ensure failed (will retry on request): {e}")
+
+@app.before_request
+def _ensure_schema_once_before_requests():
+    global _schema_ensured
+    if _schema_ensured:
+        return
+    try:
+        if wait_for_db(app, max_retries=1, base_delay=0):
+            _ensure_minimum_schema()
+            _schema_ensured = True
+    except Exception as e:
+        # Don't block requests; just log.
+        app.logger.warning(f"Lazy schema ensure failed: {e}")
 
 
 # Admin authentication
