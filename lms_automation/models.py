@@ -35,6 +35,10 @@ class Round(db.Model):
     special_note = db.Column(db.Text, nullable=True)
     cycle_number = db.Column(db.Integer, default=1)
 
+    # Season tracking (season locked per game)
+    season_id = db.Column(db.String(10), nullable=True)
+    api_season_year = db.Column(db.Integer, nullable=True)
+
     fixtures = db.relationship('Fixture', backref='round', lazy=True)
     picks = db.relationship('Pick', backref='round', lazy=True)
 
