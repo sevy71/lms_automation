@@ -2543,18 +2543,22 @@ class LMSScheduler:
                 )
                 return arsenal_canonical, 'missed_deadline_default_arsenal'
 
-        # RULE 2 (NEW): "previous round that lost" (as per your game rules)
-        # If the player survived the previous round, the team that LOST that fixture is the OPPONENT
-        # of the player's last winning pick. Use that team if it's available this round.
+        # RULE 2 (UPDATED): "previous round that lost" with step-back
+        # Target = opponent team from the player's most recent WINNING pick.
+        # If that team is not available (already used in cycle / not in this round's fixtures),
+        # step back to the previous round, etc.
         if current_round_number >= 2:
             try:
-                prev_pick = Pick.query.filter_by(player_id=player.id).join(Round).filter(
-                    Round.cycle_number == current_cycle,
-                    Round.round_number == (current_round_number - 1)
-                ).first()
+                # Iterate backwards through rounds in this cycle
+                for prev_rn in range(current_round_number - 1, 0, -1):
+                    prev_pick = Pick.query.filter_by(player_id=player.id).join(Round).filter(
+                        Round.cycle_number == current_cycle,
+                        Round.round_number == prev_rn
+                    ).first()
 
-                if prev_pick and prev_pick.is_winner is True:
-                    # Find opponent team from previous pick's fixture
+                    if not prev_pick or prev_pick.is_winner is not True:
+                        continue
+
                     prev_round = prev_pick.round
                     opponent = None
                     for fx in (prev_round.fixtures or []):
@@ -2565,14 +2569,18 @@ class LMSScheduler:
                             opponent = normalize_team_name(fx.home_team)
                             break
 
-                    if opponent and opponent in available_canonical:
+                    if not opponent:
+                        continue
+
+                    # Candidate must be available this round (and not previously used in the cycle)
+                    if opponent in available_canonical:
                         logger.info(
-                            f"  AUTO-PICK PREV-LOSER: player_id={player.id} ({player.name}) -> '{opponent}' "
-                            f"(opponent of last winning pick {normalize_team_name(prev_pick.team_picked)})"
+                            f"  AUTO-PICK PREV-LOSER (step-back): player_id={player.id} ({player.name}) -> '{opponent}' "
+                            f"(from prev_round={prev_rn}, last winning pick {normalize_team_name(prev_pick.team_picked)})"
                         )
                         return opponent, 'missed_deadline_prev_round_loser'
             except Exception as e:
-                logger.warning(f"  Prev-loser auto-pick check failed for player_id={player.id}: {e}")
+                logger.warning(f"  Prev-loser auto-pick (step-back) failed for player_id={player.id}: {e}")
 
         # RULE 3: Check preference list in order
         for preferred_team in self.TEAM_PREFERENCE_LIST:
