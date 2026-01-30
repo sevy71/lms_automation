@@ -765,14 +765,17 @@ def resend_round_announcement(round_id):
 @app.route('/admin/seed-random-picks')
 @admin_required
 def seed_random_picks():
-    """
-    Admin helper: Seed DETERMINISTIC picks for testing.
+    """Admin helper: Seed picks for testing.
 
-    Assigns teams using the deterministic selection strategy:
-    1. Round 1: Arsenal (if available)
-    2. Otherwise: First team from preference list (Arsenal, Man City, Liverpool, etc.)
-    3. Fallback: Alphabetically first available team
-    4. Last resort: Random (only if no other option)
+    Default behaviour (Round 2+): deterministic selection strategy (existing behaviour).
+
+    Special behaviour (Round 1 only):
+    - MOCK players get RANDOM teams to avoid everyone clustering on Arsenal and ending the game immediately.
+    - REAL players are skipped (so you can pick manually).
+
+    Mock detection:
+    - Prefer explicit flag: player.unreachable == True
+    - Fallback heuristic for test: missing telegram_id
 
     RESPECTS THE RULE: No team can be picked twice in the same cycle.
 
@@ -781,6 +784,7 @@ def seed_random_picks():
         count: Max number of picks to create (default: all eligible players)
         only_missing: If 1, only create picks for players missing picks (default: 1)
     """
+    import random
     from lms_automation.team_utils import normalize_team_name
 
     round_id = request.args.get('round_id', type=int)
@@ -878,10 +882,27 @@ def seed_random_picks():
             print(f"[SEED-DETERMINISTIC] Player {player.id} ({player.name}): NO AVAILABLE TEAMS, skipping")
             continue
 
-        # Use deterministic selection
-        selected_team, auto_reason = _deterministic_team_selection(
-            available_teams, current_round_number, current_cycle
-        )
+        # Round 1 behaviour: randomise MOCKS only, skip REAL players so they can pick manually
+        if current_round_number == 1:
+            is_mock = False
+            try:
+                is_mock = bool(getattr(player, 'unreachable', False))
+            except Exception:
+                is_mock = False
+            if not is_mock:
+                is_mock = not bool(getattr(player, 'telegram_id', None))
+
+            if not is_mock:
+                print(f"[SEED-ROUND1] Player {player.id} ({player.name}): treated as REAL, skipping (manual pick)")
+                continue
+
+            selected_team = random.choice(sorted(list(available_teams)))
+            auto_reason = 'round1_mock_random'
+        else:
+            # Use deterministic selection
+            selected_team, auto_reason = _deterministic_team_selection(
+                available_teams, current_round_number, current_cycle
+            )
 
         if not selected_team:
             skipped_no_available += 1
