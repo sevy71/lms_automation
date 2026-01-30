@@ -3468,9 +3468,12 @@ def handle_round_by_id(round_id):
             
             old_status = round_obj.status
             round_obj.status = new_status
-            # If admin marks a round as completed, also attempt winner detection
+            # If admin marks a round as completed, evaluate game state (winner/rollover/continue)
             if new_status == 'completed':
-                auto_detect_and_mark_winner()
+                try:
+                    _evaluate_game_state_after_round_standalone(round_obj)
+                except Exception as e:
+                    app.logger.warning(f"Game-state evaluation failed after admin completion: {e}")
             db.session.commit()
             
             return jsonify({
@@ -4463,8 +4466,11 @@ def process_round_results(round_id):
         
         if completed_fixtures == total_fixtures:
             round_obj.status = 'completed'
-            # If round fully completed, check if there is a single remaining active player and mark winner
-            auto_detect_and_mark_winner()
+            # If round fully completed, evaluate game state (winner/rollover/continue) + send notifications
+            try:
+                _evaluate_game_state_after_round_standalone(round_obj)
+            except Exception as e:
+                app.logger.warning(f"Game-state evaluation failed after processing results: {e}")
         
         db.session.commit()
         

@@ -2513,8 +2513,28 @@ class LMSScheduler:
             )
             return None, None
 
-        # RULE 1: Round 1 of any cycle - default to Arsenal if available
+        # RULE 1 (MODIFIED): Round 1 of any cycle
+        # For mock players, pick RANDOM to avoid deterministic wipeouts and premature winners.
+        # We identify mocks primarily by unreachable=True (explicit), with a safe fallback:
+        # if telegram_id is missing (common for mocks in test), treat as mock.
         if current_round_number == 1:
+            is_mock = False
+            try:
+                is_mock = bool(getattr(player, 'unreachable', False))
+            except Exception:
+                is_mock = False
+            if not is_mock:
+                # Fallback heuristic for test environments
+                is_mock = not bool(getattr(player, 'telegram_id', None))
+
+            if is_mock:
+                choice = random.choice(sorted(list(available_canonical)))
+                logger.info(
+                    f"  AUTO-PICK ROUND1 RANDOM (mock): player_id={player.id} ({player.name}) -> '{choice}'"
+                )
+                return choice, 'round1_mock_random'
+
+            # Non-mock players (real participants) keep the original deterministic Round 1 default
             arsenal_canonical = normalize_team_name('Arsenal')
             if arsenal_canonical in available_canonical:
                 logger.info(
