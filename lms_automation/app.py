@@ -3056,6 +3056,7 @@ def handle_player_by_id(player_id):
             
             name = data['name'].strip()
             whatsapp = data.get('whatsapp_number', '').strip()
+            telegram_id = data.get('telegram_id', '').strip() or None
             
             # Check if another player with the same name exists
             existing_player = Player.query.filter(Player.name == name, Player.id != player_id).first()
@@ -3068,6 +3069,8 @@ def handle_player_by_id(player_id):
             # Update player
             player.name = name
             player.whatsapp_number = sanitize_phone_number(whatsapp) if whatsapp else None
+            # Allow setting/updating telegram_id from admin UI
+            player.telegram_id = telegram_id
             
             db.session.commit()
             

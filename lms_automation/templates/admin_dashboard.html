@@ -665,7 +665,7 @@ document.addEventListener('DOMContentLoaded', function() {
                                                         <i class="fas fa-cog"></i>
                                                     </button>
                                                     <ul class="dropdown-menu">
-                                                        <li><button class="dropdown-item edit-player-btn" data-player-id="{{ player.id }}" data-player-name="{{ player.name }}" data-player-whatsapp="{{ player.whatsapp_number }}">
+                                                        <li><button class="dropdown-item edit-player-btn" data-player-id="{{ player.id }}" data-player-name="{{ player.name }}" data-player-whatsapp="{{ player.whatsapp_number }}" data-player-telegram="{{ player.telegram_id }}">
                                                             <i class="fas fa-edit me-2"></i>Edit
                                                         </button></li>
                                                         {% if player.whatsapp_number %}
@@ -790,6 +790,12 @@ document.addEventListener('DOMContentLoaded', function() {
                         <label for="editPlayerWhatsapp" class="form-label">WhatsApp Number</label>
                         <input type="tel" class="form-control" id="editPlayerWhatsapp" placeholder="+44XXXXXXXXXX">
                         <div class="form-text">Include country code (e.g., +44 for UK) or leave empty</div>
+                    </div>
+
+                    <div class="mb-3">
+                        <label for="editPlayerTelegram" class="form-label">Telegram ID (chat_id)</label>
+                        <input type="text" class="form-control" id="editPlayerTelegram" placeholder="e.g. 123456789">
+                        <div class="form-text">Optional. Needed for Telegram notifications. This is the numeric chat_id/user_id.</div>
                     </div>
                 </div>
                 <div class="modal-footer">
@@ -1442,10 +1448,12 @@ document.addEventListener('DOMContentLoaded', function() {
             const playerId = this.getAttribute('data-player-id');
             const playerName = this.getAttribute('data-player-name');
             const playerWhatsapp = this.getAttribute('data-player-whatsapp');
+            const playerTelegram = this.getAttribute('data-player-telegram');
             
             document.getElementById('editPlayerId').value = playerId;
             document.getElementById('editPlayerName').value = playerName;
             document.getElementById('editPlayerWhatsapp').value = playerWhatsapp || '';
+            document.getElementById('editPlayerTelegram').value = playerTelegram || '';
             
             new bootstrap.Modal(document.getElementById('editPlayerModal')).show();
         });
@@ -1458,6 +1466,7 @@ document.addEventListener('DOMContentLoaded', function() {
         const playerId = document.getElementById('editPlayerId').value;
         const name = document.getElementById('editPlayerName').value.trim();
         const whatsapp = document.getElementById('editPlayerWhatsapp').value.trim();
+        const telegramId = document.getElementById('editPlayerTelegram').value.trim();
         
         if (!name) {
             alert('Player name is required');
@@ -1471,7 +1480,8 @@ document.addEventListener('DOMContentLoaded', function() {
             },
             body: JSON.stringify({
                 name: name,
-                whatsapp_number: whatsapp
+                whatsapp_number: whatsapp,
+                telegram_id: telegramId
             })
         })
         .then(response => response.json())
