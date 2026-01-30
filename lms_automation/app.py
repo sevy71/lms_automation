@@ -4817,11 +4817,16 @@ def make_pick(token):
     token_cycle = round_obj.cycle_number or 1
 
     # Get only picks from rounds in the same cycle
+    # Used teams should mean "teams used in PREVIOUS rounds of this cycle".
+    # IMPORTANT: exclude the current round pick (if it already exists) so we don't block
+    # re-submitting/editing the same team in the current round and incorrectly say
+    # "previous round".
     previous_picks = (
         Pick.query
         .join(Round, Pick.round_id == Round.id)
         .filter(Pick.player_id == player.id)
         .filter(Round.cycle_number == token_cycle)
+        .filter(Pick.round_id != round_obj.id)
         .all()
     )
     used_teams = [pick.team_picked for pick in previous_picks]
@@ -4881,7 +4886,7 @@ def make_pick(token):
                                  fixtures=fixtures, 
                                  used_teams=used_teams,
                                  is_team_used=is_team_used,
-                                 error="You have already picked this team in a previous round",
+                                 error="You have already picked this team earlier in this cycle",
                                  player_nav_only=True)
         
         # Validate team exists in fixtures
