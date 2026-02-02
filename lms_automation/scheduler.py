@@ -40,7 +40,8 @@ announced -> picks_locked:
 
 picks_locked -> completed:
   WHEN: ALL of:
-    a) all fixtures have status='completed'
+    a) all RELEVANT fixtures completed (fixtures involving picked teams)
+       Non-relevant fixtures (no player picked either team) do NOT block completion.
     b) picks exist for every eligible player (manual or auto)
     c) eliminations have been processed (is_winner evaluated for all picks)
   BY: process_eliminations job
@@ -53,9 +54,10 @@ CRITICAL INVARIANTS:
 --------------------
 1. NEVER mark round completed if picks_count == 0 for eligible players
 2. NEVER mark round completed if picks_count < eligible_count AND deadline not passed
-3. NEVER mark round completed if any fixture is still scheduled/live/postponed
-4. is_winner=False MUST always mean is_eliminated=True (enforced by invariant job)
-   GUARD: Invariant job only enforces for completed rounds with fixture scores!
+3. NEVER mark round completed if any RELEVANT fixture is still scheduled/live/postponed
+   (relevant = involves a team that a player picked)
+4. is_winner=False MUST always mean is_eliminated=True (enforced immediately per-fixture)
+   SAFETY NET: Also enforced by invariant job for completed rounds with fixture scores.
 5. Auto-picks MUST be applied before eliminations if deadline has passed
 6. NEVER allow picks_locked without tokens_generated (unless SKIP_ANNOUNCEMENT_GATE)
 7. NEVER allow picks_locked without announced marker (unless SKIP_ANNOUNCEMENT_GATE)
@@ -67,7 +69,8 @@ IDEMPOTENCY RULES:
 - generate_round_tokens: Only creates if token doesn't exist; marks 'tokens_generated' once
 - send_new_round_announcements: Only sends if not announced; marks 'announced' once
 - apply_missed_picks: Only insert if no pick exists for (player_id, round_id)
-- process_eliminations: Only set is_eliminated=True if is_winner=False AND not already eliminated
+- _update_picks_for_fixture: Sets is_winner AND immediately sets is_eliminated/player.status for losers
+- process_eliminations: Safety-net re-check; only set is_eliminated=True if is_winner=False AND not already eliminated
 - check_all_picks_submitted: Only send notification once (check special_note)
 - enforce_global_elimination_invariant: Only enforces for completed rounds with scores
 - Notifications: All use special_note markers to prevent duplicate sends
@@ -349,8 +352,8 @@ class LMSScheduler:
 
         # Start polling 2 hours after earliest kick-off (when first games should be finishing)
         window_start = earliest_kickoff + timedelta(hours=2)
-        # Stop polling 3 hours after latest kick-off (buffer for delays, extra time, etc.)
-        window_end = latest_kickoff + timedelta(hours=3)
+        # Stop polling 4 hours after latest kick-off (2h game + 2h API delay buffer)
+        window_end = latest_kickoff + timedelta(hours=4)
 
         return window_start, window_end
 
@@ -358,8 +361,11 @@ class LMSScheduler:
         """
         Check if current time is within the fixture update window for a round.
 
-        Returns True if we should poll for results, False otherwise.
-        Also returns True if all fixtures are not yet completed (to catch stragglers).
+        Uses PER-FIXTURE windows: each fixture's window runs from its kickoff
+        to kickoff + 4 hours (2h game time + 2h API delay buffer).
+
+        Returns True if ANY incomplete fixture is currently within its window,
+        or if any incomplete fixture is past its window (straggler catch-up).
         """
         if now is None:
             now = datetime.utcnow()
@@ -368,37 +374,52 @@ class LMSScheduler:
         if now.tzinfo is not None:
             now = now.replace(tzinfo=None)
 
-        window_start, window_end = self._get_fixture_update_window(round_obj)
-
-        if window_start is None:
-            # No fixtures with kick-off times, fall back to always polling
-            logger.debug(f"Round {round_obj.round_number}: No kickoff times found, will poll")
+        fixtures = Fixture.query.filter_by(round_id=round_obj.id).all()
+        if not fixtures:
+            logger.debug(f"Round {round_obj.round_number}: No fixtures found, will poll")
             return True
 
-        # Check if any fixtures are still incomplete - if so, keep polling regardless of window
-        incomplete_fixtures = Fixture.query.filter_by(round_id=round_obj.id).filter(
-            Fixture.status != 'completed'
-        ).count()
+        incomplete_fixtures = [f for f in fixtures if f.status != 'completed']
 
-        if incomplete_fixtures > 0 and now > window_start:
-            # We're past the start time and have incomplete fixtures, keep polling
-            logger.debug(
-                f"Round {round_obj.round_number}: {incomplete_fixtures} incomplete fixtures, "
-                f"continuing to poll (past window_start={window_start.strftime('%Y-%m-%d %H:%M')})"
-            )
-            return True
+        if not incomplete_fixtures:
+            logger.debug(f"Round {round_obj.round_number}: All fixtures completed, skipping poll")
+            return False
 
-        # Check if we're within the calculated window
-        in_window = window_start <= now <= window_end
+        for fixture in incomplete_fixtures:
+            if not fixture.date or not fixture.time:
+                # No kickoff time known -- be safe and poll
+                logger.debug(
+                    f"Round {round_obj.round_number}: Fixture {fixture.home_team} vs {fixture.away_team} "
+                    f"has no kickoff time, will poll"
+                )
+                return True
 
-        if not in_window:
-            logger.debug(
-                f"Round {round_obj.round_number}: Outside update window "
-                f"({window_start.strftime('%Y-%m-%d %H:%M')} to {window_end.strftime('%Y-%m-%d %H:%M')}), "
-                f"current time: {now.strftime('%Y-%m-%d %H:%M')}"
-            )
+            kickoff = datetime.combine(fixture.date, fixture.time)
+            # 4h window: ~2h for game to finish + 2h buffer for API delays
+            fixture_window_end = kickoff + timedelta(hours=4)
 
-        return in_window
+            if kickoff <= now <= fixture_window_end:
+                logger.debug(
+                    f"Round {round_obj.round_number}: Fixture {fixture.home_team} vs {fixture.away_team} "
+                    f"within per-fixture window (kickoff={kickoff.strftime('%Y-%m-%d %H:%M')}, "
+                    f"window_end={fixture_window_end.strftime('%Y-%m-%d %H:%M')})"
+                )
+                return True
+
+            if now > fixture_window_end:
+                # Past the fixture's window but still not completed -- keep polling as straggler
+                logger.debug(
+                    f"Round {round_obj.round_number}: Fixture {fixture.home_team} vs {fixture.away_team} "
+                    f"past window but still incomplete, continuing to poll"
+                )
+                return True
+
+        # All incomplete fixtures are in the future (before their kickoff)
+        logger.debug(
+            f"Round {round_obj.round_number}: {len(incomplete_fixtures)} incomplete fixture(s) "
+            f"but none have reached their kickoff time yet"
+        )
+        return False
 
     def update_fixture_results(self):
         """Poll Football API for fixture results and update database.
@@ -620,6 +641,14 @@ class LMSScheduler:
             for pick in away_picks:
                 if pick.is_winner is None:
                     pick.is_winner = False
+                    if not pick.is_eliminated:
+                        pick.is_eliminated = True
+                        if pick.player and pick.player.status != 'eliminated':
+                            pick.player.status = 'eliminated'
+                            logger.info(
+                                f"IMMEDIATE ELIMINATION: player_id={pick.player_id} ({pick.player.name}) "
+                                f"eliminated via {fixture.home_team} {fixture.home_score}-{fixture.away_score} {fixture.away_team}"
+                            )
                     picks_updated += 1
                     logger.info(
                         f"PICK RESULT: player_id={pick.player_id} picked '{pick.team_picked}' "
@@ -644,6 +673,14 @@ class LMSScheduler:
             for pick in home_picks:
                 if pick.is_winner is None:
                     pick.is_winner = False
+                    if not pick.is_eliminated:
+                        pick.is_eliminated = True
+                        if pick.player and pick.player.status != 'eliminated':
+                            pick.player.status = 'eliminated'
+                            logger.info(
+                                f"IMMEDIATE ELIMINATION: player_id={pick.player_id} ({pick.player.name}) "
+                                f"eliminated via {fixture.home_team} {fixture.home_score}-{fixture.away_score} {fixture.away_team}"
+                            )
                     picks_updated += 1
                     logger.info(
                         f"PICK RESULT: player_id={pick.player_id} picked '{pick.team_picked}' "
@@ -657,6 +694,14 @@ class LMSScheduler:
             for pick in home_picks:
                 if pick.is_winner is None:
                     pick.is_winner = False  # Draw is NOT a win
+                    if not pick.is_eliminated:
+                        pick.is_eliminated = True
+                        if pick.player and pick.player.status != 'eliminated':
+                            pick.player.status = 'eliminated'
+                            logger.info(
+                                f"IMMEDIATE ELIMINATION: player_id={pick.player_id} ({pick.player.name}) "
+                                f"eliminated via draw {fixture.home_team} {fixture.home_score}-{fixture.away_score} {fixture.away_team}"
+                            )
                     picks_updated += 1
                     logger.info(
                         f"PICK RESULT: player_id={pick.player_id} picked '{pick.team_picked}' "
@@ -666,6 +711,14 @@ class LMSScheduler:
             for pick in away_picks:
                 if pick.is_winner is None:
                     pick.is_winner = False  # Draw is NOT a win
+                    if not pick.is_eliminated:
+                        pick.is_eliminated = True
+                        if pick.player and pick.player.status != 'eliminated':
+                            pick.player.status = 'eliminated'
+                            logger.info(
+                                f"IMMEDIATE ELIMINATION: player_id={pick.player_id} ({pick.player.name}) "
+                                f"eliminated via draw {fixture.home_team} {fixture.home_score}-{fixture.away_score} {fixture.away_team}"
+                            )
                     picks_updated += 1
                     logger.info(
                         f"PICK RESULT: player_id={pick.player_id} picked '{pick.team_picked}' "
@@ -731,28 +784,49 @@ class LMSScheduler:
                         logger.warning(f"  GUARD BLOCK: Round {round_obj.round_number} has no fixtures, skipping")
                         continue
 
-                    # ======== GUARD 2: Check all fixtures completed ========
+                    # ======== GUARD 2: Check all RELEVANT fixtures completed ========
+                    # A fixture is "relevant" if any player picked one of the teams in it.
+                    # The round can complete as soon as all picked teams' games have finished,
+                    # even if other fixtures in the matchday are still pending.
                     completed_fixtures = [f for f in fixtures if f.status == 'completed']
                     draw_fixtures = [f for f in completed_fixtures if f.home_score == f.away_score]
+                    pending_fixtures = [f for f in fixtures if f.status != 'completed']
+
+                    picks = Pick.query.filter_by(round_id=round_obj.id).all()
+                    picked_teams = {normalize_team_name(p.team_picked) for p in picks}
+
+                    # Find pending fixtures that involve a picked team
+                    relevant_pending = []
+                    for pf in pending_fixtures:
+                        home_canonical = normalize_team_name(pf.home_team)
+                        away_canonical = normalize_team_name(pf.away_team)
+                        if home_canonical in picked_teams or away_canonical in picked_teams:
+                            relevant_pending.append(pf)
 
                     logger.info(
                         f"  fixtures_total={len(fixtures)}, fixtures_completed={len(completed_fixtures)}, "
+                        f"fixtures_pending={len(pending_fixtures)}, relevant_pending={len(relevant_pending)}, "
                         f"fixtures_draw={len(draw_fixtures)}"
                     )
 
-                    if not all(f.status == 'completed' for f in fixtures):
-                        pending_fixtures = [f for f in fixtures if f.status != 'completed']
+                    if relevant_pending:
                         logger.info(
-                            f"  GUARD BLOCK: Round {round_obj.round_number} has {len(pending_fixtures)} fixture(s) not completed"
+                            f"  GUARD BLOCK: Round {round_obj.round_number} has {len(relevant_pending)} "
+                            f"pending fixture(s) with picked teams"
                         )
-                        for pf in pending_fixtures[:5]:  # Log first 5
+                        for pf in relevant_pending[:5]:
                             logger.info(f"    - {pf.home_team} vs {pf.away_team} (status={pf.status})")
                         continue
+
+                    if pending_fixtures:
+                        logger.info(
+                            f"  Round {round_obj.round_number}: {len(pending_fixtures)} pending fixture(s) "
+                            f"but none involve picked teams - proceeding with round completion"
+                        )
 
                     # ======== GUARD 3: Check picks exist for eligible players ========
                     eligible_players = self._get_eligible_players_for_round(round_obj)
                     eligible_count = len(eligible_players)
-                    picks = Pick.query.filter_by(round_id=round_obj.id).all()
                     picks_count = len(picks)
 
                     logger.info(f"  eligible_players={eligible_count}, picks_count={picks_count}")
@@ -888,6 +962,10 @@ class LMSScheduler:
                             winning_players.append(f"{pick.player.name}(id={pick.player.id}, pick={pick.team_picked})")
 
                     # Log summary for this round
+                    if eliminated_count == 0:
+                        logger.info(
+                            f"  All eliminations already processed per-fixture (immediate elimination active)"
+                        )
                     logger.info(
                         f"  ROUND {round_obj.round_number} SUMMARY: "
                         f"picks_evaluated={len(picks)}, winners={winners_count}, "
