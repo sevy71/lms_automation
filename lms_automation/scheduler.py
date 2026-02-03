@@ -2677,6 +2677,11 @@ class LMSScheduler:
                 }
 
             response = requests.post(url, json=payload)
+            if response.status_code != 200:
+                logger.error(
+                    f"Telegram sendMessage failed: status={response.status_code}, "
+                    f"chat_id={telegram_id}, response={response.text[:300]}"
+                )
             return response.status_code == 200
         except Exception as e:
             logger.error(f"Error sending Telegram message: {e}")
