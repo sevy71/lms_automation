@@ -1490,7 +1490,8 @@ class LMSScheduler:
             pick_url = f"{os.environ.get('BASE_URL', 'http://localhost:5000')}/pick/{pick_token.token}"
 
             if round_obj.first_kickoff_at:
-                deadline_str = round_obj.first_kickoff_at.strftime('%A %d %B at %H:%M')
+                deadline = round_obj.first_kickoff_at - timedelta(hours=1)
+                deadline_str = deadline.strftime('%A %d %B at %H:%M')
             else:
                 deadline_str = "soon"
 
@@ -3079,7 +3080,8 @@ class LMSScheduler:
             pick_url = f"{os.environ.get('BASE_URL', 'http://localhost:5000')}/pick/{pick_token.token}"
 
             if round_obj.first_kickoff_at:
-                deadline_str = round_obj.first_kickoff_at.strftime('%A %d %B at %H:%M')
+                deadline = round_obj.first_kickoff_at - timedelta(hours=1)
+                deadline_str = deadline.strftime('%A %d %B at %H:%M')
             else:
                 deadline_str = "soon"
 
