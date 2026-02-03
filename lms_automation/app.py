@@ -2903,7 +2903,14 @@ def send_picks():
         registration_url = f"{base_url}/register"
 
         # Format Telegram message
-        deadline_str = current_round.end_date.strftime('%a %d %b %Y, %H:%M') if current_round.end_date else None
+        # Deadline is 1 hour before first kickoff
+        if current_round.first_kickoff_at:
+            deadline_dt = current_round.first_kickoff_at - timedelta(hours=1)
+            deadline_str = deadline_dt.strftime('%A %d %B at %H:%M')
+        elif current_round.end_date:
+            deadline_str = current_round.end_date.strftime('%A %d %B at %H:%M')
+        else:
+            deadline_str = None
         message_lines = [
             f"🏆 <b>Last Man Standing - Round {current_round.round_number}</b>",
             "",
@@ -2915,7 +2922,7 @@ def send_picks():
             "• Pick a team you think will WIN",
             "• You can only use each team ONCE",
             "• If your team loses or draws, you're out!",
-            (f"• Link valid until: {deadline_str}" if deadline_str else "• Link valid until the round deadline"),
+            (f"• ⏰ Deadline: <b>{deadline_str}</b>" if deadline_str else "• Link valid until the round deadline"),
             "",
             "Good luck! 🍀",
             "",
