@@ -5137,8 +5137,23 @@ def get_player_pick_history(token):
     
     try:
         player = pick_token.player
-        picks = Pick.query.filter_by(player_id=player.id).join(Round).order_by(Round.round_number).all()
-        
+
+        # Determine current cycle: use active/pending round, or fall back to latest
+        current_round = Round.query.filter(Round.status.in_(['active', 'pending'])).order_by(Round.round_number.desc()).first()
+        if current_round:
+            current_cycle = current_round.cycle_number or 1
+        else:
+            latest_round = Round.query.order_by(Round.round_number.desc()).first()
+            current_cycle = (latest_round.cycle_number or 1) if latest_round else 1
+
+        # Only show picks from the current game/cycle
+        picks = (Pick.query
+            .filter_by(player_id=player.id)
+            .join(Round)
+            .filter(Round.cycle_number == current_cycle)
+            .order_by(Round.round_number)
+            .all())
+
         pick_history = []
         for pick in picks:
             round_info = Round.query.get(pick.round_id)
