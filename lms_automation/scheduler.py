@@ -1397,6 +1397,19 @@ class LMSScheduler:
                     fixtures_created += 1
 
                 logger.info(f"AUTO-CREATE: Added {fixtures_created} fixtures for Round {next_round_number}")
+
+                # Calculate and set first_kickoff_at from fixtures
+                if fixtures_created > 0:
+                    earliest_kickoff = None
+                    for fixture in Fixture.query.filter_by(round_id=new_round.id).all():
+                        if fixture.date and fixture.time:
+                            kickoff_dt = datetime.combine(fixture.date, fixture.time)
+                            if earliest_kickoff is None or kickoff_dt < earliest_kickoff:
+                                earliest_kickoff = kickoff_dt
+
+                    if earliest_kickoff:
+                        new_round.first_kickoff_at = earliest_kickoff
+                        logger.info(f"AUTO-CREATE: Set first_kickoff_at to {earliest_kickoff}")
             else:
                 logger.warning("AUTO-CREATE: Football API unavailable, round created without fixtures")
 
