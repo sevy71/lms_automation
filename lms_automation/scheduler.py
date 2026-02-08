@@ -1185,15 +1185,26 @@ class LMSScheduler:
             logger.info(f"{active_count} players still active - game continues")
             logger.info("=" * 60)
 
-            # Normal progression:
-            # - Next round will be created manually by admin or via API
-            # - OR automatically if automation is enabled
+            # Normal progression: Auto-create next round
+            current_cycle = completed_round.cycle_number or 1
+            next_round_number = completed_round.round_number + 1
 
             # Check for end of cycle (Round 20 with 2+ survivors) - special case
             if completed_round.round_number == 20 and active_count >= 2:
-                next_cycle = (completed_round.cycle_number or 1) + 1
-                logger.info(f"END OF CYCLE {completed_round.cycle_number}: {active_count} survivors advance to Cycle {next_cycle}")
+                next_cycle = current_cycle + 1
+                logger.info(f"END OF CYCLE {current_cycle}: {active_count} survivors advance to Cycle {next_cycle}")
                 self._send_cycle_complete_notification(active_players, next_cycle)
+                # Create Round 1 of next cycle
+                next_round_number = 1
+                current_cycle = next_cycle
+
+            # Auto-create next round for normal progression
+            new_round = self._create_next_round(completed_round, next_round_number, current_cycle)
+            if new_round:
+                logger.info(
+                    f"AUTO-CREATED: Round {new_round.round_number} (Cycle {new_round.cycle_number}, "
+                    f"PL Matchday {new_round.pl_matchday})"
+                )
 
             logger.info("=== GAME STATE EVALUATION COMPLETE (continue) ===")
             return 'continue'
@@ -1308,6 +1319,92 @@ class LMSScheduler:
 
         except Exception as e:
             logger.error(f"ROLLOVER: Error creating round: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            db.session.rollback()
+            return None
+
+    def _create_next_round(self, completed_round, next_round_number, cycle_number):
+        """
+        Auto-create the next round for normal game progression (when 2+ players survive).
+
+        Args:
+            completed_round: The round that just completed
+            next_round_number: The round number for the new round
+            cycle_number: The cycle number for the new round
+
+        Returns:
+            Round object if created, None if already exists or error
+        """
+        try:
+            # Idempotency: check if next round already exists
+            existing = Round.query.filter_by(
+                cycle_number=cycle_number,
+                round_number=next_round_number
+            ).first()
+
+            if existing:
+                logger.info(
+                    f"Round {next_round_number} (Cycle {cycle_number}) already exists "
+                    f"(id={existing.id}), skipping auto-creation"
+                )
+                return None
+
+            # Determine next PL matchday
+            current_matchday = completed_round.pl_matchday or 1
+            next_matchday = min(current_matchday + 1, 38)
+
+            # Create new round
+            new_round = Round(
+                round_number=next_round_number,
+                pl_matchday=next_matchday,
+                cycle_number=cycle_number,
+                status='pending'
+            )
+
+            db.session.add(new_round)
+            db.session.flush()  # Get the round ID
+
+            logger.info(
+                f"AUTO-CREATE: Round {next_round_number} (Cycle {cycle_number}, "
+                f"PL Matchday {next_matchday}) created (id={new_round.id})"
+            )
+
+            # Sync fixtures from API
+            api = self._get_api()
+            if api:
+                season_param = str(new_round.get_api_season_year()) if hasattr(new_round, 'get_api_season_year') and new_round.get_api_season_year() else None
+                fixtures_data = api.get_premier_league_fixtures(
+                    matchday=next_matchday,
+                    season=season_param
+                )
+                formatted = api.format_fixtures_for_db(fixtures_data, next_matchday)
+
+                fixtures_created = 0
+                for fx in formatted:
+                    fixture = Fixture(
+                        round_id=new_round.id,
+                        event_id=fx.get('event_id'),
+                        home_team=fx['home_team'],
+                        away_team=fx['away_team'],
+                        date=fx['date'],
+                        time=fx['time'],
+                        home_score=fx.get('home_score'),
+                        away_score=fx.get('away_score'),
+                        status=fx.get('status', 'scheduled')
+                    )
+                    db.session.add(fixture)
+                    fixtures_created += 1
+
+                logger.info(f"AUTO-CREATE: Added {fixtures_created} fixtures for Round {next_round_number}")
+            else:
+                logger.warning("AUTO-CREATE: Football API unavailable, round created without fixtures")
+
+            db.session.commit()
+            return new_round
+
+        except Exception as e:
+            logger.error(f"AUTO-CREATE: Error creating Round {next_round_number}: {e}")
             import traceback
             logger.error(traceback.format_exc())
             db.session.rollback()
