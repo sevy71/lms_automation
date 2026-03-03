@@ -78,6 +78,29 @@ class LMSClient:
             raise LMSAPIError(data.get("error") or "Failed to submit pick")
         return data
 
+    async def check_new_game(self) -> Dict[str, Any]:
+        """Check if a new game can be started."""
+        if not self.admin_password:
+            raise LMSAPIError("Admin password required for this operation")
+
+        headers = {"X-Admin-Password": self.admin_password}
+        return await self._request("GET", "/api/admin/check-new-game", headers=headers)
+
+    async def start_new_game(self, pl_matchday: int | None = None) -> Dict[str, Any]:
+        """Start a new game cycle."""
+        if not self.admin_password:
+            raise LMSAPIError("Admin password required for this operation")
+
+        headers = {"X-Admin-Password": self.admin_password}
+        payload = {}
+        if pl_matchday is not None:
+            payload["pl_matchday"] = pl_matchday
+
+        data = await self._request("POST", "/api/admin/start-new-game", json=payload, headers=headers)
+        if not data.get("success"):
+            raise LMSAPIError(data.get("error") or "Failed to start new game")
+        return data
+
 
 def _extract_error_message(response: httpx.Response) -> str:
     try:

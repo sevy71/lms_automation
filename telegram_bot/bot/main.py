@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 from telegram.ext import Application, ApplicationBuilder
 
 from .config import BotConfig
-from .handlers import picks, registration, reminders
+from .handlers import newgame, picks, registration, reminders
 from .services import LMSClient
 
 logger = logging.getLogger(__name__)
@@ -28,6 +28,8 @@ def build_application(config: BotConfig) -> Application:
     for handler in picks.build_handlers():
         app.add_handler(handler)
     for handler in reminders.build_handlers():
+        app.add_handler(handler)
+    for handler in newgame.build_handlers():
         app.add_handler(handler)
 
     return app

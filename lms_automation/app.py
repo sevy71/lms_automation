@@ -1577,6 +1577,109 @@ def finalize_round():
         }), 500
 
 
+@app.route('/api/admin/check-new-game', methods=['GET'])
+@admin_required
+def check_new_game():
+    """
+    Check if a new game can be started and provide information about fixture availability.
+
+    Returns JSON with:
+        - can_start: bool - Whether a new game can be started
+        - has_winner: bool - Whether the last completed round had a winner
+        - next_cycle: int - The next cycle number
+        - next_matchday: int - The next matchday that would be used
+        - fixtures_available: int - Number of fixtures available for the next matchday
+        - remaining_matchdays: int - Number of matchdays left in the season
+        - warning: str - Warning message if fixtures are limited
+        - error: str - Error message if game cannot be started
+    """
+    import logging
+    logger = logging.getLogger(__name__)
+
+    try:
+        # Find the last completed round
+        last_completed_round = Round.query.filter_by(status='completed').order_by(Round.id.desc()).first()
+
+        if not last_completed_round:
+            return jsonify({
+                'can_start': False,
+                'has_winner': False,
+                'error': 'No completed rounds found. Cannot start new game.'
+            }), 200
+
+        # Check if game ended with a winner
+        special_note = last_completed_round.special_note or ''
+        has_winner = 'game_winner_announced' in special_note
+
+        if not has_winner:
+            return jsonify({
+                'can_start': False,
+                'has_winner': False,
+                'error': 'Last completed round did not have a winner. Current game is still in progress.'
+            }), 200
+
+        # Determine next cycle and matchday
+        current_cycle = last_completed_round.cycle_number or 1
+        next_cycle = current_cycle + 1
+
+        # Calculate next matchday
+        if last_completed_round.pl_matchday:
+            next_matchday = (last_completed_round.pl_matchday % 38) + 1
+        else:
+            next_matchday = 1
+
+        # Check if next cycle already exists
+        existing_next_round = Round.query.filter_by(
+            cycle_number=next_cycle,
+            round_number=1
+        ).first()
+
+        if existing_next_round:
+            return jsonify({
+                'can_start': False,
+                'has_winner': True,
+                'error': f'Cycle {next_cycle} Round 1 already exists.',
+                'next_cycle': next_cycle,
+                'existing_round_id': existing_next_round.id
+            }), 200
+
+        # Check fixture availability for the next matchday
+        from lms_automation.football_api import FootballDataAPI
+        from lms_automation.models import get_default_api_season_year
+
+        api = FootballDataAPI()
+        api_season_year = get_default_api_season_year()
+        fixtures_data = api.get_premier_league_fixtures(matchday=next_matchday, season=str(api_season_year))
+        fixtures_available = len(fixtures_data.get('matches', []))
+
+        # Calculate remaining matchdays (38 total in a season)
+        remaining_matchdays = 38 - next_matchday + 1
+
+        # Determine if there's a warning
+        warning = None
+        if fixtures_available == 0:
+            warning = f'No fixtures found for matchday {next_matchday}. The season may have ended or the API may not have data for this matchday yet.'
+        elif remaining_matchdays < 10:
+            warning = f'Only {remaining_matchdays} matchdays remaining in the season. May not be enough to complete a full game.'
+
+        return jsonify({
+            'can_start': True,
+            'has_winner': True,
+            'next_cycle': next_cycle,
+            'next_matchday': next_matchday,
+            'fixtures_available': fixtures_available,
+            'remaining_matchdays': remaining_matchdays,
+            'warning': warning
+        }), 200
+
+    except Exception as e:
+        logger.exception("check-new-game failed")
+        return jsonify({
+            'can_start': False,
+            'error': str(e)
+        }), 500
+
+
 @app.route('/api/admin/start-new-game', methods=['POST'])
 @admin_required
 def start_new_game():
@@ -2526,7 +2629,9 @@ def _evaluate_game_state_after_round_standalone(completed_round) -> str:
             admin_message = (
                 f"🏆 WINNER DECLARED: {winner.name} (id={winner.id})\n\n"
                 f"Round {completed_round.round_number} complete.\n"
-                f"Game over - competition ended."
+                f"Game over - competition ended.\n\n"
+                f"💡 Ready to start a new game?\n"
+                f"Use /newgame to check fixture availability and start a new cycle."
             )
             send_telegram_message(admin_telegram_id, admin_message)
             logger.info(f"Admin winner notification sent to telegram_id={admin_telegram_id}")
