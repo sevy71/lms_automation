@@ -48,18 +48,18 @@ async def newgame_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         warning = check_result.get("warning")
 
         # Build confirmation message
-        message = f"🎮 Ready to start a new game!\n\n"
-        message += f"📊 Next cycle: {next_cycle}\n"
-        message += f"⚽ Starting matchday: {next_matchday}\n"
-        message += f"📅 Fixtures available: {fixtures_available}\n"
-        message += f"📈 Remaining matchdays: {remaining_matchdays}\n"
+        confirmation_text = f"🎮 Ready to start a new game!\n\n"
+        confirmation_text += f"📊 Next cycle: {next_cycle}\n"
+        confirmation_text += f"⚽ Starting matchday: {next_matchday}\n"
+        confirmation_text += f"📅 Fixtures available: {fixtures_available}\n"
+        confirmation_text += f"📈 Remaining matchdays: {remaining_matchdays}\n"
 
         if warning:
-            message += f"\n⚠️ {warning}\n"
+            confirmation_text += f"\n⚠️ {warning}\n"
 
-        message += f"\n✅ All previous players will be automatically included.\n"
-        message += f"All player statuses will be reset to 'active'.\n\n"
-        message += f"Do you want to start the new game?"
+        confirmation_text += f"\n✅ All previous players will be automatically included.\n"
+        confirmation_text += f"All player statuses will be reset to 'active'.\n\n"
+        confirmation_text += f"Do you want to start the new game?"
 
         # Create inline keyboard for confirmation
         keyboard = [
@@ -70,7 +70,7 @@ async def newgame_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
 
-        await message.reply_text(message, reply_markup=reply_markup)
+        await message.reply_text(confirmation_text, reply_markup=reply_markup)
 
     except LMSAPIError as e:
         logger.error(f"LMS API error in newgame_command: {e}")
