@@ -445,9 +445,17 @@ def generate_picks_grid_xlsx():
 def admin_required(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
-        if not session.get('admin_logged_in'):
-            return redirect(url_for('admin_login', next=request.url))
-        return f(*args, **kwargs)
+        # Check for session-based auth (browser)
+        if session.get('admin_logged_in'):
+            return f(*args, **kwargs)
+
+        # Check for header-based auth (API clients like Telegram bot)
+        admin_password_header = request.headers.get('X-Admin-Password')
+        if admin_password_header and admin_password_header == ADMIN_PASSWORD:
+            return f(*args, **kwargs)
+
+        # No valid authentication found
+        return redirect(url_for('admin_login', next=request.url))
     return decorated_function
 
 @app.route('/admin/login', methods=['GET', 'POST'])
