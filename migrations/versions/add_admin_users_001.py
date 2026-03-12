@@ -22,6 +22,7 @@ import warnings
 
 from alembic import op
 import sqlalchemy as sa
+from sqlalchemy import inspect
 from sqlalchemy.sql import text
 
 
@@ -41,35 +42,42 @@ def _hash_password(password: str) -> str:
 def upgrade():
     conn = op.get_bind()
     dialect = conn.dialect.name  # 'postgresql' or 'sqlite'
+    inspector = inspect(conn)
 
     # ------------------------------------------------------------------
-    # 1. Create admin_users table
+    # 1. Create admin_users table (idempotent)
     # ------------------------------------------------------------------
-    op.create_table(
-        'admin_users',
-        sa.Column('id', sa.Integer(), nullable=False),
-        sa.Column('username', sa.String(length=100), nullable=False),
-        sa.Column('password_hash', sa.String(length=255), nullable=False),
-        sa.Column('organiser_id', sa.Integer(), nullable=False),
-        sa.Column('role', sa.String(length=20), nullable=False,
-                  server_default='organiser_admin'),
-        sa.Column('is_active', sa.Boolean(), nullable=False,
-                  server_default=sa.text('1') if dialect == 'sqlite' else sa.text('true')),
-        sa.Column('created_at', sa.DateTime(), nullable=False,
-                  server_default=sa.text('CURRENT_TIMESTAMP')),
-        sa.PrimaryKeyConstraint('id'),
-        sa.UniqueConstraint('username', name='uq_admin_users_username'),
-    )
-    op.create_index('ix_admin_users_username', 'admin_users', ['username'], unique=True)
-    op.create_index('ix_admin_users_organiser_id', 'admin_users', ['organiser_id'])
+    table_exists = inspector.has_table('admin_users')
 
-    # Add FK constraint (PostgreSQL only — SQLite silently ignores FKs anyway)
-    if dialect != 'sqlite':
-        op.create_foreign_key(
-            'fk_admin_users_organiser_id',
-            'admin_users', 'organisers',
-            ['organiser_id'], ['id'],
+    if not table_exists:
+        op.create_table(
+            'admin_users',
+            sa.Column('id', sa.Integer(), nullable=False),
+            sa.Column('username', sa.String(length=100), nullable=False),
+            sa.Column('password_hash', sa.String(length=255), nullable=False),
+            sa.Column('organiser_id', sa.Integer(), nullable=False),
+            sa.Column('role', sa.String(length=20), nullable=False,
+                      server_default='organiser_admin'),
+            sa.Column('is_active', sa.Boolean(), nullable=False,
+                      server_default=sa.text('1') if dialect == 'sqlite' else sa.text('true')),
+            sa.Column('created_at', sa.DateTime(), nullable=False,
+                      server_default=sa.text('CURRENT_TIMESTAMP')),
+            sa.PrimaryKeyConstraint('id'),
+            sa.UniqueConstraint('username', name='uq_admin_users_username'),
         )
+
+        op.create_index('ix_admin_users_username', 'admin_users', ['username'], unique=True)
+        op.create_index('ix_admin_users_organiser_id', 'admin_users', ['organiser_id'])
+
+        # Add FK constraint (PostgreSQL only — SQLite silently ignores FKs anyway)
+        if dialect != 'sqlite':
+            op.create_foreign_key(
+                'fk_admin_users_organiser_id',
+                'admin_users', 'organisers',
+                ['organiser_id'], ['id'],
+            )
+    else:
+        print("[MIGRATION] admin_users already exists — skipping table creation.")
 
     # ------------------------------------------------------------------
     # 2. Bootstrap super-admin account
