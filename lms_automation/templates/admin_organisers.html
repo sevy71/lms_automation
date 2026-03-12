@@ -21,6 +21,7 @@
       {% endfor %}
     {% endwith %}
 
+    {# ── Organiser list ── #}
     <div class="card mb-4">
       <div class="card-header fw-semibold">All Organisers</div>
       <div class="card-body p-0">
@@ -31,6 +32,7 @@
               <th>Name</th>
               <th>Slug</th>
               <th>Status</th>
+              <th>Admin accounts</th>
               <th>Created</th>
               <th></th>
             </tr>
@@ -51,14 +53,34 @@
                   {{ org.status }}
                 </span>
               </td>
+              <td>
+                {% set org_admins = admin_users_by_org.get(org.id, []) %}
+                {% if org_admins %}
+                  {% for au in org_admins %}
+                    <span class="badge {{ 'bg-warning text-dark' if au.role == 'super_admin' else 'bg-info text-dark' }} me-1">
+                      {{ au.username }}
+                      <small>({{ au.role }})</small>
+                      {% if not au.is_active %}<em>inactive</em>{% endif %}
+                    </span>
+                  {% endfor %}
+                {% else %}
+                  <span class="text-muted small">none</span>
+                {% endif %}
+              </td>
               <td>{{ org.created_at.strftime('%Y-%m-%d %H:%M') if org.created_at else '—' }}</td>
-              <td class="text-muted small">
-                {# Phase 2: switch-organiser and edit actions will go here #}
+              <td>
+                {% if org.id != current_organiser_id %}
+                <form method="post" action="{{ url_for('switch_organiser') }}" class="d-inline">
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                  <input type="hidden" name="organiser_id" value="{{ org.id }}">
+                  <button type="submit" class="btn btn-sm btn-outline-primary">Switch to</button>
+                </form>
+                {% endif %}
               </td>
             </tr>
             {% else %}
             <tr>
-              <td colspan="6" class="text-center text-muted py-3">No organisers found.</td>
+              <td colspan="7" class="text-center text-muted py-3">No organisers found.</td>
             </tr>
             {% endfor %}
           </tbody>
@@ -66,16 +88,14 @@
       </div>
     </div>
 
-    <div class="card">
+    {# ── Create Organiser ── #}
+    <div class="card mb-4">
       <div class="card-header fw-semibold">Create New Organiser</div>
       <div class="card-body">
         <p class="text-muted small mb-3">
           Creating a new organiser gives it an isolated game context — its own players,
           rounds, and picks. Players and rounds must be explicitly associated with the
           new organiser; existing data remains under the <code>default</code> organiser.
-          <br>
-          <strong>Phase 2 note:</strong> Per-organiser admin logins and full role-based
-          access control will be added in a future release.
         </p>
         <form method="post" action="{{ url_for('create_organiser') }}">
           <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
@@ -99,6 +119,56 @@
         </form>
       </div>
     </div>
+
+    {# ── Create Admin Account for an Organiser ── #}
+    <div class="card mb-4">
+      <div class="card-header fw-semibold">Create Admin Account</div>
+      <div class="card-body">
+        <p class="text-muted small mb-3">
+          Create a login for an organiser admin. They can log in at
+          <code>{{ request.url_root }}admin/login</code> using their username and password.
+          Organiser admins can only see their own organiser's data.
+        </p>
+        <form method="post" action="#" id="create-admin-form">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+          <div class="row g-3">
+            <div class="col-md-3">
+              <label for="ca-organiser" class="form-label fw-semibold">Organiser <span class="text-danger">*</span></label>
+              <select id="ca-organiser" name="organiser_id" class="form-select" required
+                      onchange="document.getElementById('create-admin-form').action='/admin/organisers/' + this.value + '/create-admin'">
+                <option value="">— select —</option>
+                {% for org in organisers %}
+                <option value="{{ org.id }}">{{ org.name }}</option>
+                {% endfor %}
+              </select>
+            </div>
+            <div class="col-md-3">
+              <label for="ca-username" class="form-label fw-semibold">Username <span class="text-danger">*</span></label>
+              <input type="text" id="ca-username" name="new_username" class="form-control"
+                     placeholder="e.g. westlondon-admin" required maxlength="100"
+                     autocomplete="off">
+            </div>
+            <div class="col-md-3">
+              <label for="ca-password" class="form-label fw-semibold">Password <span class="text-danger">*</span></label>
+              <input type="password" id="ca-password" name="new_password" class="form-control"
+                     required minlength="12" autocomplete="new-password"
+                     placeholder="min 12 characters">
+            </div>
+            <div class="col-md-2">
+              <label for="ca-role" class="form-label fw-semibold">Role</label>
+              <select id="ca-role" name="new_role" class="form-select">
+                <option value="organiser_admin" selected>Organiser Admin</option>
+                <option value="super_admin">Super Admin</option>
+              </select>
+            </div>
+            <div class="col-md-1 d-flex align-items-end">
+              <button type="submit" class="btn btn-success w-100">Create</button>
+            </div>
+          </div>
+        </form>
+      </div>
+    </div>
+
   </div>
 </div>
 {% endblock %}

@@ -301,6 +301,17 @@ def _ensure_minimum_schema():
                     except Exception as e:
                         app.logger.warning(f'Could not add notification_outbox.idempotency_key: {e}')
 
+            # Create admin_users table if missing (Phase 2c — per-organiser admin accounts)
+            if not insp.has_table('admin_users') and insp.has_table('organisers'):
+                try:
+                    from lms_automation.models import AdminUser
+                    AdminUser.__table__.create(bind=engine)
+                    app.logger.info('Created missing table admin_users')
+                    # Bootstrap super-admin from env vars
+                    _bootstrap_super_admin_if_needed()
+                except Exception as e:
+                    app.logger.warning(f'Could not create admin_users: {e}')
+
             db.session.commit()
     except Exception as e:
         db.session.rollback()
@@ -330,8 +341,10 @@ def _ensure_schema_once_before_requests():
 
 
 # Admin authentication
-ADMIN_PASSWORD = os.environ.get('ADMIN_PASSWORD', 'admin123')  # Change this!
-ADMIN_WHATSAPP = os.environ.get('ADMIN_WHATSAPP')  # Optional: admin WhatsApp number (e.g., +441234567890)
+# ADMIN_PASSWORD is kept for migration bootstrap and legacy fallback only.
+# Primary auth is now DB-backed via the admin_users table (Phase 2c).
+ADMIN_PASSWORD = os.environ.get('ADMIN_PASSWORD', 'admin123')
+ADMIN_WHATSAPP = os.environ.get('ADMIN_WHATSAPP')  # Optional: admin WhatsApp number
 
 # --- Startup security validation ---
 _IS_DEV = os.environ.get('FLASK_ENV', 'production') == 'development' or os.environ.get('DEBUG', '').lower() in ('1', 'true')
@@ -345,10 +358,13 @@ def _validate_security_config():
             "FATAL: SECRET_KEY is set to the default insecure value. "
             "Set the SECRET_KEY environment variable before starting in production."
         )
+    # Phase 2c: primary auth is DB-backed. ADMIN_PASSWORD is only used for
+    # migration bootstrap. Warn but don't block startup.
     if ADMIN_PASSWORD == 'admin123':
-        raise RuntimeError(
-            "FATAL: ADMIN_PASSWORD is set to the default insecure value. "
-            "Set the ADMIN_PASSWORD environment variable before starting in production."
+        app.logger.warning(
+            "SECURITY WARNING: ADMIN_PASSWORD is the insecure default 'admin123'. "
+            "This is used as the super-admin bootstrap password. "
+            "Change it via the admin interface immediately after first login."
         )
 
 _validate_security_config()
@@ -523,7 +539,13 @@ def generate_picks_grid_xlsx():
 
 _CSRF_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 
+
 def admin_required(f):
+    """Redirect/reject if the session is not authenticated.
+
+    For state-changing methods (POST/PUT/PATCH/DELETE) also validates the CSRF
+    token delivered either as ``X-CSRF-Token`` header or ``csrf_token`` form field.
+    """
     @wraps(f)
     def decorated_function(*args, **kwargs):
         if not session.get('admin_logged_in'):
@@ -541,8 +563,32 @@ def admin_required(f):
     return decorated_function
 
 
+def super_admin_required(f):
+    """Require super_admin role. Must be applied after @admin_required."""
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if not session.get('admin_logged_in'):
+            return redirect(url_for('admin_login', next=request.url))
+        if session.get('admin_role') != 'super_admin':
+            if request.is_json or request.accept_mimetypes.best == 'application/json':
+                return jsonify({'success': False, 'error': 'Forbidden: super-admin only'}), 403
+            flash('Access denied: super-admin only.', 'danger')
+            return redirect(url_for('admin_dashboard'))
+        if request.method in _CSRF_METHODS:
+            token = _get_request_csrf_token(request)
+            if not _validate_csrf_token(token):
+                log_admin_action(
+                    'admin_api', 'blocked',
+                    endpoint=request.endpoint,
+                    reason='csrf_mismatch',
+                )
+                return jsonify({'success': False, 'error': 'CSRF validation failed'}), 403
+        return f(*args, **kwargs)
+    return decorated_function
+
+
 # ---------------------------------------------------------------------------
-# Organiser context helpers (Phase 1 multi-organiser foundation)
+# Organiser context helpers
 # ---------------------------------------------------------------------------
 
 def _get_default_organiser_id():
@@ -555,19 +601,45 @@ def _get_default_organiser_id():
         return None
 
 
+def _bootstrap_super_admin_if_needed():
+    """Create the default super-admin account if admin_users table is empty.
+
+    Used by _ensure_minimum_schema when the table is created outside of the
+    Alembic migration (e.g. direct create_all path in CI/test environments).
+    """
+    try:
+        from lms_automation.models import AdminUser
+        if AdminUser.query.count() > 0:
+            return  # Already populated
+        default_oid = _get_default_organiser_id()
+        if not default_oid:
+            return
+        username = os.environ.get('BOOTSTRAP_ADMIN_USERNAME', 'admin')
+        password = os.environ.get('ADMIN_PASSWORD', 'admin123')
+        admin_user = AdminUser(
+            username=username,
+            organiser_id=default_oid,
+            role='super_admin',
+            is_active=True,
+        )
+        admin_user.set_password(password)
+        db.session.add(admin_user)
+        db.session.commit()
+        app.logger.info(f"Bootstrapped super-admin '{username}' in admin_users table.")
+    except Exception as e:
+        app.logger.warning(f'_bootstrap_super_admin_if_needed failed: {e}')
+
+
 def get_current_organiser_id():
     """Return the organiser_id for the current admin session.
 
     Falls back to the default organiser so pre-migration sessions still work.
     Returns None only if the organisers table doesn't exist yet (pre-migration).
-
-    TODO Phase 2: raise an error if no organiser_id is set, once all admin
-    sessions are guaranteed to have organiser context.
     """
     oid = session.get('organiser_id')
     if oid:
         return oid
-    # Session predates Phase 1 — lazily resolve and cache
+    # Session predates Phase 1 / Phase 2c — lazily resolve and cache
     oid = _get_default_organiser_id()
     if oid:
         session['organiser_id'] = oid
@@ -579,9 +651,6 @@ def check_organiser_owns(record, organiser_id):
 
     Uses getattr so this is safe against objects that don't yet have the
     organiser_id column (pre-migration compat).
-
-    TODO Phase 2: remove the getattr fallback once all records are guaranteed
-    to have organiser_id set.
     """
     record_org_id = getattr(record, 'organiser_id', None)
     if record_org_id is None:
@@ -589,56 +658,134 @@ def check_organiser_owns(record, organiser_id):
         return True
     return record_org_id == organiser_id
 
+
+# ---------------------------------------------------------------------------
+# DB-backed admin authentication helpers (Phase 2c)
+# ---------------------------------------------------------------------------
+
+def _lookup_admin_user(username):
+    """Return AdminUser for username, or None. Returns None gracefully if table missing."""
+    try:
+        from lms_automation.models import AdminUser
+        return AdminUser.query.filter_by(username=username, is_active=True).first()
+    except Exception:
+        return None
+
+
+def _admin_users_table_exists():
+    """Return True if the admin_users table has been migrated in."""
+    try:
+        from lms_automation.extensions import db
+        from sqlalchemy import inspect as sa_inspect
+        insp = sa_inspect(db.engine)
+        return insp.has_table('admin_users')
+    except Exception:
+        return False
+
+
+def _set_admin_session(admin_user):
+    """Populate session after successful DB-backed login."""
+    session.clear()
+    session['admin_logged_in'] = True
+    session.permanent = True
+    session['admin_user_id'] = admin_user.id
+    session['admin_role'] = admin_user.role
+    session['organiser_id'] = admin_user.organiser_id
+    # Cache display name to avoid extra query on every request
+    try:
+        session['organiser_name'] = admin_user.organiser.name if admin_user.organiser else ''
+    except Exception:
+        session['organiser_name'] = ''
+
+
+# ---------------------------------------------------------------------------
+# Auth routes
+# ---------------------------------------------------------------------------
+
 @app.route('/admin/login', methods=['GET', 'POST'])
 @limiter.limit("5 per minute")
 def admin_login():
     if request.method == 'POST':
+        username = request.form.get('username', '').strip()
         password = request.form.get('password', '')
-        csrf_token = request.form.get('csrf_token', '')
+        csrf_token_val = request.form.get('csrf_token', '')
 
-        if not _validate_csrf_token(csrf_token):
+        if not _validate_csrf_token(csrf_token_val):
             log_admin_action('admin_login', 'blocked', reason='csrf_mismatch')
             flash('Invalid request. Please try again.', 'error')
             return render_template('admin_login.html'), 403
 
-        pw_bytes = password.encode()
-        expected_bytes = ADMIN_PASSWORD.encode()
-        if hmac.compare_digest(pw_bytes, expected_bytes):
-            session.clear()
-            session['admin_logged_in'] = True
-            session.permanent = True
-            # Phase 1: bind admin session to the default organiser.
-            # Phase 2: resolve per-admin organiser when multi-admin is introduced.
-            default_oid = _get_default_organiser_id()
-            if default_oid:
-                session['organiser_id'] = default_oid
-            log_admin_action('admin_login', 'success')
-            raw_next = request.args.get('next', '')
-            parsed = urllib.parse.urlparse(raw_next)
-            # Allow relative paths only to prevent open redirect
-            if raw_next and not parsed.netloc and not parsed.scheme:
-                next_page = raw_next
+        # --- Primary path: DB-backed auth (Phase 2c) ---
+        if _admin_users_table_exists() and username:
+            admin_user = _lookup_admin_user(username)
+            if admin_user and admin_user.check_password(password):
+                _set_admin_session(admin_user)
+                log_admin_action('admin_login', 'success',
+                                 admin_username=username, role=admin_user.role)
+                raw_next = request.args.get('next', '')
+                parsed = urllib.parse.urlparse(raw_next)
+                if raw_next and not parsed.netloc and not parsed.scheme:
+                    next_page = raw_next
+                else:
+                    next_page = url_for('admin_dashboard')
+                return redirect(next_page)
             else:
-                next_page = url_for('admin_dashboard')
-            return redirect(next_page)
+                log_admin_action('admin_login', 'failure', admin_username=username)
+                flash('Invalid username or password.', 'error')
+                return render_template('admin_login.html')
+
+        # --- Legacy fallback: env-var password (pre-migration or username omitted) ---
+        # This path is deprecated and will be removed once all deployments have migrated.
+        if not username:
+            pw_bytes = password.encode()
+            expected_bytes = ADMIN_PASSWORD.encode()
+            if hmac.compare_digest(pw_bytes, expected_bytes):
+                session.clear()
+                session['admin_logged_in'] = True
+                session.permanent = True
+                session['admin_role'] = 'super_admin'
+                default_oid = _get_default_organiser_id()
+                if default_oid:
+                    session['organiser_id'] = default_oid
+                log_admin_action('admin_login', 'success',
+                                 path='legacy_env_password')
+                app.logger.warning(
+                    "Admin logged in via deprecated legacy env-password path. "
+                    "Run the add_admin_users_001 migration to enable DB-backed login."
+                )
+                raw_next = request.args.get('next', '')
+                parsed = urllib.parse.urlparse(raw_next)
+                if raw_next and not parsed.netloc and not parsed.scheme:
+                    next_page = raw_next
+                else:
+                    next_page = url_for('admin_dashboard')
+                return redirect(next_page)
+            else:
+                log_admin_action('admin_login', 'failure')
+                flash('Invalid password.', 'error')
         else:
-            log_admin_action('admin_login', 'failure')
-            flash('Invalid password', 'error')
+            # Username provided but admin_users table missing — clear error
+            log_admin_action('admin_login', 'failure', admin_username=username,
+                             reason='admin_users_table_missing')
+            flash('Admin accounts not yet migrated. Leave username blank and use the admin password.', 'error')
 
     return render_template('admin_login.html')
 
+
 @app.route('/admin/logout')
 def admin_logout():
-    log_admin_action('admin_logout', 'success')
+    log_admin_action('admin_logout', 'success',
+                     admin_username=session.get('admin_user_id', 'legacy'))
     session.clear()
-    flash('You have been logged out', 'info')
+    flash('You have been logged out.', 'info')
     return redirect(url_for('index'))
+
 
 @app.route('/admin/change-password', methods=['POST'])
 @admin_required
 def change_admin_password():
+    """Change the current admin user's password (DB-backed path)."""
     try:
-        global ADMIN_PASSWORD
         data = request.get_json()
         current_password = data.get('current_password', '')
         new_password = data.get('new_password', '')
@@ -646,20 +793,34 @@ def change_admin_password():
         if not current_password or not new_password:
             return jsonify({'success': False, 'error': 'Current and new password are required'}), 400
 
-        if not hmac.compare_digest(current_password.encode(), ADMIN_PASSWORD.encode()):
-            log_admin_action('admin_change_password', 'failure', reason='wrong_current_password')
-            return jsonify({'success': False, 'error': 'Current password is incorrect'}), 400
-
         if len(new_password) < 12:
             return jsonify({'success': False, 'error': 'New password must be at least 12 characters'}), 400
 
+        admin_user_id = session.get('admin_user_id')
+        if admin_user_id and _admin_users_table_exists():
+            from lms_automation.models import AdminUser
+            admin_user = AdminUser.query.get(admin_user_id)
+            if not admin_user or not admin_user.check_password(current_password):
+                log_admin_action('admin_change_password', 'failure',
+                                 reason='wrong_current_password')
+                return jsonify({'success': False, 'error': 'Current password is incorrect'}), 400
+            admin_user.set_password(new_password)
+            db.session.commit()
+            log_admin_action('admin_change_password', 'success')
+            return jsonify({'success': True, 'message': 'Password changed successfully.'})
+
+        # Legacy path: update in-memory ADMIN_PASSWORD (deprecated)
+        global ADMIN_PASSWORD
+        if not hmac.compare_digest(current_password.encode(), ADMIN_PASSWORD.encode()):
+            log_admin_action('admin_change_password', 'failure',
+                             reason='wrong_current_password')
+            return jsonify({'success': False, 'error': 'Current password is incorrect'}), 400
         ADMIN_PASSWORD = new_password
         os.environ['ADMIN_PASSWORD'] = new_password
-        log_admin_action('admin_change_password', 'success')
-
+        log_admin_action('admin_change_password', 'success', path='legacy')
         return jsonify({
             'success': True,
-            'message': 'Password changed successfully. Please update your ADMIN_PASSWORD environment variable in Railway.'
+            'message': 'Password changed (legacy mode). Update ADMIN_PASSWORD env var in Railway.'
         })
 
     except Exception as e:
@@ -5019,37 +5180,31 @@ def rules():
 
 
 # ---------------------------------------------------------------------------
-# Organiser management (Phase 1 — super-light)
-#
-# Security model (Phase 1):
-#   - Protected by existing admin_required decorator (shared password).
-#   - Only the currently authenticated admin can manage organisers.
-#   - No cross-organiser data is exposed.
-#
-# TODO Phase 2: restrict create/edit to a "super-admin" role once per-organiser
-# admin accounts are introduced.
+# Organiser management (Phase 2c — super-admin only)
 # ---------------------------------------------------------------------------
 
 @app.route('/admin/organisers')
-@admin_required
+@super_admin_required
 def list_organisers():
-    """List all organisers. Phase 1: admin can see + create organisers."""
-    from lms_automation.models import Organiser
+    """List all organisers. Super-admin only."""
+    from lms_automation.models import Organiser, AdminUser
     organisers = Organiser.query.order_by(Organiser.created_at).all()
+    # Attach admin users to each organiser for display
+    admin_users_by_org = {}
+    if _admin_users_table_exists():
+        for au in AdminUser.query.all():
+            admin_users_by_org.setdefault(au.organiser_id, []).append(au)
     current_oid = get_current_organiser_id()
     return render_template('admin_organisers.html',
                            organisers=organisers,
+                           admin_users_by_org=admin_users_by_org,
                            current_organiser_id=current_oid)
 
 
 @app.route('/admin/organisers/create', methods=['POST'])
-@admin_required
+@super_admin_required
 def create_organiser():
-    """Create a new organiser (name + slug).
-
-    Security: guarded by admin_required + CSRF (POST method triggers check in
-    admin_required decorator). Slug is validated to be URL-safe and unique.
-    """
+    """Create a new organiser (name + slug). Super-admin only."""
     import re
     from lms_automation.models import Organiser
 
@@ -5077,6 +5232,78 @@ def create_organiser():
                      organiser_slug=slug, organiser_name=name)
     flash(f'Organiser "{name}" created successfully.', 'success')
     return redirect(url_for('list_organisers'))
+
+
+@app.route('/admin/organisers/<int:org_id>/create-admin', methods=['POST'])
+@super_admin_required
+def create_organiser_admin(org_id):
+    """Create an admin account for the given organiser. Super-admin only."""
+    from lms_automation.models import Organiser, AdminUser
+
+    org = Organiser.query.get_or_404(org_id)
+
+    new_username = (request.form.get('new_username') or '').strip()
+    new_password = (request.form.get('new_password') or '')
+    new_role = request.form.get('new_role', 'organiser_admin')
+
+    if new_role not in ('organiser_admin', 'super_admin'):
+        flash('Invalid role.', 'danger')
+        return redirect(url_for('list_organisers'))
+
+    if not new_username:
+        flash('Username is required.', 'danger')
+        return redirect(url_for('list_organisers'))
+
+    if len(new_password) < 12:
+        flash('Password must be at least 12 characters.', 'danger')
+        return redirect(url_for('list_organisers'))
+
+    if AdminUser.query.filter_by(username=new_username).first():
+        flash(f'Username "{new_username}" is already taken.', 'danger')
+        return redirect(url_for('list_organisers'))
+
+    admin_user = AdminUser(
+        username=new_username,
+        organiser_id=org.id,
+        role=new_role,
+        is_active=True,
+    )
+    admin_user.set_password(new_password)
+    db.session.add(admin_user)
+    db.session.commit()
+
+    log_admin_action('admin_user_create', 'success',
+                     new_username=new_username, organiser_id=org.id, role=new_role)
+    flash(
+        f'Admin account "{new_username}" created for organiser "{org.name}". '
+        f'Login URL: {request.url_root}admin/login',
+        'success',
+    )
+    return redirect(url_for('list_organisers'))
+
+
+@app.route('/admin/switch-organiser', methods=['POST'])
+@super_admin_required
+def switch_organiser():
+    """Super-admin: switch session to a different organiser context."""
+    from lms_automation.models import Organiser
+
+    target_org_id = request.form.get('organiser_id', type=int)
+    if not target_org_id:
+        flash('No organiser selected.', 'danger')
+        return redirect(url_for('list_organisers'))
+
+    org = Organiser.query.get(target_org_id)
+    if not org:
+        flash('Organiser not found.', 'danger')
+        return redirect(url_for('list_organisers'))
+
+    session['organiser_id'] = org.id
+    session['organiser_name'] = org.name
+    log_admin_action('switch_organiser', 'success', target_organiser_id=org.id,
+                     target_organiser_slug=org.slug)
+    flash(f'Switched to organiser: {org.name}', 'success')
+    return redirect(url_for('admin_dashboard'))
 
 
 # ---------------------------------------------------------------------------

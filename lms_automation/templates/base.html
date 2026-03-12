@@ -36,8 +36,16 @@
                     <a class="nav-link" href="{{ url_for('player_registration') }}">Join Game</a>
                     <a class="nav-link" href="{{ url_for('rules') }}">Rules</a>
                     {% if session.get('admin_logged_in') %}
-                    <a class="nav-link" href="{{ url_for('admin_dashboard') }}">Admin</a>
+                    <a class="nav-link" href="{{ url_for('admin_dashboard') }}">
+                        Admin
+                        {% if session.get('organiser_name') %}
+                        <span class="badge bg-secondary ms-1" title="Current organiser">{{ session.get('organiser_name') }}</span>
+                        {% endif %}
+                    </a>
+                    {% if session.get('admin_role') == 'super_admin' %}
                     <a class="nav-link" href="{{ url_for('list_organisers') }}">Organisers</a>
+                    {% endif %}
+                    <a class="nav-link" href="{{ url_for('admin_logout') }}">Logout</a>
                     {% endif %}
                 </div>
             {% endif %}

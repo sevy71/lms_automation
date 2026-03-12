@@ -12,11 +12,6 @@ class Organiser(db.Model):
     Each organiser owns their own set of players, rounds, and game data.
     The 'default' organiser is auto-created during migration and owns all
     pre-existing data so backward compatibility is preserved.
-
-    Phase 2 will add:
-    - Per-organiser admin accounts (currently single shared password)
-    - Full role-based access control
-    - Organiser-scoped scheduler jobs
     """
     __tablename__ = 'organisers'
 
@@ -34,6 +29,44 @@ class Organiser(db.Model):
 
     def __repr__(self):
         return f'<Organiser {self.slug}>'
+
+
+class AdminUser(db.Model):
+    """Per-organiser admin accounts (Phase 2c).
+
+    Roles:
+    - organiser_admin: can manage their own organiser's data only
+    - super_admin: can manage all organisers + create admin accounts
+
+    The default super-admin is bootstrapped during migration from the legacy
+    ADMIN_PASSWORD env var so existing deployments keep working without manual
+    steps.
+    """
+    __tablename__ = 'admin_users'
+
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(100), nullable=False, unique=True, index=True)
+    password_hash = db.Column(db.String(255), nullable=False)
+    organiser_id = db.Column(db.Integer, db.ForeignKey('organisers.id'),
+                             nullable=False, index=True)
+    role = db.Column(db.String(20), nullable=False,
+                     default='organiser_admin')  # organiser_admin | super_admin
+    is_active = db.Column(db.Boolean, nullable=False, default=True)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+
+    organiser = db.relationship('Organiser', backref='admin_users', lazy=True,
+                                foreign_keys=[organiser_id])
+
+    def set_password(self, password):
+        from werkzeug.security import generate_password_hash
+        self.password_hash = generate_password_hash(password)
+
+    def check_password(self, password):
+        from werkzeug.security import check_password_hash
+        return check_password_hash(self.password_hash, password)
+
+    def __repr__(self):
+        return f'<AdminUser {self.username} role={self.role}>'
 
 
 class Player(db.Model):
