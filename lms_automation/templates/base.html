@@ -35,7 +35,9 @@
                     <a class="nav-link" href="{{ url_for('index') }}">Home</a>
                     <a class="nav-link" href="{{ url_for('player_registration') }}">Join Game</a>
                     <a class="nav-link" href="{{ url_for('rules') }}">Rules</a>
+                    {% if session.get('admin_logged_in') %}
                     <a class="nav-link" href="{{ url_for('admin_dashboard') }}">Admin</a>
+                    {% endif %}
                 </div>
             {% endif %}
         </div>
