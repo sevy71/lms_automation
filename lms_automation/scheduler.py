@@ -306,6 +306,21 @@ class LMSScheduler:
             )
             logger.info(f"Invariant enforcement job configured with {invariant_interval}-minute interval")
 
+            # Deliver pending Telegram notifications from the outbox every 60 seconds.
+            # This is the async delivery half of the transactional outbox pattern:
+            # game-state code writes rows to notification_outbox inside the state
+            # transaction; this job delivers them with up to 3 attempts before
+            # marking a row 'dead'.
+            self.scheduler.add_job(
+                func=self._deliver_notifications,
+                trigger=IntervalTrigger(seconds=60),
+                id='deliver_notifications',
+                name='Deliver pending Telegram notifications from outbox',
+                next_run_time=datetime.now(),
+                replace_existing=True,
+            )
+            logger.info("Notification delivery job configured (60-second interval)")
+
             self.scheduler.start()
             logger.info("Scheduler started with all jobs configured")
 
@@ -1047,194 +1062,20 @@ class LMSScheduler:
 
     def _evaluate_game_state_after_round(self, completed_round) -> str:
         """
-        Centralized end-of-round game-state evaluation.
-
-        DEFINITIONS (EXACT SEMANTICS):
-
-        WINNER:
-        - Declared ONLY when:
-          - A round is completed AND
-          - EXACTLY 1 player remains active across the entire game (Player.status == 'active')
-
-        ROLLOVER:
-        - Occurs ONLY when:
-          - A round is completed AND
-          - ZERO players remain active (everyone eliminated)
-
-        CONTINUE (normal progression):
-        - Occurs when:
-          - A round is completed AND
-          - active_players > 1
-
-        This function is the SINGLE SOURCE OF TRUTH for game state transitions.
-        It must be called after EVERY round completion (scheduler and manual API).
-
-        Returns:
-            str: 'winner', 'rollover', or 'continue'
+        Delegates to services.round_lifecycle — the single source of truth.
+        Passes self.announce_round_now as the automation callback so new rounds
+        get tokens generated and announced automatically.
         """
-        logger.info("=" * 60)
-        logger.info("=== GAME STATE EVALUATION START ===")
-        logger.info(f"Evaluating after Round {completed_round.round_number} (cycle={completed_round.cycle_number})")
-
-        # Count players by status GLOBALLY (not per-round) - AUTHORITATIVE COUNTS
-        active_players = Player.query.filter_by(status='active').all()
-        active_count = len(active_players)
-        eliminated_count = Player.query.filter_by(status='eliminated').count()
-        winner_count = Player.query.filter_by(status='winner').count()
-
-        # Determine outcome based on active_count
-        if active_count == 1:
-            outcome = 'winner'
-        elif active_count == 0:
-            outcome = 'rollover'
-        else:
-            outcome = 'continue'
-
-        # AUTHORITATIVE LOG - single source of truth for debugging
-        logger.info(
-            "GAME STATE EVAL: round_id=%s cycle=%s round=%s active_count=%s "
-            "eliminated_count=%s winner_count=%s outcome=%s",
-            completed_round.id, completed_round.cycle_number, completed_round.round_number,
-            active_count, eliminated_count, winner_count, outcome
+        from lms_automation.services.round_lifecycle import evaluate_game_state_after_round
+        return evaluate_game_state_after_round(
+            completed_round,
+            announce_callback=self.announce_round_now,
         )
-
-        # ==================== WINNER CHECK ====================
-        # EXACTLY 1 player remains active
-        if active_count == 1:
-            winner = active_players[0]
-            logger.info("=" * 60)
-            logger.info("GAME STATE: winner")
-            logger.info(f"WINNER DECLARED: {winner.name} (id={winner.id})")
-            logger.info("=" * 60)
-
-            # Idempotency check
-            if self._has_marker(completed_round, 'game_winner_announced'):
-                logger.info("Winner already announced (idempotent), skipping notifications")
-                return 'winner'
-
-            # Mark winner status
-            winner.status = 'winner'
-
-            # Send winner DM + broadcast
-            self._send_winner_notification(winner, completed_round)
-
-            # Mark round with winner marker (done inside _send_winner_notification)
-            # DO NOT create new round - game is over
-
-            logger.info("=== GAME STATE EVALUATION COMPLETE (winner) ===")
-            return 'winner'
-
-        # ==================== ROLLOVER CHECK ====================
-        # ZERO players remain active (everyone eliminated)
-        elif active_count == 0:
-            logger.info("=" * 60)
-            logger.info("GAME STATE: rollover")
-            logger.info("All players eliminated - triggering rollover")
-            logger.info("=" * 60)
-
-            # Idempotency check
-            next_cycle = (completed_round.cycle_number or 1) + 1
-            rollover_marker = f"rollover_processed_cycle_{next_cycle}"
-
-            if self._has_marker(completed_round, rollover_marker):
-                logger.info(f"Rollover already processed for cycle {next_cycle} (idempotent)")
-                return 'rollover'
-
-            # Add rollover marker
-            self._add_marker(completed_round, rollover_marker)
-
-            # Increment cycle_number, reset round_number to 1 conceptually
-            # (new round will be round_number = global_max + 1, but cycle_number = next_cycle)
-
-            # Reset ALL players to status='active'
-            Player.query.update({'status': 'active'}, synchronize_session=False)
-            logger.info("All players reset to status='active'")
-
-            # Clear elimination-related state on picks for new cycle
-            # (Not strictly necessary since new cycle has new picks, but good hygiene)
-
-            # Send rollover notification to ALL players
-            self._send_rollover_notification(next_cycle)
-
-            # Send admin notification
-            self._send_admin_rollover_notification(next_cycle, completed_round)
-
-            # Create new round (cycle+1, round 1 of that cycle)
-            new_round = self._create_rollover_round(completed_round, next_cycle)
-            if new_round:
-                # Commit round+fixtures first
-                db.session.commit()
-
-                # Mark that next round was created
-                next_round_marker = f"next_round_created_cycle_{next_cycle}"
-                self._add_marker(completed_round, next_round_marker)
-
-                # Trigger automation: generate tokens, announce round
-                self._trigger_rollover_automation(new_round)
-
-                logger.info(f"New round created: round_id={new_round.id}, round_number={new_round.round_number}")
-
-            logger.info("=== GAME STATE EVALUATION COMPLETE (rollover) ===")
-            return 'rollover'
-
-        # ==================== CONTINUE (normal progression) ====================
-        # active_players > 1
-        else:
-            logger.info("=" * 60)
-            logger.info("GAME STATE: continue")
-            logger.info(f"{active_count} players still active - game continues")
-            logger.info("=" * 60)
-
-            # Normal progression: Auto-create next round
-            current_cycle = completed_round.cycle_number or 1
-            next_round_number = completed_round.round_number + 1
-
-            # Check for end of cycle (Round 20 with 2+ survivors) - special case
-            if completed_round.round_number == 20 and active_count >= 2:
-                next_cycle = current_cycle + 1
-                logger.info(f"END OF CYCLE {current_cycle}: {active_count} survivors advance to Cycle {next_cycle}")
-                self._send_cycle_complete_notification(active_players, next_cycle)
-                # Create Round 1 of next cycle
-                next_round_number = 1
-                current_cycle = next_cycle
-
-            # Auto-create next round for normal progression
-            new_round = self._create_next_round(completed_round, next_round_number, current_cycle)
-            if new_round:
-                logger.info(
-                    f"AUTO-CREATED: Round {new_round.round_number} (Cycle {new_round.cycle_number}, "
-                    f"PL Matchday {new_round.pl_matchday})"
-                )
-
-            logger.info("=== GAME STATE EVALUATION COMPLETE (continue) ===")
-            return 'continue'
 
     def _send_admin_rollover_notification(self, new_cycle, completed_round):
-        """
-        Send Telegram notification to ADMIN about rollover event.
-
-        This notification is sent regardless of admin's player status.
-        Uses ADMIN_TELEGRAM_ID environment variable.
-        """
-        admin_telegram_id = os.environ.get('ADMIN_TELEGRAM_ID')
-        if not admin_telegram_id:
-            logger.warning("ADMIN_TELEGRAM_ID not set, skipping admin rollover notification")
-            return
-
-        message = (
-            f"🔄 ROLLOVER: All players eliminated.\n\n"
-            f"Starting Cycle {new_cycle}, Round 1.\n"
-            f"Previous round: {completed_round.round_number} (Cycle {completed_round.cycle_number or 1})"
-        )
-
-        try:
-            success = self._send_telegram_message(admin_telegram_id, message)
-            if success:
-                logger.info(f"Admin rollover notification sent to telegram_id={admin_telegram_id}")
-            else:
-                logger.warning(f"Failed to send admin rollover notification to telegram_id={admin_telegram_id}")
-        except Exception as e:
-            logger.error(f"Error sending admin rollover notification: {e}")
+        """Delegates to services.telegram_dispatch."""
+        from lms_automation.services.telegram_dispatch import send_admin_rollover_notification
+        return send_admin_rollover_notification(new_cycle, completed_round)
 
     def _check_game_state(self, completed_round):
         """
@@ -1244,236 +1085,19 @@ class LMSScheduler:
         return self._evaluate_game_state_after_round(completed_round)
 
     def _create_rollover_round(self, completed_round, next_cycle):
-        """
-        Create a new pending round for the next cycle after rollover.
-
-        Idempotency: Uses special_note marker 'rollover_seeded_cycle_{n}' to prevent
-        duplicate round creation if this runs multiple times.
-
-        Returns the new Round object if created, None if already exists or on error.
-        """
-        rollover_marker = f"rollover_seeded_cycle_{next_cycle}"
-
-        # Idempotency check: see if any round already has this marker (NULL-safe)
-        existing_rollover = Round.query.filter(
-            Round.special_note.isnot(None),
-            Round.special_note.contains(rollover_marker)
-        ).first()
-
-        if existing_rollover:
-            logger.info(
-                f"ROLLOVER: Round for Cycle {next_cycle} already seeded "
-                f"(round_id={existing_rollover.id}), skipping creation"
-            )
-            return None
-
-        try:
-            # Each cycle starts at round_number=1 (per-cycle numbering)
-            # This aligns with _auto_create_rollover_round in app.py
-            next_round_number = 1
-
-            # Determine next matchday (cap at 38, don't wrap)
-            current_matchday = completed_round.pl_matchday or 1
-            next_matchday = min(current_matchday + 1, 38)
-            if next_matchday == 38 and current_matchday == 38:
-                logger.warning(
-                    f"ROLLOVER: End of season (matchday 38), using matchday 38 again"
-                )
-
-            # Create the round
-            new_round = Round(
-                round_number=next_round_number,
-                pl_matchday=next_matchday,
-                cycle_number=next_cycle,
-                status='pending'
-            )
-
-            # Append rollover marker to special_note (preserve existing content)
-            if new_round.special_note:
-                new_round.special_note += f"; {rollover_marker}"
-            else:
-                new_round.special_note = rollover_marker
-
-            db.session.add(new_round)
-            db.session.flush()  # Get ID for fixture creation
-
-            logger.info(
-                f"ROLLOVER: Creating round_id={new_round.id}, round_number={next_round_number}, "
-                f"cycle={next_cycle}, matchday={next_matchday}"
-            )
-
-            # Populate fixtures using existing API logic (same as sync_fixtures)
-            fixtures_created = self._populate_fixtures_for_rollover_round(new_round)
-
-            if fixtures_created == 0:
-                logger.warning(
-                    f"ROLLOVER: Round {next_round_number} created but no fixtures "
-                    f"available for matchday {next_matchday}"
-                )
-            else:
-                logger.info(
-                    f"ROLLOVER: Created {fixtures_created} fixtures for round {next_round_number}"
-                )
-
-            return new_round
-
-        except Exception as e:
-            logger.error(f"ROLLOVER: Error creating round: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
-            db.session.rollback()
-            return None
+        """Delegates to services.round_lifecycle."""
+        from lms_automation.services.round_lifecycle import create_rollover_round
+        return create_rollover_round(completed_round, next_cycle)
 
     def _create_next_round(self, completed_round, next_round_number, cycle_number):
-        """
-        Auto-create the next round for normal game progression (when 2+ players survive).
-
-        Args:
-            completed_round: The round that just completed
-            next_round_number: The round number for the new round
-            cycle_number: The cycle number for the new round
-
-        Returns:
-            Round object if created, None if already exists or error
-        """
-        try:
-            # Idempotency: check if next round already exists
-            existing = Round.query.filter_by(
-                cycle_number=cycle_number,
-                round_number=next_round_number
-            ).first()
-
-            if existing:
-                logger.info(
-                    f"Round {next_round_number} (Cycle {cycle_number}) already exists "
-                    f"(id={existing.id}), skipping auto-creation"
-                )
-                return None
-
-            # Determine next PL matchday
-            current_matchday = completed_round.pl_matchday or 1
-            next_matchday = min(current_matchday + 1, 38)
-
-            # Create new round
-            new_round = Round(
-                round_number=next_round_number,
-                pl_matchday=next_matchday,
-                cycle_number=cycle_number,
-                status='pending'
-            )
-
-            db.session.add(new_round)
-            db.session.flush()  # Get the round ID
-
-            logger.info(
-                f"AUTO-CREATE: Round {next_round_number} (Cycle {cycle_number}, "
-                f"PL Matchday {next_matchday}) created (id={new_round.id})"
-            )
-
-            # Sync fixtures from API
-            api = self._get_api()
-            if api:
-                season_param = str(new_round.get_api_season_year()) if hasattr(new_round, 'get_api_season_year') and new_round.get_api_season_year() else None
-                fixtures_data = api.get_premier_league_fixtures(
-                    matchday=next_matchday,
-                    season=season_param
-                )
-                formatted = api.format_fixtures_for_db(fixtures_data, next_matchday)
-
-                fixtures_created = 0
-                for fx in formatted:
-                    fixture = Fixture(
-                        round_id=new_round.id,
-                        event_id=fx.get('event_id'),
-                        home_team=fx['home_team'],
-                        away_team=fx['away_team'],
-                        date=fx['date'],
-                        time=fx['time'],
-                        home_score=fx.get('home_score'),
-                        away_score=fx.get('away_score'),
-                        status=fx.get('status', 'scheduled')
-                    )
-                    db.session.add(fixture)
-                    fixtures_created += 1
-
-                logger.info(f"AUTO-CREATE: Added {fixtures_created} fixtures for Round {next_round_number}")
-
-                # Calculate and set first_kickoff_at from fixtures
-                if fixtures_created > 0:
-                    earliest_kickoff = None
-                    for fixture in Fixture.query.filter_by(round_id=new_round.id).all():
-                        if fixture.date and fixture.time:
-                            kickoff_dt = datetime.combine(fixture.date, fixture.time)
-                            if earliest_kickoff is None or kickoff_dt < earliest_kickoff:
-                                earliest_kickoff = kickoff_dt
-
-                    if earliest_kickoff:
-                        new_round.first_kickoff_at = earliest_kickoff
-                        logger.info(f"AUTO-CREATE: Set first_kickoff_at to {earliest_kickoff}")
-            else:
-                logger.warning("AUTO-CREATE: Football API unavailable, round created without fixtures")
-
-            db.session.commit()
-            return new_round
-
-        except Exception as e:
-            logger.error(f"AUTO-CREATE: Error creating Round {next_round_number}: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
-            db.session.rollback()
-            return None
+        """Delegates to services.round_lifecycle."""
+        from lms_automation.services.round_lifecycle import create_next_round
+        return create_next_round(completed_round, next_round_number, cycle_number)
 
     def _populate_fixtures_for_rollover_round(self, round_obj):
-        """
-        Fetch and populate fixtures for a rollover round.
-        Reuses the same API logic as sync_fixtures.
-        """
-        try:
-            api = self._get_api()
-            if not api:
-                logger.warning("ROLLOVER: Football API unavailable")
-                return 0
-
-            # Use round's api_season_year for the API call
-            season_param = str(round_obj.get_api_season_year()) if round_obj.get_api_season_year() else None
-            fixtures_data = api.get_premier_league_fixtures(
-                matchday=round_obj.pl_matchday,
-                season=season_param
-            )
-            formatted = api.format_fixtures_for_db(fixtures_data, round_obj.pl_matchday)
-
-            if not formatted:
-                return 0
-
-            earliest_kickoff = None
-            for fx in formatted:
-                fixture = Fixture(
-                    round_id=round_obj.id,
-                    event_id=fx.get('event_id'),
-                    home_team=fx['home_team'],
-                    away_team=fx['away_team'],
-                    date=fx.get('date'),
-                    time=fx.get('time'),
-                    home_score=fx.get('home_score'),
-                    away_score=fx.get('away_score'),
-                    status=fx.get('status', 'scheduled')
-                )
-                db.session.add(fixture)
-
-                # Track earliest kickoff for first_kickoff_at
-                if fx.get('date') and fx.get('time'):
-                    dt = datetime.combine(fx['date'], fx['time'])
-                    if earliest_kickoff is None or dt < earliest_kickoff:
-                        earliest_kickoff = dt
-
-            if earliest_kickoff:
-                round_obj.first_kickoff_at = earliest_kickoff
-
-            return len(formatted)
-
-        except Exception as e:
-            logger.error(f"ROLLOVER: Error populating fixtures: {e}")
-            return 0
+        """Delegates to services.round_lifecycle."""
+        from lms_automation.services.round_lifecycle import populate_fixtures_for_round
+        return populate_fixtures_for_round(round_obj)
 
     def _trigger_rollover_automation(self, round_obj):
         """
@@ -2519,123 +2143,24 @@ class LMSScheduler:
                 logger.error(f"Traceback:\n{traceback.format_exc()}")
                 db.session.rollback()
 
+    def _deliver_notifications(self):
+        """APScheduler job: deliver all pending outbox rows via Telegram Bot API."""
+        with self.app.app_context():
+            try:
+                from lms_automation.services.notifications import deliver_pending_notifications
+                deliver_pending_notifications()
+            except Exception as e:
+                logger.error("deliver_notifications job failed: %s", e)
+
     def _send_picks_published_notification(self, round_obj):
-        """
-        LEAN & CLEAN: Send notification that all picks are locked.
-
-        - Only sends to ACTIVE players (not eliminated)
-        - Uses short message + link to picks grid (no long bullet list)
-        - Idempotent: only sends once per round
-        """
-        # Use special_note to track if we've already sent this notification
-        if round_obj.special_note and 'picks_published' in round_obj.special_note:
-            logger.debug(f"Round {round_obj.round_number}: picks already published, skipping notification")
-            return
-
-        # Get count of picks for context
-        picks_count = Pick.query.filter_by(round_id=round_obj.id).count()
-        auto_pick_count = Pick.query.filter_by(round_id=round_obj.id, auto_assigned=True).count()
-
-        # Build short message with link (no long bullet list)
-        picks_grid_url = self._get_picks_grid_url()
-        message = f"📋 Round {round_obj.round_number} picks locked!\n\n"
-        message += f"{picks_count} picks submitted"
-        if auto_pick_count > 0:
-            message += f" ({auto_pick_count} auto-picks)"
-        message += "."
-
-        # LEAN & CLEAN: Only send to ACTIVE players
-        active_players = Player.query.filter(
-            Player.status == 'active',
-            Player.telegram_id.isnot(None)
-        ).all()
-
-        sent_count = 0
-        skipped_not_active = 0
-
-        for player in active_players:
-            if self._send_telegram_message(
-                player.telegram_id,
-                message,
-                button_url=picks_grid_url,
-                button_text="📊 View Picks Grid"
-            ):
-                sent_count += 1
-
-        # Log how many non-active players were NOT sent to (for transparency)
-        all_with_telegram = Player.query.filter(Player.telegram_id.isnot(None)).count()
-        skipped_not_active = all_with_telegram - len(active_players)
-
-        logger.info(
-            f"Round {round_obj.round_number}: Sent picks-locked notification to {sent_count} ACTIVE players "
-            f"(skipped_not_active={skipped_not_active})"
-        )
-
-        # Mark as published to prevent duplicate notifications
-        if round_obj.special_note:
-            round_obj.special_note += "; picks_published"
-        else:
-            round_obj.special_note = "picks_published"
-        db.session.commit()
+        """Delegates to services.telegram_dispatch."""
+        from lms_automation.services.telegram_dispatch import send_picks_published_notification
+        return send_picks_published_notification(round_obj)
 
     def _send_round_results_notification(self, round_obj, winners_count, eliminated_count, draw_count):
-        """
-        LEAN & CLEAN: Send round results notification.
-
-        - Sends to EVERYONE who PARTICIPATED in the round (has a pick)
-        - Includes: round number, winners, eliminated, draws, link to results
-        - This is the transparency message for round completion
-        - Idempotent: only sends once per round
-        """
-        # Use special_note to track if we've already sent this notification
-        if round_obj.special_note and 'results_sent' in round_obj.special_note:
-            logger.debug(f"Round {round_obj.round_number}: results already sent, skipping notification")
-            return
-
-        # Get all players who participated in this round (have a pick)
-        picks = Pick.query.filter_by(round_id=round_obj.id).all()
-        participant_ids = {pick.player_id for pick in picks}
-
-        # Build short message with link
-        picks_grid_url = self._get_picks_grid_url()
-        message = f"🏁 Round {round_obj.round_number} results!\n\n"
-        message += f"✅ {winners_count} survived\n"
-        message += f"❌ {eliminated_count} eliminated"
-        if draw_count > 0:
-            message += f"\n🤝 {draw_count} draw fixture(s)"
-        message += "\n\nGood luck next round!"
-
-        # Send to everyone who participated (regardless of current status)
-        sent_count = 0
-        skipped_no_telegram = 0
-
-        for player_id in participant_ids:
-            player = Player.query.get(player_id)
-            if not player:
-                continue
-
-            if not player.telegram_id:
-                skipped_no_telegram += 1
-                continue
-
-            if self._send_telegram_message(
-                player.telegram_id,
-                message,
-                button_url=picks_grid_url,
-                button_text="📊 View Results"
-            ):
-                sent_count += 1
-
-        logger.info(
-            f"Round {round_obj.round_number}: Sent results notification to {sent_count} participants "
-            f"(skipped_no_telegram={skipped_no_telegram}, total_participants={len(participant_ids)})"
-        )
-
-        # Mark as sent to prevent duplicate notifications
-        if round_obj.special_note:
-            round_obj.special_note += "; results_sent"
-        else:
-            round_obj.special_note = "results_sent"
+        """Delegates to services.telegram_dispatch."""
+        from lms_automation.services.telegram_dispatch import send_round_results_notification
+        return send_round_results_notification(round_obj, winners_count, eliminated_count, draw_count)
 
     # Fixed preference list for deterministic auto-picks (popular/strong teams first)
     TEAM_PREFERENCE_LIST = [
@@ -2765,203 +2290,24 @@ class LMSScheduler:
         return selected, 'missed_deadline_random_last_resort'
 
     def _send_telegram_message(self, telegram_id, message, button_url=None, button_text="Make Your Pick"):
-        """Send message via Telegram bot with optional inline button"""
-        try:
-            # Use Telegram API directly instead of bot proxy
-            bot_token = os.environ.get('TELEGRAM_BOT_TOKEN')
-            if not bot_token:
-                logger.error("TELEGRAM_BOT_TOKEN not set")
-                return False
-
-            url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-            payload = {
-                'chat_id': telegram_id,
-                'text': message
-            }
-
-            # Add inline keyboard button if URL provided
-            if button_url:
-                payload['reply_markup'] = {
-                    'inline_keyboard': [[
-                        {'text': button_text, 'url': button_url}
-                    ]]
-                }
-
-            response = requests.post(url, json=payload)
-            if response.status_code != 200:
-                logger.error(
-                    f"Telegram sendMessage failed: status={response.status_code}, "
-                    f"chat_id={telegram_id}, response={response.text[:300]}"
-                )
-            return response.status_code == 200
-        except Exception as e:
-            logger.error(f"Error sending Telegram message: {e}")
-            return False
+        """Delegates to services.telegram_dispatch."""
+        from lms_automation.services.telegram_dispatch import send_telegram_message
+        return send_telegram_message(telegram_id, message, button_url, button_text)
 
     def _send_winner_notification(self, winner, completed_round):
-        """
-        Game-over winner notification: sends winner DM + broadcast to all players.
-
-        ONLY triggers on true game over (exactly 1 active player OR 1 player with status='winner').
-        Uses 'game_winner_announced' marker in rounds.special_note for idempotency.
-
-        Sends:
-        1) Winner DM to the winner (if they have telegram_id)
-        2) Broadcast to ALL players who have telegram_id (including eliminated)
-
-        Logs: winner_sent=0/1 broadcast_sent=N skipped_missing_telegram=M errors=E winner=<name>(id=<id>)
-        """
-        # Idempotency check: don't resend if already announced
-        idempotency_marker = 'game_winner_announced'
-        if completed_round.special_note and idempotency_marker in completed_round.special_note:
-            logger.info(
-                f"Winner broadcast: SKIPPED (already announced) winner={winner.name}(id={winner.id})"
-            )
-            return
-
-        picks_grid_url = self._get_picks_grid_url()
-
-        # Message texts
-        winner_dm_text = (
-            f"🏆 You've won the competition!\n\n"
-            f"Congratulations! You are the Last Man Standing! 🎉"
-        )
-        broadcast_text = (
-            f"🏁 Competition over — Winner is {winner.name}.\n\n"
-            f"Thanks for playing! 🎉"
-        )
-
-        # Counters
-        winner_sent = 0
-        broadcast_sent = 0
-        skipped_missing_telegram = 0
-        errors = 0
-
-        # 1) Send winner DM to the winner
-        if winner.telegram_id:
-            try:
-                if self._send_telegram_message(
-                    winner.telegram_id,
-                    winner_dm_text,
-                    button_url=picks_grid_url,
-                    button_text="📊 View Final Grid"
-                ):
-                    winner_sent = 1
-                else:
-                    errors += 1
-            except Exception as e:
-                logger.error(f"Error sending winner DM to {winner.name}: {e}")
-                errors += 1
-        else:
-            skipped_missing_telegram += 1
-
-        # 2) Send broadcast to ALL players (including eliminated, even the winner gets both)
-        players = Player.query.all()
-        for player in players:
-            if player.telegram_id:
-                try:
-                    if self._send_telegram_message(
-                        player.telegram_id,
-                        broadcast_text,
-                        button_url=picks_grid_url,
-                        button_text="📊 View Final Grid"
-                    ):
-                        broadcast_sent += 1
-                    else:
-                        errors += 1
-                except Exception as e:
-                    logger.error(f"Error sending broadcast to {player.name}: {e}")
-                    errors += 1
-            else:
-                skipped_missing_telegram += 1
-
-        # 3) Send admin notification (always, regardless of player status)
-        admin_telegram_id = os.environ.get('ADMIN_TELEGRAM_ID')
-        if admin_telegram_id:
-            admin_message = (
-                f"🏆 WINNER DECLARED: {winner.name} (id={winner.id})\n\n"
-                f"Round {completed_round.round_number} complete.\n"
-                f"Game over - competition ended."
-            )
-            try:
-                self._send_telegram_message(admin_telegram_id, admin_message)
-                logger.info(f"Admin winner notification sent to telegram_id={admin_telegram_id}")
-            except Exception as e:
-                logger.error(f"Error sending admin winner notification: {e}")
-
-        # Mark as announced (idempotency)
-        if completed_round.special_note:
-            completed_round.special_note += f"; {idempotency_marker}"
-        else:
-            completed_round.special_note = idempotency_marker
-        db.session.commit()
-
-        # Log summary (single clear line)
-        logger.info(
-            f"Winner broadcast: winner_sent={winner_sent} broadcast_sent={broadcast_sent} "
-            f"skipped_missing_telegram={skipped_missing_telegram} errors={errors} "
-            f"winner={winner.name}(id={winner.id})"
-        )
+        """Delegates to services.telegram_dispatch."""
+        from lms_automation.services.telegram_dispatch import send_winner_notification
+        return send_winner_notification(winner, completed_round)
 
     def _send_rollover_notification(self, new_cycle):
-        """
-        LEAN & CLEAN: Send rollover notification to ALL players (active + eliminated).
-        Short message + link.
-        """
-        picks_grid_url = self._get_picks_grid_url()
-        message = f"🔄 ROLLOVER!\n\nAll players eliminated. Starting Cycle {new_cycle}.\nEveryone is back in!"
-
-        # Send to ALL players (regardless of status)
-        players = Player.query.all()
-        sent_count = 0
-        skipped_missing = 0
-        for player in players:
-            if hasattr(player, 'telegram_id') and player.telegram_id:
-                if self._send_telegram_message(
-                    player.telegram_id,
-                    message,
-                    button_url=picks_grid_url,
-                    button_text="📊 View Grid"
-                ):
-                    sent_count += 1
-            else:
-                skipped_missing += 1
-        logger.info(
-            "Rollover announcement: sent=%s, skipped_no_telegram=%s, total_players=%s",
-            sent_count,
-            skipped_missing,
-            len(players)
-        )
+        """Delegates to services.telegram_dispatch."""
+        from lms_automation.services.telegram_dispatch import send_rollover_notification
+        return send_rollover_notification(new_cycle)
 
     def _send_cycle_complete_notification(self, survivors, new_cycle):
-        """
-        LEAN & CLEAN: Send cycle completion to ALL players (active + eliminated).
-        Short message + link.
-        """
-        picks_grid_url = self._get_picks_grid_url()
-        message = f"📊 Cycle Complete!\n\n{len(survivors)} survivor(s) advance to Cycle {new_cycle}."
-
-        # Send to ALL players (regardless of status)
-        players = Player.query.all()
-        sent_count = 0
-        skipped_missing = 0
-        for player in players:
-            if hasattr(player, 'telegram_id') and player.telegram_id:
-                if self._send_telegram_message(
-                    player.telegram_id,
-                    message,
-                    button_url=picks_grid_url,
-                    button_text="📊 View Grid"
-                ):
-                    sent_count += 1
-            else:
-                skipped_missing += 1
-        logger.info(
-            "Cycle complete announcement: sent=%s, skipped_no_telegram=%s, total_players=%s",
-            sent_count,
-            skipped_missing,
-            len(players)
-        )
+        """Delegates to services.telegram_dispatch."""
+        from lms_automation.services.telegram_dispatch import send_cycle_complete_notification
+        return send_cycle_complete_notification(survivors, new_cycle)
 
     def _reset_game_for_new_cycle(self):
         """Reset game data for a new cycle (optional auto-reset)"""
@@ -2992,21 +2338,14 @@ class LMSScheduler:
     # ==================== PHASE MARKER HELPERS ====================
 
     def _has_marker(self, round_obj, marker: str) -> bool:
-        """Check if round has a specific phase marker in special_note."""
-        return round_obj.special_note and marker in round_obj.special_note
+        """Delegates to services.markers."""
+        from lms_automation.services.markers import has_marker
+        return has_marker(round_obj, marker)
 
     def _add_marker(self, round_obj, marker: str) -> bool:
-        """
-        Add a phase marker to round.special_note if not already present.
-        Returns True if marker was added, False if already present.
-        """
-        if self._has_marker(round_obj, marker):
-            return False
-        if round_obj.special_note:
-            round_obj.special_note += f"; {marker}"
-        else:
-            round_obj.special_note = marker
-        return True
+        """Delegates to services.markers."""
+        from lms_automation.services.markers import add_marker
+        return add_marker(round_obj, marker)
 
     def _ensure_tokens_for_round(self, round_obj) -> dict:
         """
@@ -3059,15 +2398,9 @@ class LMSScheduler:
         return {'created': tokens_created, 'total': final_token_count}
 
     def _get_phase_status(self, round_obj) -> dict:
-        """Get current phase status for a round (for logging)."""
-        return {
-            'status': round_obj.status,
-            'tokens_generated': self._has_marker(round_obj, 'tokens_generated'),
-            'announced': self._has_marker(round_obj, 'announced'),
-            'picks_locked': self._has_marker(round_obj, 'picks_locked'),
-            'picks_published': self._has_marker(round_obj, 'picks_published'),
-            'results_sent': self._has_marker(round_obj, 'results_sent'),
-        }
+        """Delegates to services.markers."""
+        from lms_automation.services.markers import get_phase_status
+        return get_phase_status(round_obj)
 
     def announce_round_now(self, round_id: int) -> dict:
         """
@@ -3186,7 +2519,7 @@ class LMSScheduler:
                 )
                 continue
 
-            # Build and send announcement message
+            # Build announcement message and enqueue for async delivery
             pick_url = f"{os.environ.get('BASE_URL', 'http://localhost:5000')}/pick/{pick_token.token}"
 
             if round_obj.first_kickoff_at:
@@ -3198,47 +2531,37 @@ class LMSScheduler:
             message = f"⚽ NEW ROUND {round_obj.round_number} IS LIVE!\n\n"
             message += f"Make your pick before {deadline_str}"
 
-            try:
-                success = self._send_telegram_message(
-                    player.telegram_id,
-                    message,
-                    button_url=pick_url,
-                    button_text="⚽ Make Your Pick"
+            from lms_automation.services.notifications import enqueue_notification
+            enqueue_notification(
+                player.telegram_id,
+                message,
+                button_url=pick_url,
+                button_text="⚽ Make Your Pick",
+                round_id=round_obj.id,
+                idempotency_key=f"round_announcement:{player.telegram_id}:{round_obj.id}",
+            )
+            sent += 1
+            logger.info(f"  Queued announcement for {player.name} (id={player.id})")
+
+            # Schedule reminders unconditionally — delivery outcome is async
+            if round_obj.first_kickoff_at:
+                reminder_4h = ReminderSchedule(
+                    player_id=player.id,
+                    round_id=round_obj.id,
+                    reminder_type='4_hour',
+                    scheduled_time=round_obj.first_kickoff_at - timedelta(hours=4),
+                    is_sent=False,
                 )
+                db.session.add(reminder_4h)
 
-                if success:
-                    sent += 1
-                    logger.info(f"  Sent pick-link announcement to {player.name} (id={player.id})")
-
-                    # Schedule reminders
-                    if round_obj.first_kickoff_at:
-                        reminder_4h = ReminderSchedule(
-                            player_id=player.id,
-                            round_id=round_obj.id,
-                            reminder_type='4_hour',
-                            scheduled_time=round_obj.first_kickoff_at - timedelta(hours=4),
-                            is_sent=False
-                        )
-                        db.session.add(reminder_4h)
-
-                        reminder_2h = ReminderSchedule(
-                            player_id=player.id,
-                            round_id=round_obj.id,
-                            reminder_type='2_hour',
-                            scheduled_time=round_obj.first_kickoff_at - timedelta(hours=2),
-                            is_sent=False
-                        )
-                        db.session.add(reminder_2h)
-                else:
-                    errors += 1
-                    logger.warning(
-                        f"  FAILED to send announcement to {player.name} (id={player.id})"
-                    )
-            except Exception as e:
-                errors += 1
-                logger.error(
-                    f"  Exception sending to {player.name} (id={player.id}): {e}"
+                reminder_2h = ReminderSchedule(
+                    player_id=player.id,
+                    round_id=round_obj.id,
+                    reminder_type='2_hour',
+                    scheduled_time=round_obj.first_kickoff_at - timedelta(hours=2),
+                    is_sent=False,
                 )
+                db.session.add(reminder_2h)
 
         # Set 'announced' marker after processing (even if some players missing telegram)
         self._add_marker(round_obj, 'announced')
@@ -3307,9 +2630,9 @@ class LMSScheduler:
         return self._player_has_pick_for_round(player_id, round_id)
 
     def _get_picks_grid_url(self) -> str:
-        """Get the URL to the picks grid page."""
-        base_url = os.environ.get('BASE_URL', 'http://localhost:5000').rstrip('/')
-        return f"{base_url}/picks-grid"
+        """Delegates to services.telegram_dispatch."""
+        from lms_automation.services.telegram_dispatch import get_picks_grid_url
+        return get_picks_grid_url()
 
 
 def check_db_integrity():

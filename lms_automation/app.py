@@ -5,6 +5,9 @@ print("BOOT commit   =", os.environ.get("RAILWAY_GIT_COMMIT_SHA") or os.environ.
 
 from flask import Flask, render_template, request, jsonify, session, redirect, url_for, flash
 from flask_migrate import Migrate
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+import hmac
 import os
 import sys
 from dotenv import load_dotenv
@@ -22,7 +25,30 @@ if project_root not in sys.path:
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'dev-secret-key-change-in-production')
+app.config['SESSION_COOKIE_SECURE'] = True
+app.config['SESSION_COOKIE_HTTPONLY'] = True
+app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
+app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(hours=8)
 app.config.setdefault('DISPLAY_TIMEZONE', os.environ.get('DISPLAY_TIMEZONE', 'Europe/London'))
+
+# --- Proxy-aware IP resolution ---
+# TRUSTED_PROXY_DEPTH controls how many rightmost X-Forwarded-For entries are
+# stripped before using the next value as the real client IP.
+#
+#   0  — local dev / direct connection: trust request.remote_addr as-is (no XFF)
+#   1  — Railway / single load-balancer: the LB adds one entry; strip it to get
+#        the client IP that the LB saw.  This is the correct default for Railway.
+#   N  — multi-hop proxy chains: strip N rightmost entries.
+#
+# ProxyFix is safe against IP spoofing because an attacker can prepend arbitrary
+# values to X-Forwarded-For, but they cannot forge the entries appended by the
+# actual proxy infrastructure at the right of the chain.  Only rightmost entries
+# (controlled by infrastructure) are trusted; leftmost entries (under attacker
+# control) are ignored.
+_proxy_depth = int(os.environ.get('TRUSTED_PROXY_DEPTH', '1'))
+if _proxy_depth > 0:
+    from werkzeug.middleware.proxy_fix import ProxyFix
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=_proxy_depth, x_proto=_proxy_depth)
 
 try:
     from zoneinfo import ZoneInfo  # Python 3.9+
@@ -78,6 +104,7 @@ if app.config['SQLALCHEMY_ENGINE_OPTIONS']:
 from lms_automation.models import Player, Round, Fixture, Pick, PickToken, ReminderSchedule
 from lms_automation.telegram_service import telegram_service
 from lms_automation.eligibility import get_eligible_players_for_round
+from lms_automation.services.audit import log_admin_action
 
 
 # Initialize db with app
@@ -254,6 +281,26 @@ def _ensure_minimum_schema():
                 except Exception as e:
                     app.logger.warning(f'Could not create reminder_schedules: {e}')
 
+            # Create notification_outbox table if missing (transactional outbox for Telegram delivery)
+            if not insp.has_table('notification_outbox'):
+                try:
+                    from lms_automation.models import NotificationOutbox
+                    NotificationOutbox.__table__.create(bind=engine)
+                    app.logger.info('Created missing table notification_outbox')
+                except Exception as e:
+                    app.logger.warning(f'Could not create notification_outbox: {e}')
+            else:
+                # Patch: add idempotency_key column if the table predates this column
+                notif_cols = {col['name'] for col in insp.get_columns('notification_outbox')}
+                if 'idempotency_key' not in notif_cols:
+                    try:
+                        db.session.execute(
+                            text('ALTER TABLE notification_outbox ADD COLUMN idempotency_key VARCHAR(255) NULL;')
+                        )
+                        app.logger.info('Added missing column notification_outbox.idempotency_key')
+                    except Exception as e:
+                        app.logger.warning(f'Could not add notification_outbox.idempotency_key: {e}')
+
             db.session.commit()
     except Exception as e:
         db.session.rollback()
@@ -285,6 +332,38 @@ def _ensure_schema_once_before_requests():
 # Admin authentication
 ADMIN_PASSWORD = os.environ.get('ADMIN_PASSWORD', 'admin123')  # Change this!
 ADMIN_WHATSAPP = os.environ.get('ADMIN_WHATSAPP')  # Optional: admin WhatsApp number (e.g., +441234567890)
+
+# --- Startup security validation ---
+_IS_DEV = os.environ.get('FLASK_ENV', 'production') == 'development' or os.environ.get('DEBUG', '').lower() in ('1', 'true')
+
+def _validate_security_config():
+    """Warn loudly if default credentials are used in production."""
+    if _IS_DEV:
+        return
+    if app.config['SECRET_KEY'] == 'dev-secret-key-change-in-production':
+        raise RuntimeError(
+            "FATAL: SECRET_KEY is set to the default insecure value. "
+            "Set the SECRET_KEY environment variable before starting in production."
+        )
+    if ADMIN_PASSWORD == 'admin123':
+        raise RuntimeError(
+            "FATAL: ADMIN_PASSWORD is set to the default insecure value. "
+            "Set the ADMIN_PASSWORD environment variable before starting in production."
+        )
+
+_validate_security_config()
+
+# --- Rate limiter ---
+limiter = Limiter(get_remote_address, app=app, default_limits=[])
+
+# --- CSRF helpers ---
+from lms_automation.services.csrf import (
+    generate_csrf_token as _generate_csrf_token,
+    validate_csrf_token as _validate_csrf_token,
+    get_request_csrf_token as _get_request_csrf_token,
+)
+
+app.jinja_env.globals['csrf_token'] = _generate_csrf_token
 
 # --- Helpers ---
 def team_abbrev(team_name: str) -> str:
@@ -442,31 +521,62 @@ def generate_picks_grid_xlsx():
         print(f"Error generating XLSX: {e}")
         return None
 
+_CSRF_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+
 def admin_required(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
         if not session.get('admin_logged_in'):
             return redirect(url_for('admin_login', next=request.url))
+        if request.method in _CSRF_METHODS:
+            token = _get_request_csrf_token(request)
+            if not _validate_csrf_token(token):
+                log_admin_action(
+                    'admin_api', 'blocked',
+                    endpoint=request.endpoint,
+                    reason='csrf_mismatch',
+                )
+                return jsonify({'success': False, 'error': 'CSRF validation failed'}), 403
         return f(*args, **kwargs)
     return decorated_function
 
 @app.route('/admin/login', methods=['GET', 'POST'])
+@limiter.limit("5 per minute")
 def admin_login():
     if request.method == 'POST':
-        password = request.form.get('password')
-        if password == ADMIN_PASSWORD:
+        password = request.form.get('password', '')
+        csrf_token = request.form.get('csrf_token', '')
+
+        if not _validate_csrf_token(csrf_token):
+            log_admin_action('admin_login', 'blocked', reason='csrf_mismatch')
+            flash('Invalid request. Please try again.', 'error')
+            return render_template('admin_login.html'), 403
+
+        pw_bytes = password.encode()
+        expected_bytes = ADMIN_PASSWORD.encode()
+        if hmac.compare_digest(pw_bytes, expected_bytes):
+            session.clear()
             session['admin_logged_in'] = True
             session.permanent = True
-            next_page = request.args.get('next') or url_for('admin_dashboard')
+            log_admin_action('admin_login', 'success')
+            raw_next = request.args.get('next', '')
+            parsed = urllib.parse.urlparse(raw_next)
+            # Allow relative paths only to prevent open redirect
+            if raw_next and not parsed.netloc and not parsed.scheme:
+                next_page = raw_next
+            else:
+                next_page = url_for('admin_dashboard')
             return redirect(next_page)
         else:
+            log_admin_action('admin_login', 'failure')
             flash('Invalid password', 'error')
-    
+
     return render_template('admin_login.html')
 
 @app.route('/admin/logout')
 def admin_logout():
-    session.pop('admin_logged_in', None)
+    log_admin_action('admin_logout', 'success')
+    session.clear()
     flash('You have been logged out', 'info')
     return redirect(url_for('index'))
 
@@ -476,28 +586,28 @@ def change_admin_password():
     try:
         global ADMIN_PASSWORD
         data = request.get_json()
-        current_password = data.get('current_password')
-        new_password = data.get('new_password')
-        
+        current_password = data.get('current_password', '')
+        new_password = data.get('new_password', '')
+
         if not current_password or not new_password:
             return jsonify({'success': False, 'error': 'Current and new password are required'}), 400
-        
-        if current_password != ADMIN_PASSWORD:
+
+        if not hmac.compare_digest(current_password.encode(), ADMIN_PASSWORD.encode()):
+            log_admin_action('admin_change_password', 'failure', reason='wrong_current_password')
             return jsonify({'success': False, 'error': 'Current password is incorrect'}), 400
-        
-        if len(new_password) < 6:
-            return jsonify({'success': False, 'error': 'New password must be at least 6 characters'}), 400
-        
-        # In a real app, you'd update the password in a database or config file
-        # For now, we'll just update the environment variable (temporary)
+
+        if len(new_password) < 12:
+            return jsonify({'success': False, 'error': 'New password must be at least 12 characters'}), 400
+
         ADMIN_PASSWORD = new_password
         os.environ['ADMIN_PASSWORD'] = new_password
-        
+        log_admin_action('admin_change_password', 'success')
+
         return jsonify({
             'success': True,
             'message': 'Password changed successfully. Please update your ADMIN_PASSWORD environment variable in Railway.'
         })
-        
+
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
@@ -1010,571 +1120,6 @@ def current_round_picks_status():
         })
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
-
-
-@app.route('/api/admin/process-results', methods=['POST'])
-@admin_required
-def manual_process_results():
-    """
-    Manual endpoint to process results and eliminations for active rounds.
-
-    This endpoint is designed for MANUAL_MODE operation where automation is disabled.
-    It runs the same logic as the scheduler's process_eliminations job but on-demand.
-
-    Query params:
-        - update_fixtures: If '1' or 'true', sync fixture results from API first
-        - round_id: Optional specific round ID to process (defaults to all active rounds)
-
-    Returns JSON with:
-        - rounds_processed: list of round IDs that were completed
-        - eliminations: list of eliminated players with details
-        - winners: list of winning players
-        - fixture_updates: count of fixtures updated (if update_fixtures=true)
-        - errors: any errors encountered
-    """
-    import logging
-    logger = logging.getLogger(__name__)
-
-    logger.info("=" * 60)
-    logger.info("=== MANUAL PROCESS RESULTS START ===")
-    logger.info("=" * 60)
-
-    try:
-        update_fixtures = request.args.get('update_fixtures', '0') in ('1', 'true', 'True')
-        specific_round_id = request.args.get('round_id', type=int)
-
-        result = {
-            'success': True,
-            'rounds_processed': [],
-            'eliminations': [],
-            'winners': [],
-            'fixture_updates': 0,
-            'errors': [],
-            'summary': {}
-        }
-
-        # Step 1: Optionally update fixtures from API
-        if update_fixtures:
-            logger.info("Step 1: Updating fixtures from Football API...")
-            try:
-                from lms_automation.football_api import FootballDataAPI
-                from lms_automation.team_utils import normalize_team_name
-
-                api = FootballDataAPI()
-
-                # Get rounds to update
-                if specific_round_id:
-                    rounds_to_update = Round.query.filter_by(id=specific_round_id).all()
-                else:
-                    rounds_to_update = Round.query.filter(Round.status.in_(['active', 'pending'])).all()
-
-                for round_obj in rounds_to_update:
-                    if not round_obj.pl_matchday:
-                        continue
-
-                    # Use round's api_season_year for the API call
-                    season_param = str(round_obj.get_api_season_year()) if round_obj.get_api_season_year() else None
-                    api_data = api.get_premier_league_fixtures(
-                        matchday=round_obj.pl_matchday,
-                        season=season_param
-                    )
-
-                    if api_data and 'matches' in api_data:
-                        matches_by_id = {
-                            str(m.get('id')): m for m in api_data['matches'] if m.get('id') is not None
-                        }
-                        fixtures = Fixture.query.filter_by(round_id=round_obj.id).all()
-
-                        for fixture in fixtures:
-                            match = None
-                            if fixture.event_id:
-                                match = matches_by_id.get(str(fixture.event_id))
-                            if not match:
-                                for candidate in api_data['matches']:
-                                    if (candidate.get('homeTeam', {}).get('name') == fixture.home_team and
-                                        candidate.get('awayTeam', {}).get('name') == fixture.away_team):
-                                        match = candidate
-                                        break
-
-                            if match:
-                                score = match.get('score', {})
-                                full_time = score.get('fullTime', {})
-                                home_score = full_time.get('home')
-                                away_score = full_time.get('away')
-                                api_status = match.get('status', '')
-
-                                # Map API status to our status
-                                status_map = {
-                                    'FINISHED': 'completed',
-                                    'IN_PLAY': 'live',
-                                    'PAUSED': 'live',
-                                    'POSTPONED': 'postponed',
-                                    'CANCELLED': 'postponed',
-                                    'SCHEDULED': 'scheduled',
-                                    'TIMED': 'scheduled',
-                                }
-                                new_status = status_map.get(api_status, fixture.status)
-
-                                # Update fixture if scores changed
-                                if home_score is not None and away_score is not None:
-                                    if fixture.home_score != home_score or fixture.away_score != away_score or fixture.status != new_status:
-                                        fixture.home_score = home_score
-                                        fixture.away_score = away_score
-                                        fixture.status = new_status
-                                        result['fixture_updates'] += 1
-                                        logger.info(f"Updated fixture: {fixture.home_team} {home_score}-{away_score} {fixture.away_team} ({new_status})")
-
-                db.session.commit()
-                logger.info(f"Fixture updates complete: {result['fixture_updates']} fixtures updated")
-            except Exception as e:
-                logger.error(f"Error updating fixtures: {e}")
-                result['errors'].append(f"Fixture update error: {str(e)}")
-
-        # Step 2: Process eliminations for active rounds
-        logger.info("Step 2: Processing eliminations...")
-
-        if specific_round_id:
-            active_rounds = Round.query.filter_by(id=specific_round_id).all()
-        else:
-            active_rounds = Round.query.filter_by(status='active').all()
-
-        logger.info(f"Found {len(active_rounds)} round(s) to process")
-
-        from lms_automation.team_utils import normalize_team_name
-
-        for round_obj in active_rounds:
-            logger.info(f"Processing Round {round_obj.round_number} (id={round_obj.id})")
-            round_result = {
-                'round_id': round_obj.id,
-                'round_number': round_obj.round_number,
-                'status': 'skipped',
-                'reason': None,
-                'eliminations': [],
-                'winners': []
-            }
-
-            # GUARD 1: Check fixtures exist
-            fixtures = Fixture.query.filter_by(round_id=round_obj.id).all()
-            if not fixtures:
-                round_result['reason'] = 'no_fixtures'
-                logger.warning(f"  GUARD BLOCK: Round {round_obj.round_number} has no fixtures")
-                result['errors'].append(f"Round {round_obj.round_number}: no fixtures")
-                continue
-
-            # GUARD 2: Check all fixtures completed
-            completed_fixtures = [f for f in fixtures if f.status == 'completed']
-            if not all(f.status == 'completed' for f in fixtures):
-                pending_fixtures = [f for f in fixtures if f.status != 'completed']
-                round_result['reason'] = f'{len(pending_fixtures)}_fixtures_not_completed'
-                logger.info(f"  GUARD BLOCK: {len(pending_fixtures)} fixture(s) not completed")
-                result['errors'].append(f"Round {round_obj.round_number}: {len(pending_fixtures)} fixtures not completed")
-                continue
-
-            # GUARD 3: Check picks exist
-            eligible_players = get_eligible_players_for_round(round_obj)
-            picks = Pick.query.filter_by(round_id=round_obj.id).all()
-
-            if len(picks) == 0:
-                round_result['reason'] = 'no_picks'
-                logger.warning(f"  GUARD BLOCK: Round {round_obj.round_number} has 0 picks")
-                result['errors'].append(f"Round {round_obj.round_number}: no picks submitted")
-                continue
-
-            if len(picks) < len(eligible_players):
-                round_result['reason'] = f'picks_incomplete ({len(picks)}/{len(eligible_players)})'
-                logger.info(f"  GUARD BLOCK: {len(picks)}/{len(eligible_players)} picks")
-                result['errors'].append(f"Round {round_obj.round_number}: {len(picks)}/{len(eligible_players)} picks")
-                continue
-
-            # Evaluate picks based on fixture results
-            fixture_teams = {}
-            for fx in fixtures:
-                home_norm = normalize_team_name(fx.home_team)
-                away_norm = normalize_team_name(fx.away_team)
-
-                # Determine outcomes
-                if fx.home_score > fx.away_score:
-                    fixture_teams[home_norm] = True  # home win
-                    fixture_teams[away_norm] = False  # away loss
-                elif fx.away_score > fx.home_score:
-                    fixture_teams[home_norm] = False  # home loss
-                    fixture_teams[away_norm] = True  # away win
-                else:
-                    fixture_teams[home_norm] = False  # draw = loss
-                    fixture_teams[away_norm] = False  # draw = loss
-
-            # Update pick results
-            for pick in picks:
-                pick_norm = normalize_team_name(pick.team_picked)
-                if pick_norm in fixture_teams:
-                    pick.is_winner = fixture_teams[pick_norm]
-                else:
-                    # Unmatched pick = loss
-                    pick.is_winner = False
-                    logger.warning(f"  Unmatched pick: {pick.player.name} -> {pick.team_picked}")
-
-            # GUARD 4: Check all picks evaluated
-            unevaluated = [p for p in picks if p.is_winner is None]
-            if unevaluated:
-                round_result['reason'] = f'{len(unevaluated)}_unevaluated_picks'
-                logger.warning(f"  GUARD BLOCK: {len(unevaluated)} unevaluated picks")
-                result['errors'].append(f"Round {round_obj.round_number}: {len(unevaluated)} picks couldn't be evaluated")
-                continue
-
-            # Process eliminations
-            for pick in picks:
-                if pick.is_winner == False and not pick.is_eliminated:
-                    pick.is_eliminated = True
-                    pick.player.status = 'eliminated'
-                    elimination_info = {
-                        'player_id': pick.player_id,
-                        'player_name': pick.player.name,
-                        'team_picked': pick.team_picked,
-                        'round_number': round_obj.round_number
-                    }
-                    round_result['eliminations'].append(elimination_info)
-                    result['eliminations'].append(elimination_info)
-                    logger.info(f"  ELIMINATED: {pick.player.name} (picked {pick.team_picked})")
-                elif pick.is_winner == True:
-                    winner_info = {
-                        'player_id': pick.player_id,
-                        'player_name': pick.player.name,
-                        'team_picked': pick.team_picked,
-                        'round_number': round_obj.round_number
-                    }
-                    round_result['winners'].append(winner_info)
-                    result['winners'].append(winner_info)
-
-            # Check if results already sent (idempotency)
-            special_note = round_obj.special_note or ''
-            results_already_sent = 'results_sent' in special_note
-
-            # Mark round as completed
-            round_obj.status = 'completed'
-            round_result['status'] = 'completed'
-
-            # Add results_sent marker if not already present
-            if not results_already_sent:
-                if special_note:
-                    round_obj.special_note = f"{special_note},results_sent"
-                else:
-                    round_obj.special_note = "results_sent"
-                logger.info(f"  Added results_sent marker to round {round_obj.round_number}")
-            else:
-                logger.info(f"  Results already sent for round {round_obj.round_number} (idempotent)")
-
-            result['rounds_processed'].append(round_result)
-            logger.info(f"  Round {round_obj.round_number}: COMPLETED (winners={len(round_result['winners'])}, eliminated={len(round_result['eliminations'])})")
-
-            # CRITICAL: Evaluate game state after each completed round
-            # This is the centralized logic for winner/rollover/continue
-            game_state = _evaluate_game_state_after_round_standalone(round_obj)
-            round_result['game_state'] = game_state
-            logger.info(f"  Game state after Round {round_obj.round_number}: {game_state}")
-
-        db.session.commit()
-
-        # Build summary
-        total_active = Player.query.filter_by(status='active').count()
-        total_eliminated = Player.query.filter_by(status='eliminated').count()
-        total_winner = Player.query.filter_by(status='winner').count()
-
-        # Determine last completed round outcome
-        last_game_state = None
-        if result['rounds_processed']:
-            last_game_state = result['rounds_processed'][-1].get('game_state', 'unknown')
-
-        result['summary'] = {
-            'total_active_players': total_active,
-            'total_eliminated_players': total_eliminated,
-            'total_winners': total_winner,
-            'rounds_completed': len(result['rounds_processed']),
-            'total_eliminations_this_run': len(result['eliminations']),
-            'fixture_updates': result['fixture_updates'],
-            'last_game_state': last_game_state
-        }
-
-        logger.info("=" * 60)
-        logger.info(f"=== MANUAL PROCESS RESULTS COMPLETE ===")
-        logger.info(f"Summary: {result['summary']}")
-        logger.info("=" * 60)
-
-        return jsonify(result)
-
-    except Exception as e:
-        import traceback
-        logger.error(f"Error in manual_process_results: {e}")
-        logger.error(traceback.format_exc())
-        db.session.rollback()
-        return jsonify({
-            'success': False,
-            'error': str(e)
-        }), 500
-
-
-@app.route('/api/admin/round-readiness/<int:round_id>', methods=['GET'])
-@admin_required
-def get_round_readiness(round_id):
-    """
-    Check if a round is ready to be finalized based on relevant fixtures.
-
-    This endpoint allows the admin UI to check readiness before attempting
-    to finalize. It returns detailed information about which fixtures are
-    pending and which teams they affect.
-
-    Returns JSON with:
-        - ready: bool - True if round can be finalized
-        - picked_teams: list of distinct teams picked this round
-        - relevant_fixtures: list of fixtures that involve picked teams
-        - pending_relevant: list of relevant fixtures still pending
-        - message: human-readable status message
-    """
-    readiness = check_round_readiness(round_id)
-    return jsonify(readiness)
-
-
-@app.route('/api/admin/finalize-round', methods=['POST'])
-@admin_required
-def finalize_round():
-    """
-    Admin endpoint to finalize a round after manual score entry.
-
-    This endpoint runs the FULL end-of-round pipeline:
-    1. Processes eliminations for all picks in the round
-    2. Marks round as completed (sets results_sent marker)
-    3. Calls the centralized evaluator for WINNER/ROLLOVER/CONTINUE
-
-    Idempotency guarantees:
-    - results_sent marker prevents duplicate elimination processing
-    - rollover_processed_cycle_{N} prevents duplicate rollover rounds
-    - game_winner_announced prevents duplicate winner notifications
-
-    Request body:
-        - round_id: The round ID to finalize (required)
-
-    Returns JSON with:
-        - success: bool
-        - outcome: 'winner' | 'rollover' | 'continue'
-        - new_round_created: bool (true if rollover created a new round)
-        - cycle_number: Current/new cycle number
-        - round_number: Current/new round number
-        - eliminations: List of eliminated players
-        - survivors: List of surviving players
-        - error: Error message (if success=False)
-    """
-    import logging
-    logger = logging.getLogger(__name__)
-
-    try:
-        data = request.get_json(silent=True) or {}
-        round_id = data.get('round_id')
-
-        if not round_id:
-            return jsonify({
-                'success': False,
-                'error': 'round_id is required'
-            }), 400
-
-        round_obj = Round.query.get(round_id)
-        if not round_obj:
-            return jsonify({
-                'success': False,
-                'error': f'Round {round_id} not found'
-            }), 404
-
-        logger.info("=" * 60)
-        logger.info("FINALIZE ROUND START: round_id=%s cycle=%s round=%s",
-                    round_id, round_obj.cycle_number, round_obj.round_number)
-        logger.info("=" * 60)
-
-        # Helper functions
-        def has_marker(r, marker):
-            return r.special_note and marker in r.special_note
-
-        def add_marker(r, marker):
-            if has_marker(r, marker):
-                return False
-            if r.special_note:
-                r.special_note += f"; {marker}"
-            else:
-                r.special_note = marker
-            return True
-
-        # GUARD 1: Check fixtures exist
-        fixtures = Fixture.query.filter_by(round_id=round_id).all()
-        if not fixtures:
-            logger.warning("FINALIZE ROUND BLOCKED: No fixtures in round %s", round_id)
-            return jsonify({
-                'success': False,
-                'error': 'Round has no fixtures'
-            }), 400
-
-        # GUARD 2: Check picks exist (needed for readiness check)
-        picks = Pick.query.filter_by(round_id=round_id).all()
-        if not picks:
-            logger.warning("FINALIZE ROUND BLOCKED: No picks in round %s", round_id)
-            return jsonify({
-                'success': False,
-                'error': 'Round has no picks'
-            }), 400
-
-        # GUARD 3: Check RELEVANT fixtures readiness (not all fixtures)
-        # This allows finalizing before the full matchday is complete
-        readiness = check_round_readiness(round_id)
-        if not readiness['ready']:
-            logger.warning(
-                "FINALIZE ROUND BLOCKED: Relevant fixtures not ready. round_id=%s message=%s",
-                round_id, readiness['message']
-            )
-            return jsonify({
-                'success': False,
-                'error': readiness['message'],
-                'readiness_details': {
-                    'picked_teams': readiness['picked_teams'],
-                    'relevant_fixtures_count': len(readiness['relevant_fixtures']),
-                    'pending_relevant': readiness['pending_relevant']
-                }
-            }), 400
-
-        # Mark RELEVANT fixtures as completed if they have scores
-        # (Non-relevant fixtures may still be pending, but that's OK)
-        for fx in fixtures:
-            if fx.home_score is not None and fx.away_score is not None:
-                if fx.status != 'completed':
-                    fx.status = 'completed'
-
-        # Idempotency check: results_sent marker
-        already_finalized = has_marker(round_obj, 'results_sent')
-        if already_finalized:
-            logger.info("Round %s already finalized (results_sent marker present) - running evaluator only", round_id)
-        else:
-            logger.info("Processing eliminations for round %s...", round_id)
-
-        # Import team normalization
-        from lms_automation.team_utils import normalize_team_name
-
-        # Build fixture outcome map (only from fixtures with scores)
-        # Non-relevant fixtures may not have scores yet, and that's OK
-        fixture_outcomes = {}
-        for fx in fixtures:
-            # Skip fixtures without scores (non-relevant or incomplete)
-            if fx.home_score is None or fx.away_score is None:
-                continue
-
-            home_norm = normalize_team_name(fx.home_team)
-            away_norm = normalize_team_name(fx.away_team)
-
-            if fx.home_score > fx.away_score:
-                fixture_outcomes[home_norm] = True   # home win
-                fixture_outcomes[away_norm] = False  # away loss
-            elif fx.away_score > fx.home_score:
-                fixture_outcomes[home_norm] = False  # home loss
-                fixture_outcomes[away_norm] = True   # away win
-            else:
-                fixture_outcomes[home_norm] = False  # draw = loss
-                fixture_outcomes[away_norm] = False  # draw = loss
-
-        # Process eliminations (idempotent - only updates if not already set)
-        eliminations = []
-        survivors = []
-
-        for pick in picks:
-            pick_norm = normalize_team_name(pick.team_picked)
-            is_winner = fixture_outcomes.get(pick_norm, False)
-
-            # Update pick outcome
-            pick.is_winner = is_winner
-
-            if is_winner:
-                pick.is_eliminated = False
-                # CRITICAL: Ensure winning player's status is 'active' (not 'eliminated' or stale)
-                # This prevents the bug where survivors=1 but active_count=0 triggers rollover
-                if pick.player.status != 'active':
-                    logger.info("WINNER STATUS FIX: %s was '%s', setting to 'active'",
-                                pick.player.name, pick.player.status)
-                    pick.player.status = 'active'
-                survivors.append({
-                    'player_id': pick.player_id,
-                    'player_name': pick.player.name,
-                    'team_picked': pick.team_picked
-                })
-            else:
-                pick.is_eliminated = True
-                # Only mark player eliminated if not already
-                if pick.player.status != 'eliminated':
-                    pick.player.status = 'eliminated'
-                    logger.info("ELIMINATED: %s (picked %s)", pick.player.name, pick.team_picked)
-                eliminations.append({
-                    'player_id': pick.player_id,
-                    'player_name': pick.player.name,
-                    'team_picked': pick.team_picked
-                })
-
-        # Mark round as completed
-        round_obj.status = 'completed'
-
-        # Add results_sent marker (idempotent)
-        if not already_finalized:
-            add_marker(round_obj, 'results_sent')
-            logger.info("Added results_sent marker to round %s", round_id)
-
-        db.session.commit()
-
-        # CRITICAL: Call centralized evaluator for WINNER/ROLLOVER/CONTINUE
-        logger.info("Calling centralized evaluator...")
-        outcome = _evaluate_game_state_after_round_standalone(round_obj)
-
-        logger.info("=" * 60)
-        logger.info("FINALIZE ROUND OUTCOME: %s", outcome)
-        logger.info("=" * 60)
-
-        # Determine if a new round was created (for rollover)
-        new_round_created = False
-        new_cycle_number = round_obj.cycle_number or 1
-        new_round_number = round_obj.round_number
-
-        if outcome == 'rollover':
-            # Check if a new round was created for the next cycle
-            next_cycle = new_cycle_number + 1
-            new_round = Round.query.filter_by(cycle_number=next_cycle, round_number=1).first()
-            if new_round:
-                new_round_created = True
-                new_cycle_number = next_cycle
-                new_round_number = 1
-                logger.info("Rollover created new round: Cycle %s Round %s (id=%s)",
-                            new_cycle_number, new_round_number, new_round.id)
-
-        # Get final player counts
-        active_count = Player.query.filter_by(status='active').count()
-        eliminated_count = Player.query.filter_by(status='eliminated').count()
-        winner_count = Player.query.filter_by(status='winner').count()
-
-        return jsonify({
-            'success': True,
-            'outcome': outcome,
-            'new_round_created': new_round_created,
-            'cycle_number': new_cycle_number,
-            'round_number': new_round_number,
-            'eliminations': eliminations,
-            'survivors': survivors,
-            'summary': {
-                'active_players': active_count,
-                'eliminated_players': eliminated_count,
-                'winners': winner_count,
-                'total_eliminations_this_round': len(eliminations),
-                'total_survivors_this_round': len(survivors)
-            }
-        })
-
-    except Exception as e:
-        import traceback
-        logger.error("Error in finalize_round: %s", e)
-        logger.error(traceback.format_exc())
-        db.session.rollback()
-        return jsonify({
-            'success': False,
-            'error': str(e)
-        }), 500
 
 
 @app.route('/api/admin/start-new-game', methods=['POST'])
@@ -2211,409 +1756,9 @@ def _auto_create_rollover_round(
 
 
 def check_round_readiness(round_id):
-    """
-    Check if a round is ready to be finalized based on RELEVANT fixtures only.
-
-    Definition of "relevant fixtures":
-    - Fixtures whose home_team OR away_team matches ANY team picked in that round.
-    - A round is ready when ALL relevant fixtures are completed with scores.
-
-    This allows finalizing a round before all PL matchday fixtures are done,
-    as long as the fixtures that matter for LMS eliminations are complete.
-
-    Args:
-        round_id: The ID of the round to check
-
-    Returns:
-        dict with:
-            - ready: bool - True if round can be finalized
-            - picked_teams: list of distinct teams picked this round
-            - relevant_fixtures: list of fixtures that involve picked teams
-            - pending_relevant: list of relevant fixtures still pending
-            - message: human-readable status message
-
-    IMPORTANT: This function is idempotent and read-only.
-    """
-    import logging
-    from lms_automation.team_utils import normalize_team_name
-
-    logger = logging.getLogger(__name__)
-
-    round_obj = Round.query.get(round_id)
-    if not round_obj:
-        return {
-            'ready': False,
-            'picked_teams': [],
-            'relevant_fixtures': [],
-            'pending_relevant': [],
-            'message': f'Round {round_id} not found'
-        }
-
-    # Get all picks for this round
-    picks = Pick.query.filter_by(round_id=round_id).all()
-    if not picks:
-        logger.info(
-            "ROUND READY CHECK: round_id=%s picked_teams=0 relevant_fixtures=0 "
-            "pending_relevant=0 ready=false (no picks)",
-            round_id
-        )
-        return {
-            'ready': False,
-            'picked_teams': [],
-            'relevant_fixtures': [],
-            'pending_relevant': [],
-            'message': 'No picks in round - cannot finalize'
-        }
-
-    # Get distinct teams picked (normalized) - ignore NULL/empty picks
-    picked_teams_normalized = set()
-    for pick in picks:
-        if pick.team_picked:
-            picked_teams_normalized.add(normalize_team_name(pick.team_picked))
-
-    if not picked_teams_normalized:
-        logger.info(
-            "ROUND READY CHECK: round_id=%s picked_teams=0 relevant_fixtures=0 "
-            "pending_relevant=0 ready=false (no valid teams picked)",
-            round_id
-        )
-        return {
-            'ready': False,
-            'picked_teams': [],
-            'relevant_fixtures': [],
-            'pending_relevant': [],
-            'message': 'No valid teams picked in round'
-        }
-
-    # Get all fixtures for this round
-    fixtures = Fixture.query.filter_by(round_id=round_id).all()
-    if not fixtures:
-        logger.info(
-            "ROUND READY CHECK: round_id=%s picked_teams=%s relevant_fixtures=0 "
-            "pending_relevant=0 ready=false (no fixtures)",
-            round_id, len(picked_teams_normalized)
-        )
-        return {
-            'ready': False,
-            'picked_teams': list(picked_teams_normalized),
-            'relevant_fixtures': [],
-            'pending_relevant': [],
-            'message': 'No fixtures in round'
-        }
-
-    # Find relevant fixtures (those involving picked teams)
-    relevant_fixtures = []
-    for fx in fixtures:
-        home_norm = normalize_team_name(fx.home_team)
-        away_norm = normalize_team_name(fx.away_team)
-        if home_norm in picked_teams_normalized or away_norm in picked_teams_normalized:
-            relevant_fixtures.append(fx)
-
-    # Find pending relevant fixtures (not completed OR missing scores)
-    # Treat POSTPONED/SCHEDULED as not ready
-    pending_relevant = []
-    for fx in relevant_fixtures:
-        is_completed = (
-            fx.status == 'completed' and
-            fx.home_score is not None and
-            fx.away_score is not None
-        )
-        if not is_completed:
-            pending_relevant.append({
-                'fixture_id': fx.id,
-                'home_team': fx.home_team,
-                'away_team': fx.away_team,
-                'status': fx.status,
-                'has_scores': fx.home_score is not None and fx.away_score is not None
-            })
-
-    ready = len(pending_relevant) == 0 and len(relevant_fixtures) > 0
-
-    # AUTHORITATIVE LOG
-    logger.info(
-        "ROUND READY CHECK: round_id=%s picked_teams=%s relevant_fixtures=%s "
-        "pending_relevant=%s ready=%s",
-        round_id, len(picked_teams_normalized), len(relevant_fixtures),
-        len(pending_relevant), ready
-    )
-
-    if ready:
-        message = f'Round ready: all {len(relevant_fixtures)} relevant fixtures completed'
-    else:
-        if len(relevant_fixtures) == 0:
-            message = f'No fixtures involve the {len(picked_teams_normalized)} picked teams'
-        else:
-            pending_teams = set()
-            for pf in pending_relevant:
-                pending_teams.add(pf['home_team'])
-                pending_teams.add(pf['away_team'])
-            pending_teams_in_picks = pending_teams & picked_teams_normalized
-            message = (
-                f'{len(pending_relevant)} relevant fixture(s) still pending. '
-                f'Waiting for: {", ".join(sorted(pending_teams_in_picks)) if pending_teams_in_picks else "fixtures to complete"}'
-            )
-
-    return {
-        'ready': ready,
-        'picked_teams': list(picked_teams_normalized),
-        'relevant_fixtures': [
-            {
-                'fixture_id': fx.id,
-                'home_team': fx.home_team,
-                'away_team': fx.away_team,
-                'status': fx.status,
-                'home_score': fx.home_score,
-                'away_score': fx.away_score
-            }
-            for fx in relevant_fixtures
-        ],
-        'pending_relevant': pending_relevant,
-        'message': message
-    }
-
-
-def _evaluate_game_state_after_round_standalone(completed_round) -> str:
-    """
-    Standalone version of centralized game state evaluation for use in app.py.
-
-    DEFINITIONS (EXACT SEMANTICS):
-
-    WINNER:
-    - Declared ONLY when:
-      - A round is completed AND
-      - EXACTLY 1 player remains active across the entire game (Player.status == 'active')
-
-    ROLLOVER:
-    - Occurs ONLY when:
-      - A round is completed AND
-      - ZERO players remain active (everyone eliminated)
-
-    CONTINUE (normal progression):
-    - Occurs when:
-      - A round is completed AND
-      - active_players > 1
-
-    This mirrors the scheduler's _evaluate_game_state_after_round but works standalone.
-
-    Returns:
-        str: 'winner', 'rollover', or 'continue'
-    """
-    import logging
-    import requests
-    logger = logging.getLogger(__name__)
-
-    logger.info("=" * 60)
-    logger.info("=== GAME STATE EVALUATION START (manual API) ===")
-    logger.info(f"Evaluating after Round {completed_round.round_number} (cycle={completed_round.cycle_number})")
-
-    # Count players by status GLOBALLY (not per-round) - AUTHORITATIVE COUNTS
-    active_players = Player.query.filter_by(status='active').all()
-    active_count = len(active_players)
-    eliminated_count = Player.query.filter_by(status='eliminated').count()
-    winner_count = Player.query.filter_by(status='winner').count()
-
-    # Determine outcome based on active_count
-    if active_count == 1:
-        outcome = 'winner'
-    elif active_count == 0:
-        outcome = 'rollover'
-    else:
-        outcome = 'continue'
-
-    # AUTHORITATIVE LOG - single source of truth for debugging
-    logger.info(
-        "GAME STATE EVAL: round_id=%s cycle=%s round=%s active_count=%s "
-        "eliminated_count=%s winner_count=%s outcome=%s",
-        completed_round.id, completed_round.cycle_number, completed_round.round_number,
-        active_count, eliminated_count, winner_count, outcome
-    )
-
-    # Helper to add marker
-    def add_marker(round_obj, marker):
-        if round_obj.special_note and marker in round_obj.special_note:
-            return False
-        if round_obj.special_note:
-            round_obj.special_note += f"; {marker}"
-        else:
-            round_obj.special_note = marker
-        return True
-
-    def has_marker(round_obj, marker):
-        return round_obj.special_note and marker in round_obj.special_note
-
-    def send_telegram_message(telegram_id, message, button_url=None, button_text="View"):
-        """Send message via Telegram bot"""
-        try:
-            bot_token = os.environ.get('TELEGRAM_BOT_TOKEN')
-            if not bot_token:
-                logger.error("TELEGRAM_BOT_TOKEN not set")
-                return False
-
-            url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-            payload = {
-                'chat_id': telegram_id,
-                'text': message
-            }
-
-            if button_url:
-                payload['reply_markup'] = {
-                    'inline_keyboard': [[
-                        {'text': button_text, 'url': button_url}
-                    ]]
-                }
-
-            response = requests.post(url, json=payload)
-            return response.status_code == 200
-        except Exception as e:
-            logger.error(f"Error sending Telegram message: {e}")
-            return False
-
-    def get_picks_grid_url():
-        base_url = os.environ.get('BASE_URL', 'http://localhost:5000').rstrip('/')
-        return f"{base_url}/picks-grid"
-
-    # ==================== WINNER CHECK ====================
-    # EXACTLY 1 player remains active
-    if active_count == 1:
-        winner = active_players[0]
-        logger.info("=" * 60)
-        logger.info("GAME STATE: winner")
-        logger.info(f"WINNER DECLARED: {winner.name} (id={winner.id})")
-        logger.info("=" * 60)
-
-        # Idempotency check
-        if has_marker(completed_round, 'game_winner_announced'):
-            logger.info("Winner already announced (idempotent), skipping notifications")
-            return 'winner'
-
-        # Mark winner status
-        winner.status = 'winner'
-
-        # Send winner notification
-        picks_grid_url = get_picks_grid_url()
-        winner_dm_text = (
-            f"🏆 You've won the competition!\n\n"
-            f"Congratulations! You are the Last Man Standing! 🎉"
-        )
-        broadcast_text = (
-            f"🏁 Competition over — Winner is {winner.name}.\n\n"
-            f"Thanks for playing! 🎉"
-        )
-
-        # Send winner DM
-        if winner.telegram_id:
-            send_telegram_message(
-                winner.telegram_id,
-                winner_dm_text,
-                button_url=picks_grid_url,
-                button_text="📊 View Final Grid"
-            )
-
-        # Broadcast to all players
-        all_players = Player.query.all()
-        for player in all_players:
-            if player.telegram_id:
-                send_telegram_message(
-                    player.telegram_id,
-                    broadcast_text,
-                    button_url=picks_grid_url,
-                    button_text="📊 View Final Grid"
-                )
-
-        # Send admin notification
-        admin_telegram_id = os.environ.get('ADMIN_TELEGRAM_ID')
-        if admin_telegram_id:
-            admin_message = (
-                f"🏆 WINNER DECLARED: {winner.name} (id={winner.id})\n\n"
-                f"Round {completed_round.round_number} complete.\n"
-                f"Game over - competition ended."
-            )
-            send_telegram_message(admin_telegram_id, admin_message)
-            logger.info(f"Admin winner notification sent to telegram_id={admin_telegram_id}")
-
-        # Mark round with winner marker
-        add_marker(completed_round, 'game_winner_announced')
-        db.session.commit()
-
-        logger.info("=== GAME STATE EVALUATION COMPLETE (winner) ===")
-        return 'winner'
-
-    # ==================== ROLLOVER CHECK ====================
-    # ZERO players remain active (everyone eliminated)
-    elif active_count == 0:
-        logger.info("=" * 60)
-        logger.info("GAME STATE: rollover")
-        logger.info("All players eliminated - triggering rollover")
-        logger.info("=" * 60)
-
-        # Idempotency check
-        next_cycle = (completed_round.cycle_number or 1) + 1
-        rollover_marker = f"rollover_processed_cycle_{next_cycle}"
-
-        if has_marker(completed_round, rollover_marker):
-            logger.info(f"Rollover already processed for cycle {next_cycle} (idempotent)")
-            return 'rollover'
-
-        # Add rollover marker
-        add_marker(completed_round, rollover_marker)
-
-        # Reset ALL players to status='active'
-        Player.query.update({'status': 'active'}, synchronize_session=False)
-        logger.info("All players reset to status='active'")
-
-        # Send rollover notification to ALL players
-        picks_grid_url = get_picks_grid_url()
-        rollover_message = f"🔄 ROLLOVER!\n\nAll players eliminated. Starting Cycle {next_cycle}.\nEveryone is back in!"
-
-        all_players = Player.query.all()
-        for player in all_players:
-            if player.telegram_id:
-                send_telegram_message(
-                    player.telegram_id,
-                    rollover_message,
-                    button_url=picks_grid_url,
-                    button_text="📊 View Grid"
-                )
-
-        # Send admin notification
-        admin_telegram_id = os.environ.get('ADMIN_TELEGRAM_ID')
-        if admin_telegram_id:
-            admin_message = (
-                f"🔄 ROLLOVER: All players eliminated.\n\n"
-                f"Starting Cycle {next_cycle}, Round 1.\n"
-                f"Previous round: {completed_round.round_number} (Cycle {completed_round.cycle_number or 1})"
-            )
-            send_telegram_message(admin_telegram_id, admin_message)
-            logger.info(f"Admin rollover notification sent to telegram_id={admin_telegram_id}")
-
-        db.session.commit()
-
-        # AUTO-CREATE next cycle round 1 (even in MANUAL_MODE - this is a rollover)
-        # IMPORTANT: Rollover inherits season from previous cycle (same season competition continues)
-        logger.info(f"Auto-creating Cycle {next_cycle} Round 1...")
-        rollover_result = _auto_create_rollover_round(
-            next_cycle,
-            completed_round.pl_matchday,
-            inherit_season_from_cycle=completed_round.cycle_number or 1
-        )
-        if rollover_result.get('success'):
-            logger.info(f"Rollover round created: id={rollover_result.get('round_id')}, fixtures={rollover_result.get('fixtures_added')}")
-        else:
-            logger.error(f"Failed to auto-create rollover round: {rollover_result.get('error')}")
-
-        logger.info("=== GAME STATE EVALUATION COMPLETE (rollover) ===")
-        return 'rollover'
-
-    # ==================== CONTINUE (normal progression) ====================
-    # active_players > 1
-    else:
-        logger.info("=" * 60)
-        logger.info("GAME STATE: continue")
-        logger.info(f"{active_count} players still active - game continues")
-        logger.info("=" * 60)
-
-        logger.info("=== GAME STATE EVALUATION COMPLETE (continue) ===")
-        return 'continue'
+    """Check round readiness — delegates to services.round_lifecycle."""
+    from lms_automation.services.round_lifecycle import check_round_readiness as _svc
+    return _svc(round_id)
 
 
 def _earliest_kickoff_for_round(round_obj: Round):
@@ -5789,6 +4934,13 @@ def generate_tokens_for_round(round_id):
 @app.route('/rules')
 def rules():
     return render_template('rules.html')
+
+
+# ---------------------------------------------------------------------------
+# Blueprints — register after all inline routes so there are no conflicts
+# ---------------------------------------------------------------------------
+from lms_automation.routes.admin_ops import admin_ops_bp  # noqa: E402
+app.register_blueprint(admin_ops_bp)
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))

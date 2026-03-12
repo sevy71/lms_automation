@@ -5,6 +5,7 @@ import string
 import os
 
 
+
 class Player(db.Model):
     __tablename__ = 'players'
 
@@ -292,6 +293,52 @@ class ReminderSchedule(db.Model):
         self.is_sent = True
         self.sent_at = datetime.utcnow()
         db.session.commit()
+
+
+# ---------------------------------------------------------------------------
+# Notification outbox (transactional outbox pattern)
+# ---------------------------------------------------------------------------
+
+class NotificationOutbox(db.Model):
+    """
+    Pending, sent, and dead Telegram notifications.
+
+    Game-state code writes rows to this table inside the same DB transaction as
+    the state changes.  A separate scheduler job reads pending rows and delivers
+    them via the Telegram Bot API with configurable retries.
+
+    Status transitions:
+      pending  ->  sent   (delivered on any attempt)
+      pending  ->  dead   (all attempts exhausted; max_attempts reached)
+    """
+    __tablename__ = 'notification_outbox'
+
+    id = db.Column(db.Integer, primary_key=True)
+    round_id = db.Column(db.Integer, db.ForeignKey('rounds.id'), nullable=True, index=True)
+    telegram_id = db.Column(db.String(100), nullable=False)
+    message = db.Column(db.Text, nullable=False)
+    button_url = db.Column(db.String(500), nullable=True)
+    button_text = db.Column(db.String(200), nullable=True)
+    # Deterministic idempotency key: '{event}:{telegram_id}:{scope}'.
+    # Nullable — rows without a key are always inserted.
+    # enqueue_notification() skips insert when an active (pending/sent) row with
+    # the same key already exists, preventing duplicate notifications on retry.
+    idempotency_key = db.Column(db.String(255), nullable=True, index=True)
+    # pending / sent / dead
+    status = db.Column(db.String(20), nullable=False, default='pending', index=True)
+    attempts = db.Column(db.Integer, nullable=False, default=0)
+    max_attempts = db.Column(db.Integer, nullable=False, default=3)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    last_attempt_at = db.Column(db.DateTime, nullable=True)
+    last_error = db.Column(db.Text, nullable=True)
+    sent_at = db.Column(db.DateTime, nullable=True)
+
+    def __repr__(self):
+        return (
+            f'<NotificationOutbox id={self.id} status={self.status} '
+            f'attempts={self.attempts}/{self.max_attempts} '
+            f'telegram_id={self.telegram_id}>'
+        )
 
 
 # ---------------------------------------------------------------------------

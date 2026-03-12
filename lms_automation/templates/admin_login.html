@@ -21,6 +21,7 @@
                 {% endwith %}
 
                 <form method="POST">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                     <div class="mb-3">
                         <label for="password" class="form-label">Admin Password</label>
                         <input type="password" class="form-control" id="password" name="password" required autofocus>

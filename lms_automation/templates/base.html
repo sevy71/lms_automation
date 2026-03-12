@@ -17,6 +17,9 @@
     <link rel="alternate icon" type="image/png" href="{{ url_for('static', filename='favicon.png') }}">
     <!-- App styles -->
     <link href="{{ url_for('static', filename='css/app.css') }}" rel="stylesheet">
+    {% if session.get('admin_logged_in') %}
+    <meta name="csrf-token" content="{{ csrf_token() }}">
+    {% endif %}
 </head>
 <body>
     <nav class="navbar navbar-expand-lg navbar-dark bg-dark">
@@ -43,6 +46,24 @@
     </div>
 
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js"></script>
+    {% if session.get('admin_logged_in') %}
+    <script>
+    (function () {
+      var _csrfToken = document.querySelector('meta[name="csrf-token"]');
+      if (!_csrfToken) return;
+      var token = _csrfToken.content;
+      var _origFetch = window.fetch;
+      window.fetch = function (input, init) {
+        init = init || {};
+        var method = (init.method || 'GET').toUpperCase();
+        if (method === 'POST' || method === 'PUT' || method === 'PATCH' || method === 'DELETE') {
+          init.headers = Object.assign({}, init.headers || {}, { 'X-CSRF-Token': token });
+        }
+        return _origFetch.call(this, input, init);
+      };
+    })();
+    </script>
+    {% endif %}
     {% block scripts %}{% endblock %}
 </body>
 </html>
