@@ -540,6 +540,55 @@ def admin_required(f):
         return f(*args, **kwargs)
     return decorated_function
 
+
+# ---------------------------------------------------------------------------
+# Organiser context helpers (Phase 1 multi-organiser foundation)
+# ---------------------------------------------------------------------------
+
+def _get_default_organiser_id():
+    """Return the id of the 'default' organiser row, or None if not yet migrated."""
+    try:
+        from lms_automation.models import Organiser
+        org = Organiser.query.filter_by(slug='default').first()
+        return org.id if org else None
+    except Exception:
+        return None
+
+
+def get_current_organiser_id():
+    """Return the organiser_id for the current admin session.
+
+    Falls back to the default organiser so pre-migration sessions still work.
+    Returns None only if the organisers table doesn't exist yet (pre-migration).
+
+    TODO Phase 2: raise an error if no organiser_id is set, once all admin
+    sessions are guaranteed to have organiser context.
+    """
+    oid = session.get('organiser_id')
+    if oid:
+        return oid
+    # Session predates Phase 1 — lazily resolve and cache
+    oid = _get_default_organiser_id()
+    if oid:
+        session['organiser_id'] = oid
+    return oid
+
+
+def check_organiser_owns(record, organiser_id):
+    """Return True if the record belongs to organiser_id.
+
+    Uses getattr so this is safe against objects that don't yet have the
+    organiser_id column (pre-migration compat).
+
+    TODO Phase 2: remove the getattr fallback once all records are guaranteed
+    to have organiser_id set.
+    """
+    record_org_id = getattr(record, 'organiser_id', None)
+    if record_org_id is None:
+        # Pre-migration row — allow access (backward compat)
+        return True
+    return record_org_id == organiser_id
+
 @app.route('/admin/login', methods=['GET', 'POST'])
 @limiter.limit("5 per minute")
 def admin_login():
@@ -558,6 +607,11 @@ def admin_login():
             session.clear()
             session['admin_logged_in'] = True
             session.permanent = True
+            # Phase 1: bind admin session to the default organiser.
+            # Phase 2: resolve per-admin organiser when multi-admin is introduced.
+            default_oid = _get_default_organiser_id()
+            if default_oid:
+                session['organiser_id'] = default_oid
             log_admin_action('admin_login', 'success')
             raw_next = request.args.get('next', '')
             parsed = urllib.parse.urlparse(raw_next)
@@ -634,14 +688,16 @@ def get_picks_grid_data():
     try:
         from sqlalchemy import func
 
-        # Determine available cycles
-        all_cycles = (
-            db.session.query(Round.cycle_number)
-            .filter(Round.cycle_number.isnot(None))
-            .distinct()
-            .order_by(Round.cycle_number)
-            .all()
+        # Phase 1: scope to current organiser
+        oid = get_current_organiser_id()
+
+        # Determine available cycles (scoped to organiser)
+        cycle_q = db.session.query(Round.cycle_number).filter(
+            Round.cycle_number.isnot(None)
         )
+        if oid:
+            cycle_q = cycle_q.filter(Round.organiser_id == oid)
+        all_cycles = cycle_q.distinct().order_by(Round.cycle_number).all()
         available_cycles = [c[0] for c in all_cycles] or [1]
 
         # Determine current cycle (default):
@@ -651,24 +707,28 @@ def get_picks_grid_data():
         if requested_cycle is not None:
             current_cycle = requested_cycle
         else:
-            active_round = Round.query.filter(Round.status.in_(['active', 'pending'])).order_by(Round.id.desc()).first()
+            ar_q = Round.query.filter(Round.status.in_(['active', 'pending']))
+            if oid:
+                ar_q = ar_q.filter(Round.organiser_id == oid)
+            active_round = ar_q.order_by(Round.id.desc()).first()
             if active_round:
                 current_cycle = active_round.cycle_number or 1
             else:
                 current_cycle = max(available_cycles)
 
         # Query rounds only in the selected cycle, ordered by round_number
-        rounds = (
-            Round.query
-            .filter(Round.cycle_number == current_cycle)
-            .order_by(Round.round_number)
-            .all()
-        )
+        rnd_q = Round.query.filter(Round.cycle_number == current_cycle)
+        if oid:
+            rnd_q = rnd_q.filter(Round.organiser_id == oid)
+        rounds = rnd_q.order_by(Round.round_number).all()
 
         # Build round_id set for efficient filtering
         round_ids = {r.id for r in rounds}
 
-        players = Player.query.order_by(Player.name).all()
+        pl_q = Player.query.order_by(Player.name)
+        if oid:
+            pl_q = pl_q.filter(Player.organiser_id == oid)
+        players = pl_q.all()
 
         # Fetch only picks whose round is in the selected cycle
         picks = Pick.query.filter(Pick.round_id.in_(round_ids)).all()
@@ -731,13 +791,22 @@ def index():
 @app.route('/admin_dashboard')
 @admin_required
 def admin_dashboard():
-    players = Player.query.all()
-    current_round = Round.query.filter_by(status='active').first()
+    # Phase 1: scope all queries to the current organiser.
+    oid = get_current_organiser_id()
+
+    players = (Player.query.filter_by(organiser_id=oid).all()
+               if oid else Player.query.all())
+
+    round_q = Round.query.filter_by(status='active')
+    if oid:
+        round_q = round_q.filter_by(organiser_id=oid)
+    current_round = round_q.first()
 
     # Compute game state info for dashboard display
-    active_player_count = Player.query.filter_by(status='active').count()
-    eliminated_player_count = Player.query.filter_by(status='eliminated').count()
-    winner_player_count = Player.query.filter_by(status='winner').count()
+    pq = Player.query.filter_by(organiser_id=oid) if oid else Player.query
+    active_player_count = pq.filter_by(status='active').count()
+    eliminated_player_count = pq.filter_by(status='eliminated').count()
+    winner_player_count = pq.filter_by(status='winner').count()
 
     # Get current cycle number
     current_cycle = None
@@ -745,12 +814,16 @@ def admin_dashboard():
         current_cycle = current_round.cycle_number or 1
     else:
         # Find from most recent round
-        latest_round = Round.query.order_by(Round.id.desc()).first()
+        rq = Round.query.filter_by(organiser_id=oid) if oid else Round.query
+        latest_round = rq.order_by(Round.id.desc()).first()
         if latest_round:
             current_cycle = latest_round.cycle_number or 1
 
     # Get last completed round and its outcome
-    last_completed_round = Round.query.filter_by(status='completed').order_by(Round.id.desc()).first()
+    lrq = Round.query.filter_by(status='completed')
+    if oid:
+        lrq = lrq.filter_by(organiser_id=oid)
+    last_completed_round = lrq.order_by(Round.id.desc()).first()
     last_round_outcome = None
     if last_completed_round:
         special_note = last_completed_round.special_note or ''
@@ -1051,9 +1124,14 @@ def seed_random_picks():
 @app.route('/api/admin/current-round-picks-status')
 @admin_required
 def current_round_picks_status():
-    """Return pick submission status for the active round: counts, who’s missing, and an optional WhatsApp link for admin when complete."""
+    """Return pick submission status for the active round: counts, who's missing, and an optional WhatsApp link for admin when complete."""
     try:
-        round_obj = Round.query.filter_by(status='active').first()
+        # Phase 1: scope to current organiser
+        oid = get_current_organiser_id()
+        rq = Round.query.filter_by(status='active')
+        if oid:
+            rq = rq.filter_by(organiser_id=oid)
+        round_obj = rq.first()
         if not round_obj:
             return jsonify({
                 'success': True,
@@ -4584,16 +4662,21 @@ def reminders_dashboard():
 def admin_statistics_page():
     """Standalone Player Statistics Dashboard page (no JS fetch required)."""
     try:
+        # Phase 1: scope to current organiser
+        oid = get_current_organiser_id()
+        pq = Player.query.filter_by(organiser_id=oid) if oid else Player.query
+        rq = Round.query.filter_by(organiser_id=oid) if oid else Round.query
+
         # Competition overview
-        total_players = Player.query.count()
-        active_players = Player.query.filter_by(status='active').count()
-        eliminated_players = Player.query.filter_by(status='eliminated').count()
-        total_rounds = Round.query.count()
-        completed_rounds = Round.query.filter_by(status='completed').count()
-        active_round = Round.query.filter_by(status='active').first()
+        total_players = pq.count()
+        active_players = pq.filter_by(status='active').count()
+        eliminated_players = pq.filter_by(status='eliminated').count()
+        total_rounds = rq.count()
+        completed_rounds = rq.filter_by(status='completed').count()
+        active_round = rq.filter_by(status='active').first()
 
         # Player stats
-        players = Player.query.all()
+        players = pq.all()
         player_stats = []
         for player in players:
             picks = Pick.query.filter_by(player_id=player.id).all()
@@ -4933,6 +5016,99 @@ def generate_tokens_for_round(round_id):
 @app.route('/rules')
 def rules():
     return render_template('rules.html')
+
+
+# ---------------------------------------------------------------------------
+# Organiser management (Phase 1 — super-light)
+#
+# Security model (Phase 1):
+#   - Protected by existing admin_required decorator (shared password).
+#   - Only the currently authenticated admin can manage organisers.
+#   - No cross-organiser data is exposed.
+#
+# TODO Phase 2: restrict create/edit to a "super-admin" role once per-organiser
+# admin accounts are introduced.
+# ---------------------------------------------------------------------------
+
+@app.route('/admin/organisers')
+@admin_required
+def list_organisers():
+    """List all organisers. Phase 1: admin can see + create organisers."""
+    from lms_automation.models import Organiser
+    organisers = Organiser.query.order_by(Organiser.created_at).all()
+    current_oid = get_current_organiser_id()
+    return render_template('admin_organisers.html',
+                           organisers=organisers,
+                           current_organiser_id=current_oid)
+
+
+@app.route('/admin/organisers/create', methods=['POST'])
+@admin_required
+def create_organiser():
+    """Create a new organiser (name + slug).
+
+    Security: guarded by admin_required + CSRF (POST method triggers check in
+    admin_required decorator). Slug is validated to be URL-safe and unique.
+    """
+    import re
+    from lms_automation.models import Organiser
+
+    name = (request.form.get('name') or '').strip()
+    slug = (request.form.get('slug') or '').strip().lower()
+
+    if not name or not slug:
+        flash('Name and slug are required.', 'danger')
+        return redirect(url_for('list_organisers'))
+
+    if not re.match(r'^[a-z0-9_-]+$', slug):
+        flash('Slug may only contain lowercase letters, digits, hyphens, and underscores.', 'danger')
+        return redirect(url_for('list_organisers'))
+
+    existing = Organiser.query.filter_by(slug=slug).first()
+    if existing:
+        flash(f'Slug "{slug}" is already in use.', 'danger')
+        return redirect(url_for('list_organisers'))
+
+    new_org = Organiser(name=name, slug=slug, status='active')
+    db.session.add(new_org)
+    db.session.commit()
+
+    log_admin_action('organiser_create', 'success',
+                     organiser_slug=slug, organiser_name=name)
+    flash(f'Organiser "{name}" created successfully.', 'success')
+    return redirect(url_for('list_organisers'))
+
+
+# ---------------------------------------------------------------------------
+# Security guard: cross-organiser access check
+# ---------------------------------------------------------------------------
+
+def abort_if_organiser_mismatch(record, label='record'):
+    """Return a 403 JSON/redirect response if record doesn't belong to the
+    current organiser. Call this in any route that fetches a record by ID.
+
+    Usage:
+        player = Player.query.get_or_404(player_id)
+        mismatch = abort_if_organiser_mismatch(player, 'player')
+        if mismatch:
+            return mismatch
+
+    TODO Phase 2: log security events to the audit log when a mismatch occurs.
+    """
+    oid = get_current_organiser_id()
+    if oid and not check_organiser_owns(record, oid):
+        log_admin_action(
+            'cross_organiser_access', 'blocked',
+            label=label,
+            record_id=getattr(record, 'id', None),
+            record_organiser_id=getattr(record, 'organiser_id', None),
+            session_organiser_id=oid,
+        )
+        if request.is_json or request.accept_mimetypes.best == 'application/json':
+            return jsonify({'success': False, 'error': 'Forbidden'}), 403
+        flash('Access denied: record belongs to a different organiser.', 'danger')
+        return redirect(url_for('admin_dashboard'))
+    return None
 
 
 # ---------------------------------------------------------------------------

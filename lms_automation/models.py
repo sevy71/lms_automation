@@ -6,6 +6,36 @@ import os
 
 
 
+class Organiser(db.Model):
+    """Tenant-level isolation for multi-organiser support (Phase 1 foundation).
+
+    Each organiser owns their own set of players, rounds, and game data.
+    The 'default' organiser is auto-created during migration and owns all
+    pre-existing data so backward compatibility is preserved.
+
+    Phase 2 will add:
+    - Per-organiser admin accounts (currently single shared password)
+    - Full role-based access control
+    - Organiser-scoped scheduler jobs
+    """
+    __tablename__ = 'organisers'
+
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(100), nullable=False)
+    slug = db.Column(db.String(50), nullable=False, unique=True, index=True)
+    status = db.Column(db.String(20), nullable=False, default='active')  # active, suspended
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+
+    # Relationships — lazy='dynamic' so queries remain chainable for scoping
+    players = db.relationship('Player', backref='organiser', lazy='dynamic',
+                              foreign_keys='Player.organiser_id')
+    rounds = db.relationship('Round', backref='organiser', lazy='dynamic',
+                             foreign_keys='Round.organiser_id')
+
+    def __repr__(self):
+        return f'<Organiser {self.slug}>'
+
+
 class Player(db.Model):
     __tablename__ = 'players'
 
@@ -15,6 +45,11 @@ class Player(db.Model):
     telegram_id = db.Column(db.String(50), nullable=True)  # Telegram chat ID for notifications
     status = db.Column(db.String(20), default='active')  # active, eliminated, winner
     unreachable = db.Column(db.Boolean, default=False)
+
+    # Multi-organiser support (Phase 1). Set NOT NULL by migration after backfill.
+    # TODO Phase 2: enforce NOT NULL constraint on creation path once all organisers are wired.
+    organiser_id = db.Column(db.Integer, db.ForeignKey('organisers.id'),
+                             nullable=True, index=True)
 
     picks = db.relationship('Pick', backref='player', lazy=True)
 
@@ -39,6 +74,11 @@ class Round(db.Model):
     # Season tracking (season locked per game)
     season_id = db.Column(db.String(10), nullable=True)
     api_season_year = db.Column(db.Integer, nullable=True)
+
+    # Multi-organiser support (Phase 1). Set NOT NULL by migration after backfill.
+    # TODO Phase 2: enforce NOT NULL constraint on creation path once all organisers are wired.
+    organiser_id = db.Column(db.Integer, db.ForeignKey('organisers.id'),
+                             nullable=True, index=True)
 
     fixtures = db.relationship('Fixture', backref='round', lazy=True)
     picks = db.relationship('Pick', backref='round', lazy=True)

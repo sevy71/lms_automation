@@ -36,6 +36,9 @@ def get_eligible_players_for_round(round_obj):
     # Import here to avoid circular dependency (app.py imports this, models imports db)
     from lms_automation.models import Player, Round, Pick
 
+    # TODO Phase 2: add organiser_id filter here so each organiser's eligibility
+    # is computed independently.  Phase 1 is safe because all players share the
+    # default organiser; this becomes critical once a second organiser is active.
     all_active_players = Player.query.filter_by(status='active').all()
 
     if not round_obj:

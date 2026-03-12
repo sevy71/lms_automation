@@ -1,0 +1,104 @@
+{% extends "base.html" %}
+
+{% block title %}Organisers — Admin{% endblock %}
+
+{% block content %}
+<div class="row mt-4">
+  <div class="col-12">
+    <div class="d-flex align-items-center justify-content-between mb-3">
+      <h2 class="mb-0">Organisers</h2>
+      <a href="{{ url_for('admin_dashboard') }}" class="btn btn-sm btn-outline-secondary">
+        &larr; Back to Dashboard
+      </a>
+    </div>
+
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% for category, message in messages %}
+        <div class="alert alert-{{ 'danger' if category == 'danger' else ('success' if category == 'success' else 'info') }} alert-dismissible fade show" role="alert">
+          {{ message }}
+          <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+        </div>
+      {% endfor %}
+    {% endwith %}
+
+    <div class="card mb-4">
+      <div class="card-header fw-semibold">All Organisers</div>
+      <div class="card-body p-0">
+        <table class="table table-hover mb-0">
+          <thead class="table-light">
+            <tr>
+              <th>ID</th>
+              <th>Name</th>
+              <th>Slug</th>
+              <th>Status</th>
+              <th>Created</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for org in organisers %}
+            <tr class="{{ 'table-primary' if org.id == current_organiser_id else '' }}">
+              <td>{{ org.id }}</td>
+              <td>
+                {{ org.name }}
+                {% if org.id == current_organiser_id %}
+                  <span class="badge bg-primary ms-1">current session</span>
+                {% endif %}
+              </td>
+              <td><code>{{ org.slug }}</code></td>
+              <td>
+                <span class="badge {{ 'bg-success' if org.status == 'active' else 'bg-secondary' }}">
+                  {{ org.status }}
+                </span>
+              </td>
+              <td>{{ org.created_at.strftime('%Y-%m-%d %H:%M') if org.created_at else '—' }}</td>
+              <td class="text-muted small">
+                {# Phase 2: switch-organiser and edit actions will go here #}
+              </td>
+            </tr>
+            {% else %}
+            <tr>
+              <td colspan="6" class="text-center text-muted py-3">No organisers found.</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-header fw-semibold">Create New Organiser</div>
+      <div class="card-body">
+        <p class="text-muted small mb-3">
+          Creating a new organiser gives it an isolated game context — its own players,
+          rounds, and picks. Players and rounds must be explicitly associated with the
+          new organiser; existing data remains under the <code>default</code> organiser.
+          <br>
+          <strong>Phase 2 note:</strong> Per-organiser admin logins and full role-based
+          access control will be added in a future release.
+        </p>
+        <form method="post" action="{{ url_for('create_organiser') }}">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+          <div class="row g-3">
+            <div class="col-md-5">
+              <label for="org-name" class="form-label fw-semibold">Name <span class="text-danger">*</span></label>
+              <input type="text" id="org-name" name="name" class="form-control"
+                     placeholder="e.g. West London League" required maxlength="100">
+            </div>
+            <div class="col-md-4">
+              <label for="org-slug" class="form-label fw-semibold">Slug <span class="text-danger">*</span></label>
+              <input type="text" id="org-slug" name="slug" class="form-control"
+                     placeholder="e.g. west-london" required maxlength="50"
+                     pattern="[a-z0-9_\-]+" title="Lowercase letters, digits, hyphens and underscores only">
+              <div class="form-text">URL-safe identifier. Lowercase, no spaces.</div>
+            </div>
+            <div class="col-md-3 d-flex align-items-end">
+              <button type="submit" class="btn btn-primary w-100">Create Organiser</button>
+            </div>
+          </div>
+        </form>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}
