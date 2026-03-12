@@ -34,15 +34,12 @@ from __future__ import annotations
 
 import os
 import logging
-import requests
 
 from lms_automation.models import db, Player, Pick
 from lms_automation.services.markers import has_marker, add_marker
 from lms_automation.services.notifications import enqueue_notification
 
 logger = logging.getLogger(__name__)
-
-_SYNC_SEND_TIMEOUT_SECS = 10  # used by send_telegram_message (direct/sync path)
 
 
 # ---------------------------------------------------------------------------
@@ -56,47 +53,30 @@ def send_telegram_message(
     button_text: str = "Make Your Pick",
 ) -> bool:
     """
-    Send a single Telegram message synchronously via the Bot API.
+    Send a single Telegram message synchronously.
 
-    Returns True on HTTP 200, False on any error (never raises).
-    Times out after ``_SYNC_SEND_TIMEOUT_SECS`` seconds.
+    Delegates to ``telegram_client.send_message`` which applies global/per-chat
+    rate limiting, handles 429 flood-control, and retries transient errors.
+
+    Returns True on success, False on any error (never raises).
 
     Use only for urgent one-off sends (reminder delivery, pick-deadline alerts).
     For game-event broadcasts use the send_* functions below, which enqueue
     messages for async delivery.
     """
-    try:
-        bot_token = os.environ.get("TELEGRAM_BOT_TOKEN")
-        if not bot_token:
-            logger.error("TELEGRAM_BOT_TOKEN not set")
-            return False
-
-        url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-        payload = {"chat_id": telegram_id, "text": message}
-
-        if button_url:
-            payload["reply_markup"] = {
-                "inline_keyboard": [[{"text": button_text, "url": button_url}]]
-            }
-
-        response = requests.post(url, json=payload, timeout=_SYNC_SEND_TIMEOUT_SECS)
-        if response.status_code != 200:
-            logger.error(
-                "Telegram sendMessage failed: status=%s chat_id=%s response=%s",
-                response.status_code,
-                telegram_id,
-                response.text[:300],
-            )
-        return response.status_code == 200
-    except requests.Timeout:
+    from lms_automation.services.telegram_client import send_message as _client_send
+    ok, err = _client_send(
+        chat_id=telegram_id,
+        text=message,
+        button_url=button_url,
+        button_text=button_text,
+    )
+    if not ok:
         logger.error(
-            "Telegram sendMessage timed out after %ss for chat_id=%s",
-            _SYNC_SEND_TIMEOUT_SECS, telegram_id,
+            "send_telegram_message failed: chat_id=%s error=%s",
+            telegram_id, err,
         )
-        return False
-    except Exception as e:
-        logger.error("Error sending Telegram message: %s", e)
-        return False
+    return ok
 
 
 def get_picks_grid_url() -> str:
