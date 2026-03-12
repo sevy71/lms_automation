@@ -122,11 +122,27 @@ class PickToken(db.Model):
         return ''.join(secrets.choice(alphabet) for _ in range(32))
 
     @staticmethod
-    def create_for_player_round(player_id, round_id, expires_hours=168, force_new=False):  # default kept for fallback when no deadline
+    def create_for_player_round(player_id, round_id, expires_hours=None, force_new=False):
         """Create or fetch a pick token for a player and round.
-        - Reuse existing token only if it's still valid and not forced to regenerate.
-        - Prefer setting expiry to the round deadline (end_date) when available.
+
+        Expiry is determined dynamically so tokens survive long gaps between rounds:
+          1. Preferred: round.first_kickoff_at minus PICK_TOKEN_LOCK_BUFFER_MINUTES (default 15)
+          2. Fallback:  round.end_date if first_kickoff_at is absent/past
+          3. Last resort: now + PICK_TOKEN_DEFAULT_HOURS (env, default 168 h)
+          4. Hard cap:  min(computed_expiry, now + PICK_TOKEN_MAX_HOURS) (env, default 8760 h = 1 yr)
+
+        Tokens must still expire before (or at) kickoff so no post-kickoff picks slip through.
+        Expired tokens are regenerated automatically (not forced, just not re-used).
         """
+        # Read env config (falls back to sensible defaults)
+        default_hours = int(os.environ.get('PICK_TOKEN_DEFAULT_HOURS', 168))
+        max_hours = int(os.environ.get('PICK_TOKEN_MAX_HOURS', 8760))
+        lock_buffer_minutes = int(os.environ.get('PICK_TOKEN_LOCK_BUFFER_MINUTES', 15))
+
+        # Use caller-supplied expires_hours only when explicitly provided
+        if expires_hours is None:
+            expires_hours = default_hours
+
         # Try to reuse an existing valid token unless forced
         if not force_new:
             existing_token = PickToken.query.filter_by(
@@ -136,17 +152,27 @@ class PickToken(db.Model):
             if existing_token and existing_token.is_valid():
                 return existing_token
 
-        # Determine expiry from round deadline when present
+        # Determine expiry anchored to round lifecycle
         round_obj = Round.query.get(round_id)
+        now = datetime.utcnow()
         expires_at = None
-        if round_obj and round_obj.end_date:
-            # Use the round deadline; if it's in the past, fall back to expires_hours window
-            if round_obj.end_date > datetime.utcnow():
+
+        if round_obj:
+            # Primary anchor: first kickoff minus safety buffer
+            if round_obj.first_kickoff_at and round_obj.first_kickoff_at > now:
+                expires_at = round_obj.first_kickoff_at - timedelta(minutes=lock_buffer_minutes)
+            # Secondary anchor: end_date
+            elif round_obj.end_date and round_obj.end_date > now:
                 expires_at = round_obj.end_date
-            elif expires_hours:
-                expires_at = datetime.utcnow() + timedelta(hours=expires_hours)
-        elif expires_hours:
-            expires_at = datetime.utcnow() + timedelta(hours=expires_hours)
+
+        # Last resort: fixed TTL from env/caller
+        if expires_at is None or expires_at <= now:
+            expires_at = now + timedelta(hours=expires_hours)
+
+        # Apply hard cap so tokens cannot outlive PICK_TOKEN_MAX_HOURS
+        max_expiry = now + timedelta(hours=max_hours)
+        if expires_at > max_expiry:
+            expires_at = max_expiry
 
         # Create new token
         token = PickToken(

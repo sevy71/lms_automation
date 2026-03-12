@@ -14,7 +14,7 @@
                     <strong>Welcome!</strong><br>
                     You've been invited to join our Last Man Standing competition. Enter your name below to register.
                     {% if whatsapp_number %}
-                        <br><br><small>You'll be associated with WhatsApp number: <strong>{{ whatsapp_number }}</strong></small>
+                        <br><br><small>Your contact number: <strong>{{ whatsapp_number }}</strong></small>
                     {% endif %}
                 </div>
 
@@ -31,18 +31,18 @@
 
                     {% if whatsapp_number %}
                         <div class="mb-3">
-                            <label for="whatsappNumber" class="form-label fw-bold">WhatsApp Number</label>
+                            <label for="whatsappNumber" class="form-label fw-bold">Mobile Number</label>
                             <input type="tel" class="form-control form-control-lg" id="whatsappNumber" readonly
                                    value="{{ whatsapp_number }}"
                                    style="background-color: #f8f9fa;">
-                            <div class="form-text">This number will be used to send you pick reminders</div>
+                            <div class="form-text">Used for account/contact verification. This number will be used to send you pick reminders.</div>
                         </div>
                     {% else %}
                         <div class="mb-3">
-                            <label for="whatsappNumber" class="form-label fw-bold">WhatsApp Number</label>
-                            <input type="tel" class="form-control form-control-lg" id="whatsappNumber" 
+                            <label for="whatsappNumber" class="form-label fw-bold">Mobile Number</label>
+                            <input type="tel" class="form-control form-control-lg" id="whatsappNumber"
                                    placeholder="+44XXXXXXXXXX" style="font-size: 1rem;">
-                            <div class="form-text">Leave blank if you prefer not to receive WhatsApp reminders</div>
+                            <div class="form-text">Optional. Used for account/contact verification and pick reminders.</div>
                         </div>
                     {% endif %}
 

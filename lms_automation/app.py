@@ -815,7 +815,7 @@ def resend_round_announcement(round_id):
 
         if not pick_token:
             # Create token on the fly
-            pick_token = PickToken.create_for_player_round(player.id, round_id, expires_hours=168)
+            pick_token = PickToken.create_for_player_round(player.id, round_id)
             db.session.add(pick_token)
             db.session.commit()
 
@@ -4907,8 +4907,7 @@ def generate_tokens_for_round(round_id):
                 # Create new token
                 token = PickToken.create_for_player_round(
                     player.id,
-                    round_obj.id,
-                    expires_hours=168  # 7 days or until round deadline
+                    round_obj.id
                 )
                 tokens_created.append({
                     'player': player.name,
