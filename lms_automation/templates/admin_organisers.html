@@ -126,7 +126,7 @@
       <div class="card-body">
         <p class="text-muted small mb-3">
           Create a login for an organiser admin. They can log in at
-          <code>{{ request.url_root }}admin/login</code> using their username and password.
+          <code>{{ url_for('admin_login', _external=True) }}</code> using their username and password.
           Organiser admins can only see their own organiser's data.
         </p>
         <form method="post" action="#" id="create-admin-form">

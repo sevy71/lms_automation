@@ -5285,7 +5285,7 @@ def create_organiser_admin(org_id):
                      new_username=new_username, organiser_id=org.id, role=new_role)
     flash(
         f'Admin account "{new_username}" created for organiser "{org.name}". '
-        f'Login URL: {request.url_root}admin/login',
+        f'Login URL: {url_for("admin_login", _external=True)}',
         'success',
     )
     return redirect(url_for('list_organisers'))
