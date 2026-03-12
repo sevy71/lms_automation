@@ -5244,6 +5244,7 @@ def create_organiser_admin(org_id):
 
     new_username = (request.form.get('new_username') or '').strip()
     new_password = (request.form.get('new_password') or '')
+    confirm_password = (request.form.get('confirm_password') or '')
     new_role = request.form.get('new_role', 'organiser_admin')
 
     if new_role not in ('organiser_admin', 'super_admin'):
@@ -5252,6 +5253,14 @@ def create_organiser_admin(org_id):
 
     if not new_username:
         flash('Username is required.', 'danger')
+        return redirect(url_for('list_organisers'))
+
+    if not new_password or not confirm_password:
+        flash('Password and confirmation are required.', 'danger')
+        return redirect(url_for('list_organisers'))
+
+    if new_password != confirm_password:
+        flash('Passwords do not match. Please re-enter both fields.', 'danger')
         return redirect(url_for('list_organisers'))
 
     if len(new_password) < 12:
