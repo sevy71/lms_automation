@@ -14,7 +14,7 @@
 
     {% with messages = get_flashed_messages(with_categories=true) %}
       {% for category, message in messages %}
-        <div class="alert alert-{{ 'danger' if category == 'danger' else ('success' if category == 'success' else 'info') }} alert-dismissible fade show" role="alert">
+        <div class="alert alert-{{ 'danger' if category in ['danger', 'error'] else ('success' if category == 'success' else ('warning' if category == 'warning' else 'info')) }} alert-dismissible fade show" role="alert">
           {{ message }}
           <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
         </div>
@@ -34,24 +34,31 @@
               <th>Status</th>
               <th>Admin accounts</th>
               <th>Created</th>
-              <th></th>
+              <th>Actions</th>
             </tr>
           </thead>
           <tbody>
             {% for org in organisers %}
-            <tr class="{{ 'table-primary' if org.id == current_organiser_id else '' }}">
+            <tr class="{{ 'table-primary' if org.id == current_organiser_id else ('table-secondary text-muted' if org.status == 'archived' else '') }}">
               <td>{{ org.id }}</td>
               <td>
                 {{ org.name }}
                 {% if org.id == current_organiser_id %}
                   <span class="badge bg-primary ms-1">current session</span>
                 {% endif %}
+                {% if org.status == 'archived' %}
+                  <span class="badge bg-secondary ms-1">archived</span>
+                {% endif %}
               </td>
               <td><code>{{ org.slug }}</code></td>
               <td>
-                <span class="badge {{ 'bg-success' if org.status == 'active' else 'bg-secondary' }}">
-                  {{ org.status }}
-                </span>
+                {% if org.status == 'active' %}
+                  <span class="badge bg-success">active</span>
+                {% elif org.status == 'archived' %}
+                  <span class="badge bg-secondary">archived</span>
+                {% else %}
+                  <span class="badge bg-warning text-dark">{{ org.status }}</span>
+                {% endif %}
               </td>
               <td>
                 {% set org_admins = admin_users_by_org.get(org.id, []) %}
@@ -67,14 +74,58 @@
                   <span class="text-muted small">none</span>
                 {% endif %}
               </td>
-              <td>{{ org.created_at.strftime('%Y-%m-%d %H:%M') if org.created_at else '—' }}</td>
-              <td>
+              <td class="text-nowrap">{{ org.created_at.strftime('%Y-%m-%d %H:%M') if org.created_at else '—' }}</td>
+              <td class="text-nowrap">
+                {# Switch context #}
                 {% if org.id != current_organiser_id %}
                 <form method="post" action="{{ url_for('switch_organiser') }}" class="d-inline">
                   <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                   <input type="hidden" name="organiser_id" value="{{ org.id }}">
                   <button type="submit" class="btn btn-sm btn-outline-primary">Switch to</button>
                 </form>
+                {% endif %}
+
+                {# QR code buttons #}
+                <a href="{{ url_for('organiser_qr_view', org_id=org.id) }}"
+                   class="btn btn-sm btn-outline-info" title="View registration QR">View QR</a>
+                <a href="{{ url_for('organiser_qr_download', org_id=org.id) }}"
+                   class="btn btn-sm btn-info" title="Download registration QR as PNG">Download QR</a>
+
+                {# Edit button — opens modal #}
+                <button type="button" class="btn btn-sm btn-outline-warning"
+                        data-bs-toggle="modal" data-bs-target="#editOrgModal"
+                        data-org-id="{{ org.id }}"
+                        data-org-name="{{ org.name }}"
+                        data-org-slug="{{ org.slug }}"
+                        data-org-status="{{ org.status }}">
+                  Edit
+                </button>
+
+                {# Archive / Unarchive toggle #}
+                {% if org.slug != 'default' %}
+                <form method="post" action="{{ url_for('archive_organiser', org_id=org.id) }}" class="d-inline">
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                  {% if org.status == 'archived' %}
+                  <button type="submit" class="btn btn-sm btn-outline-success"
+                          onclick="return confirm('Restore organiser \'{{ org.name }}\' to active?')">
+                    Unarchive
+                  </button>
+                  {% else %}
+                  <button type="submit" class="btn btn-sm btn-outline-secondary"
+                          onclick="return confirm('Archive organiser \'{{ org.name }}\'? All data will be preserved.')">
+                    Archive
+                  </button>
+                  {% endif %}
+                </form>
+
+                {# Delete button — opens confirmation modal #}
+                <button type="button" class="btn btn-sm btn-outline-danger"
+                        data-bs-toggle="modal" data-bs-target="#deleteOrgModal"
+                        data-org-id="{{ org.id }}"
+                        data-org-name="{{ org.name }}"
+                        data-org-slug="{{ org.slug }}">
+                  Delete
+                </button>
                 {% endif %}
               </td>
             </tr>
@@ -138,7 +189,7 @@
                       onchange="document.getElementById('create-admin-form').action='/admin/organisers/' + this.value + '/create-admin'">
                 <option value="">— select —</option>
                 {% for org in organisers %}
-                <option value="{{ org.id }}">{{ org.name }}</option>
+                <option value="{{ org.id }}">{{ org.name }}{% if org.status == 'archived' %} (archived){% endif %}</option>
                 {% endfor %}
               </select>
             </div>
@@ -177,4 +228,118 @@
 
   </div>
 </div>
+
+{# ═══════════════════════════════════════════════════════════════ #}
+{# Edit Organiser Modal (Part B)                                   #}
+{# ═══════════════════════════════════════════════════════════════ #}
+<div class="modal fade" id="editOrgModal" tabindex="-1" aria-labelledby="editOrgModalLabel" aria-hidden="true">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <form method="post" id="edit-org-form" action="#">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <div class="modal-header">
+          <h5 class="modal-title" id="editOrgModalLabel">Edit Organiser</h5>
+          <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+        </div>
+        <div class="modal-body">
+          <div class="mb-3">
+            <label for="edit-org-name" class="form-label fw-semibold">Name <span class="text-danger">*</span></label>
+            <input type="text" id="edit-org-name" name="name" class="form-control"
+                   required maxlength="100">
+          </div>
+          <div class="mb-3">
+            <label for="edit-org-slug" class="form-label fw-semibold">Slug <span class="text-danger">*</span></label>
+            <input type="text" id="edit-org-slug" name="slug" class="form-control"
+                   required maxlength="50" pattern="[a-z0-9_\-]+"
+                   title="Lowercase letters, digits, hyphens and underscores only">
+            <div class="form-text">
+              Changing the slug updates future registration QR links. Existing links will stop working.
+            </div>
+          </div>
+          <div class="mb-3">
+            <label for="edit-org-status" class="form-label fw-semibold">Status</label>
+            <select id="edit-org-status" name="status" class="form-select">
+              <option value="active">active</option>
+              <option value="archived">archived</option>
+              <option value="suspended">suspended</option>
+            </select>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+          <button type="submit" class="btn btn-warning">Save Changes</button>
+        </div>
+      </form>
+    </div>
+  </div>
+</div>
+
+{# ═══════════════════════════════════════════════════════════════ #}
+{# Delete Organiser Modal (Part D)                                 #}
+{# ═══════════════════════════════════════════════════════════════ #}
+<div class="modal fade" id="deleteOrgModal" tabindex="-1" aria-labelledby="deleteOrgModalLabel" aria-hidden="true">
+  <div class="modal-dialog">
+    <div class="modal-content border-danger">
+      <form method="post" id="delete-org-form" action="#">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <div class="modal-header bg-danger text-white">
+          <h5 class="modal-title" id="deleteOrgModalLabel">Delete Organiser</h5>
+          <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+        </div>
+        <div class="modal-body">
+          <div class="alert alert-danger">
+            <strong>This action is irreversible.</strong> Deletion is only allowed when the organiser
+            has <em>no players, no rounds, and no dependent picks</em>. If it has data, please
+            <strong>archive</strong> it instead.
+          </div>
+          <p>You are about to permanently delete organiser
+            <strong id="delete-org-name-display"></strong>.
+          </p>
+          <div class="mb-3">
+            <label for="delete-confirm-slug" class="form-label fw-semibold">
+              Type the organiser slug to confirm:
+              <code id="delete-org-slug-display" class="text-danger"></code>
+            </label>
+            <input type="text" id="delete-confirm-slug" name="confirm_slug" class="form-control"
+                   required autocomplete="off" placeholder="type slug here">
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel — keep organiser</button>
+          <button type="submit" class="btn btn-danger"
+                  onclick="return confirm('Final check: permanently delete this organiser?')">
+            Delete permanently
+          </button>
+        </div>
+      </form>
+    </div>
+  </div>
+</div>
+
+<script>
+// Populate Edit modal from data attributes
+document.getElementById('editOrgModal').addEventListener('show.bs.modal', function (event) {
+  const btn = event.relatedTarget;
+  const orgId = btn.getAttribute('data-org-id');
+  const orgName = btn.getAttribute('data-org-name');
+  const orgSlug = btn.getAttribute('data-org-slug');
+  const orgStatus = btn.getAttribute('data-org-status');
+  document.getElementById('edit-org-form').action = '/admin/organisers/' + orgId + '/edit';
+  document.getElementById('edit-org-name').value = orgName;
+  document.getElementById('edit-org-slug').value = orgSlug;
+  document.getElementById('edit-org-status').value = orgStatus;
+});
+
+// Populate Delete modal from data attributes
+document.getElementById('deleteOrgModal').addEventListener('show.bs.modal', function (event) {
+  const btn = event.relatedTarget;
+  const orgId = btn.getAttribute('data-org-id');
+  const orgName = btn.getAttribute('data-org-name');
+  const orgSlug = btn.getAttribute('data-org-slug');
+  document.getElementById('delete-org-form').action = '/admin/organisers/' + orgId + '/delete';
+  document.getElementById('delete-org-name-display').textContent = orgName;
+  document.getElementById('delete-org-slug-display').textContent = orgSlug;
+  document.getElementById('delete-confirm-slug').value = '';
+});
+</script>
 {% endblock %}

@@ -1,0 +1,59 @@
+{% extends "base.html" %}
+
+{% block title %}Registration QR — {{ org.name }}{% endblock %}
+
+{% block content %}
+<div class="row mt-4 justify-content-center">
+  <div class="col-md-7 col-lg-5">
+    <div class="d-flex align-items-center justify-content-between mb-3">
+      <h2 class="mb-0">Registration QR</h2>
+      <a href="{{ url_for('list_organisers') }}" class="btn btn-sm btn-outline-secondary">
+        &larr; Back to Organisers
+      </a>
+    </div>
+
+    {% if org.status == 'archived' %}
+    <div class="alert alert-warning">
+      Organiser <strong>{{ org.name }}</strong> is currently <strong>archived</strong>.
+      The QR code is shown for reference but the registration page may not accept new players.
+    </div>
+    {% endif %}
+
+    <div class="card">
+      <div class="card-header fw-semibold">
+        {{ org.name }}
+        <span class="badge {{ 'bg-success' if org.status == 'active' else 'bg-secondary' }} ms-2">
+          {{ org.status }}
+        </span>
+      </div>
+      <div class="card-body text-center">
+        {# Inline QR rendered via data-URI from the download endpoint #}
+        <img id="qr-img"
+             src="{{ url_for('organiser_qr_download', org_id=org.id) }}"
+             alt="Registration QR code for {{ org.name }}"
+             class="img-fluid border rounded p-2"
+             style="max-width: 300px;">
+        <p class="mt-3 text-muted small">
+          Scan to open:
+          <a href="{{ reg_url }}" target="_blank" rel="noopener noreferrer">{{ reg_url }}</a>
+        </p>
+      </div>
+      <div class="card-footer d-flex gap-2 justify-content-center">
+        <a href="{{ url_for('organiser_qr_download', org_id=org.id) }}"
+           download="register-{{ org.slug }}.png"
+           class="btn btn-primary">
+          Download PNG (register-{{ org.slug }}.png)
+        </a>
+        <a href="{{ reg_url }}" target="_blank" rel="noopener noreferrer"
+           class="btn btn-outline-secondary">
+          Open registration link
+        </a>
+      </div>
+    </div>
+
+    <p class="text-muted small mt-3">
+      QR encodes <code>{{ reg_url }}</code>. If the slug changes, generate a new QR.
+    </p>
+  </div>
+</div>
+{% endblock %}

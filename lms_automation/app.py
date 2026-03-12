@@ -4339,8 +4339,13 @@ def make_pick(token):
 
 @app.route('/register')
 def player_registration():
-    """Show player registration form for existing players to invite family members"""
-    return render_template('player_registration.html')
+    """Show player registration form. Accepts ?organiser=<slug> to scope to an organiser."""
+    organiser_slug = request.args.get('organiser', '').strip() or None
+    organiser = None
+    if organiser_slug:
+        from lms_automation.models import Organiser
+        organiser = Organiser.query.filter_by(slug=organiser_slug).first()
+    return render_template('player_registration.html', organiser=organiser)
 
 @app.route('/register/<whatsapp_number>')
 def register_with_whatsapp(whatsapp_number):
@@ -4348,7 +4353,13 @@ def register_with_whatsapp(whatsapp_number):
     # Decode the whatsapp number (in case it's URL encoded)
     import urllib.parse
     decoded_number = urllib.parse.unquote(whatsapp_number)
-    return render_template('player_registration.html', whatsapp_number=decoded_number)
+    organiser_slug = request.args.get('organiser', '').strip() or None
+    organiser = None
+    if organiser_slug:
+        from lms_automation.models import Organiser
+        organiser = Organiser.query.filter_by(slug=organiser_slug).first()
+    return render_template('player_registration.html', whatsapp_number=decoded_number,
+                           organiser=organiser)
 
 @app.route('/api/register', methods=['POST'])
 def api_register_player():
@@ -4363,8 +4374,25 @@ def api_register_player():
         whatsapp = data.get('whatsapp_number', '').strip() or None
         telegram_id = data.get('telegram_id', '').strip() or None
 
-        # Check if player with same name already exists
-        existing_player = Player.query.filter_by(name=name).first()
+        # Resolve organiser from slug if provided (set by organiser-specific registration page)
+        organiser_id = None
+        organiser_slug = data.get('organiser_slug', '').strip() or None
+        if organiser_slug:
+            from lms_automation.models import Organiser
+            org = Organiser.query.filter_by(slug=organiser_slug, status='active').first()
+            if org:
+                organiser_id = org.id
+
+        # Fall back to default organiser
+        if organiser_id is None:
+            organiser_id = _get_default_organiser_id()
+
+        # Check if player with same name already exists (scoped to organiser if known)
+        existing_q = Player.query.filter_by(name=name)
+        if organiser_id:
+            existing_q = existing_q.filter_by(organiser_id=organiser_id)
+        existing_player = existing_q.first()
+
         if existing_player:
             # If registering via Telegram, update the telegram_id
             if telegram_id and not existing_player.telegram_id:
@@ -4377,7 +4405,8 @@ def api_register_player():
         player = Player(
             name=name,
             whatsapp_number=sanitize_phone_number(whatsapp) if whatsapp else None,
-            telegram_id=telegram_id
+            telegram_id=telegram_id,
+            organiser_id=organiser_id,
         )
 
         db.session.add(player)
@@ -5313,6 +5342,248 @@ def switch_organiser():
                      target_organiser_slug=org.slug)
     flash(f'Switched to organiser: {org.name}', 'success')
     return redirect(url_for('admin_dashboard'))
+
+
+# ---------------------------------------------------------------------------
+# Part A — Registration QR code generation (super-admin only)
+# ---------------------------------------------------------------------------
+
+def _build_registration_url(organiser_slug: str) -> str:
+    """Return the absolute registration URL for the given organiser slug."""
+    base_url = os.environ.get('BASE_URL', '').rstrip('/')
+    if not base_url:
+        base_url = request.url_root.rstrip('/')
+    if base_url.startswith('http://') and 'localhost' not in base_url and '127.0.0.1' not in base_url:
+        base_url = base_url.replace('http://', 'https://')
+    if not base_url.startswith(('http://', 'https://')):
+        base_url = f'https://{base_url}'
+    return f'{base_url}/register?organiser={organiser_slug}'
+
+
+def _generate_qr_png_bytes(url: str) -> bytes:
+    """Render a QR code pointing at *url* and return PNG bytes."""
+    import qrcode
+    import io
+    qr = qrcode.QRCode(
+        version=None,  # auto-size
+        error_correction=qrcode.constants.ERROR_CORRECT_M,
+        box_size=10,
+        border=4,
+    )
+    qr.add_data(url)
+    qr.make(fit=True)
+    img = qr.make_image(fill_color='black', back_color='white')
+    buf = io.BytesIO()
+    img.save(buf, format='PNG')
+    return buf.getvalue()
+
+
+@app.route('/admin/organisers/<int:org_id>/qr')
+@super_admin_required
+def organiser_qr_view(org_id):
+    """Render a page showing the registration QR for an organiser. Super-admin only."""
+    from lms_automation.models import Organiser
+    org = Organiser.query.get_or_404(org_id)
+    reg_url = _build_registration_url(org.slug)
+    return render_template('admin_organiser_qr.html', org=org, reg_url=reg_url)
+
+
+@app.route('/admin/organisers/<int:org_id>/qr/download')
+@super_admin_required
+def organiser_qr_download(org_id):
+    """Stream a PNG QR code for download. Super-admin only."""
+    from lms_automation.models import Organiser
+    from flask import send_file
+    import io
+    org = Organiser.query.get_or_404(org_id)
+    if org.status == 'archived':
+        flash(f'Warning: organiser "{org.name}" is archived — QR generated anyway.', 'warning')
+    reg_url = _build_registration_url(org.slug)
+    log_admin_action('organiser_qr_download', 'success',
+                     organiser_id=org.id, organiser_slug=org.slug, url=reg_url)
+    png_bytes = _generate_qr_png_bytes(reg_url)
+    return send_file(
+        io.BytesIO(png_bytes),
+        mimetype='image/png',
+        as_attachment=True,
+        download_name=f'register-{org.slug}.png',
+    )
+
+
+# ---------------------------------------------------------------------------
+# Part B — Edit organiser details (super-admin only)
+# ---------------------------------------------------------------------------
+
+@app.route('/admin/organisers/<int:org_id>/edit', methods=['POST'])
+@super_admin_required
+def edit_organiser(org_id):
+    """Update name, slug, status for an organiser. Super-admin only."""
+    import re
+    from lms_automation.models import Organiser
+
+    org = Organiser.query.get_or_404(org_id)
+    old_slug = org.slug
+    old_name = org.name
+
+    name = (request.form.get('name') or '').strip()
+    slug = (request.form.get('slug') or '').strip().lower()
+    status = (request.form.get('status') or '').strip()
+
+    if not name or not slug:
+        flash('Name and slug are required.', 'danger')
+        return redirect(url_for('list_organisers'))
+
+    if not re.match(r'^[a-z0-9_-]+$', slug):
+        flash('Slug may only contain lowercase letters, digits, hyphens, and underscores.', 'danger')
+        return redirect(url_for('list_organisers'))
+
+    if status not in ('active', 'archived', 'suspended'):
+        flash('Invalid status value.', 'danger')
+        return redirect(url_for('list_organisers'))
+
+    # Slug uniqueness check (excluding self)
+    conflict = Organiser.query.filter(Organiser.slug == slug, Organiser.id != org_id).first()
+    if conflict:
+        flash(f'Slug "{slug}" is already in use by another organiser.', 'danger')
+        return redirect(url_for('list_organisers'))
+
+    # Prevent renaming the default organiser's slug (it is hard-coded in bootstrap logic)
+    if old_slug == 'default' and slug != 'default':
+        flash('Cannot rename the "default" organiser slug — it is used for backward compatibility.', 'danger')
+        return redirect(url_for('list_organisers'))
+
+    org.name = name
+    org.slug = slug
+    org.status = status
+    db.session.commit()
+
+    # Keep session organiser_name in sync if we just edited the current session organiser
+    if session.get('organiser_id') == org_id:
+        session['organiser_name'] = name
+        if old_slug != slug:
+            flash(f'Slug changed from "{old_slug}" → "{slug}". '
+                  f'New registration QR will use the updated slug.', 'info')
+
+    log_admin_action('organiser_edit', 'success',
+                     organiser_id=org_id, old_slug=old_slug, new_slug=slug,
+                     old_name=old_name, new_name=name, new_status=status)
+    flash(f'Organiser "{name}" updated successfully.', 'success')
+    return redirect(url_for('list_organisers'))
+
+
+# ---------------------------------------------------------------------------
+# Part C — Archive / Unarchive organiser (super-admin only)
+# ---------------------------------------------------------------------------
+
+@app.route('/admin/organisers/<int:org_id>/archive', methods=['POST'])
+@super_admin_required
+def archive_organiser(org_id):
+    """Toggle active ↔ archived for an organiser. Super-admin only."""
+    from lms_automation.models import Organiser
+
+    org = Organiser.query.get_or_404(org_id)
+
+    if org.slug == 'default':
+        flash('Cannot archive the default organiser.', 'danger')
+        return redirect(url_for('list_organisers'))
+
+    if session.get('organiser_id') == org_id and org.status == 'active':
+        flash('Cannot archive the organiser you are currently managing. '
+              'Switch to a different organiser first.', 'danger')
+        return redirect(url_for('list_organisers'))
+
+    if org.status == 'archived':
+        org.status = 'active'
+        action_label = 'unarchive'
+        msg = f'Organiser "{org.name}" restored to active.'
+    else:
+        org.status = 'archived'
+        action_label = 'archive'
+        msg = f'Organiser "{org.name}" archived. All data preserved.'
+
+    db.session.commit()
+
+    log_admin_action(f'organiser_{action_label}', 'success',
+                     organiser_id=org_id, organiser_slug=org.slug, new_status=org.status)
+    flash(msg, 'success')
+    return redirect(url_for('list_organisers'))
+
+
+# ---------------------------------------------------------------------------
+# Part D — Guarded delete organiser (super-admin only, strict rules)
+# ---------------------------------------------------------------------------
+
+@app.route('/admin/organisers/<int:org_id>/delete', methods=['POST'])
+@super_admin_required
+def delete_organiser(org_id):
+    """Delete an organiser only when it has no data and slug is confirmed. Super-admin only."""
+    from lms_automation.models import Organiser, Player, Round, AdminUser
+
+    org = Organiser.query.get_or_404(org_id)
+
+    # --- Hard safety guards ---
+    if org.slug == 'default':
+        log_admin_action('organiser_delete', 'blocked',
+                         organiser_id=org_id, reason='default_organiser')
+        flash('Cannot delete the default organiser.', 'danger')
+        return redirect(url_for('list_organisers'))
+
+    if session.get('organiser_id') == org_id:
+        log_admin_action('organiser_delete', 'blocked',
+                         organiser_id=org_id, reason='current_session_organiser')
+        flash('Cannot delete the organiser you are currently managing. '
+              'Switch to a different organiser first.', 'danger')
+        return redirect(url_for('list_organisers'))
+
+    # --- Slug confirmation ---
+    confirm_slug = (request.form.get('confirm_slug') or '').strip()
+    if confirm_slug != org.slug:
+        log_admin_action('organiser_delete', 'blocked',
+                         organiser_id=org_id, reason='slug_mismatch',
+                         provided_slug=confirm_slug)
+        flash('Confirmation slug did not match. Delete cancelled.', 'danger')
+        return redirect(url_for('list_organisers'))
+
+    # --- Data safety check ---
+    player_count = Player.query.filter_by(organiser_id=org_id).count()
+    round_count = Round.query.filter_by(organiser_id=org_id).count()
+    admin_count = AdminUser.query.filter_by(organiser_id=org_id).count()
+
+    if player_count > 0 or round_count > 0:
+        reasons = []
+        if player_count:
+            reasons.append(f'{player_count} player(s)')
+        if round_count:
+            reasons.append(f'{round_count} round(s)')
+        log_admin_action('organiser_delete', 'blocked',
+                         organiser_id=org_id, reason='has_data',
+                         player_count=player_count, round_count=round_count)
+        flash(
+            f'Cannot delete organiser "{org.name}": it still has {", ".join(reasons)}. '
+            f'Archive it instead, or remove all data first.',
+            'danger',
+        )
+        return redirect(url_for('list_organisers'))
+
+    # --- Proceed with transactional delete ---
+    try:
+        # Remove admin accounts belonging to this organiser first (FK constraint)
+        AdminUser.query.filter_by(organiser_id=org_id).delete()
+        db.session.delete(org)
+        db.session.commit()
+
+        log_admin_action('organiser_delete', 'success',
+                         organiser_id=org_id, organiser_slug=org.slug,
+                         admin_accounts_removed=admin_count)
+        flash(f'Organiser "{org.name}" deleted successfully '
+              f'(removed {admin_count} admin account(s)).', 'success')
+    except Exception as exc:
+        db.session.rollback()
+        log_admin_action('organiser_delete', 'failure',
+                         organiser_id=org_id, error=str(exc))
+        flash(f'Delete failed due to a database error: {exc}', 'danger')
+
+    return redirect(url_for('list_organisers'))
 
 
 # ---------------------------------------------------------------------------
