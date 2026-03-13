@@ -995,13 +995,17 @@ def admin_dashboard():
         else:
             last_round_outcome = 'continue'
 
+    import os as _os
+    manual_mode = _os.environ.get('MANUAL_MODE', 'false').lower() == 'true'
+
     game_state_info = {
         'current_cycle': current_cycle,
         'active_players': active_player_count,
         'eliminated_players': eliminated_player_count,
         'winner_players': winner_player_count,
         'last_completed_round': last_completed_round,
-        'last_round_outcome': last_round_outcome
+        'last_round_outcome': last_round_outcome,
+        'manual_mode': manual_mode,
     }
 
     return render_template('admin_dashboard.html',
