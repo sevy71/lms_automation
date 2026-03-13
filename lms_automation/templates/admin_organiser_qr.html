@@ -7,8 +7,9 @@
   <div class="col-md-7 col-lg-5">
     <div class="d-flex align-items-center justify-content-between mb-3">
       <h2 class="mb-0">Registration QR</h2>
-      <a href="{{ url_for('list_organisers') }}" class="btn btn-sm btn-outline-secondary">
-        &larr; Back to Organisers
+      <a href="{{ url_for('organiser_detail', org_id=org.id) }}?tab=qr-access"
+         class="btn btn-sm btn-outline-secondary">
+        &larr; Back to {{ org.name }}
       </a>
     </div>
 

@@ -5230,6 +5230,25 @@ def list_organisers():
                            current_organiser_id=current_oid)
 
 
+@app.route('/admin/organisers/<int:org_id>')
+@super_admin_required
+def organiser_detail(org_id):
+    """Detail/management view for one organiser. Super-admin only."""
+    from lms_automation.models import Organiser, AdminUser
+    org = Organiser.query.get_or_404(org_id)
+    admin_users = []
+    if _admin_users_table_exists():
+        admin_users = AdminUser.query.filter_by(organiser_id=org_id).order_by(
+            AdminUser.created_at).all()
+    reg_url = _build_registration_url(org.slug)
+    current_oid = get_current_organiser_id()
+    return render_template('admin_organiser_detail.html',
+                           org=org,
+                           admin_users=admin_users,
+                           reg_url=reg_url,
+                           current_organiser_id=current_oid)
+
+
 @app.route('/admin/organisers/create', methods=['POST'])
 @super_admin_required
 def create_organiser():
@@ -5260,7 +5279,7 @@ def create_organiser():
     log_admin_action('organiser_create', 'success',
                      organiser_slug=slug, organiser_name=name)
     flash(f'Organiser "{name}" created successfully.', 'success')
-    return redirect(url_for('list_organisers'))
+    return redirect(url_for('organiser_detail', org_id=new_org.id))
 
 
 @app.route('/admin/organisers/<int:org_id>/create-admin', methods=['POST'])
@@ -5278,27 +5297,27 @@ def create_organiser_admin(org_id):
 
     if new_role not in ('organiser_admin', 'super_admin'):
         flash('Invalid role.', 'danger')
-        return redirect(url_for('list_organisers'))
+        return redirect(url_for('organiser_detail', org_id=org_id) + '?tab=admin-accounts')
 
     if not new_username:
         flash('Username is required.', 'danger')
-        return redirect(url_for('list_organisers'))
+        return redirect(url_for('organiser_detail', org_id=org_id) + '?tab=admin-accounts')
 
     if not new_password or not confirm_password:
         flash('Password and confirmation are required.', 'danger')
-        return redirect(url_for('list_organisers'))
+        return redirect(url_for('organiser_detail', org_id=org_id) + '?tab=admin-accounts')
 
     if new_password != confirm_password:
         flash('Passwords do not match. Please re-enter both fields.', 'danger')
-        return redirect(url_for('list_organisers'))
+        return redirect(url_for('organiser_detail', org_id=org_id) + '?tab=admin-accounts')
 
     if len(new_password) < 12:
         flash('Password must be at least 12 characters.', 'danger')
-        return redirect(url_for('list_organisers'))
+        return redirect(url_for('organiser_detail', org_id=org_id) + '?tab=admin-accounts')
 
     if AdminUser.query.filter_by(username=new_username).first():
         flash(f'Username "{new_username}" is already taken.', 'danger')
-        return redirect(url_for('list_organisers'))
+        return redirect(url_for('organiser_detail', org_id=org_id) + '?tab=admin-accounts')
 
     admin_user = AdminUser(
         username=new_username,
@@ -5317,7 +5336,7 @@ def create_organiser_admin(org_id):
         f'Login URL: {url_for("admin_login", _external=True)}',
         'success',
     )
-    return redirect(url_for('list_organisers'))
+    return redirect(url_for('organiser_detail', org_id=org_id) + '?tab=admin-accounts')
 
 
 @app.route('/admin/switch-organiser', methods=['POST'])
@@ -5431,26 +5450,26 @@ def edit_organiser(org_id):
 
     if not name or not slug:
         flash('Name and slug are required.', 'danger')
-        return redirect(url_for('list_organisers'))
+        return redirect(url_for('organiser_detail', org_id=org_id) + '?edit=1')
 
     if not re.match(r'^[a-z0-9_-]+$', slug):
         flash('Slug may only contain lowercase letters, digits, hyphens, and underscores.', 'danger')
-        return redirect(url_for('list_organisers'))
+        return redirect(url_for('organiser_detail', org_id=org_id) + '?edit=1')
 
     if status not in ('active', 'archived', 'suspended'):
         flash('Invalid status value.', 'danger')
-        return redirect(url_for('list_organisers'))
+        return redirect(url_for('organiser_detail', org_id=org_id) + '?edit=1')
 
     # Slug uniqueness check (excluding self)
     conflict = Organiser.query.filter(Organiser.slug == slug, Organiser.id != org_id).first()
     if conflict:
         flash(f'Slug "{slug}" is already in use by another organiser.', 'danger')
-        return redirect(url_for('list_organisers'))
+        return redirect(url_for('organiser_detail', org_id=org_id) + '?edit=1')
 
     # Prevent renaming the default organiser's slug (it is hard-coded in bootstrap logic)
     if old_slug == 'default' and slug != 'default':
         flash('Cannot rename the "default" organiser slug — it is used for backward compatibility.', 'danger')
-        return redirect(url_for('list_organisers'))
+        return redirect(url_for('organiser_detail', org_id=org_id) + '?edit=1')
 
     org.name = name
     org.slug = slug
@@ -5468,7 +5487,7 @@ def edit_organiser(org_id):
                      organiser_id=org_id, old_slug=old_slug, new_slug=slug,
                      old_name=old_name, new_name=name, new_status=status)
     flash(f'Organiser "{name}" updated successfully.', 'success')
-    return redirect(url_for('list_organisers'))
+    return redirect(url_for('organiser_detail', org_id=org_id))
 
 
 # ---------------------------------------------------------------------------
@@ -5482,15 +5501,18 @@ def archive_organiser(org_id):
     from lms_automation.models import Organiser
 
     org = Organiser.query.get_or_404(org_id)
+    next_page = request.form.get('next', 'list')
 
     if org.slug == 'default':
         flash('Cannot archive the default organiser.', 'danger')
-        return redirect(url_for('list_organisers'))
+        return redirect(url_for('organiser_detail', org_id=org_id) if next_page == 'detail'
+                        else url_for('list_organisers'))
 
     if session.get('organiser_id') == org_id and org.status == 'active':
         flash('Cannot archive the organiser you are currently managing. '
               'Switch to a different organiser first.', 'danger')
-        return redirect(url_for('list_organisers'))
+        return redirect(url_for('organiser_detail', org_id=org_id) if next_page == 'detail'
+                        else url_for('list_organisers'))
 
     if org.status == 'archived':
         org.status = 'active'
@@ -5506,6 +5528,8 @@ def archive_organiser(org_id):
     log_admin_action(f'organiser_{action_label}', 'success',
                      organiser_id=org_id, organiser_slug=org.slug, new_status=org.status)
     flash(msg, 'success')
+    if next_page == 'detail':
+        return redirect(url_for('organiser_detail', org_id=org_id) + '?tab=danger-zone')
     return redirect(url_for('list_organisers'))
 
 

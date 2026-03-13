@@ -91,3 +91,25 @@ body {
   .btn { min-height: 44px; }
 }
 
+/* Organiser detail tabs – keep nav scrollable on narrow screens */
+#orgDetailTabs {
+  flex-wrap: nowrap;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: none;
+}
+#orgDetailTabs::-webkit-scrollbar { display: none; }
+#orgDetailTabs .nav-link { white-space: nowrap; }
+
+/* Dropdown overflow menu sizing */
+.dropdown-menu { min-width: 180px; }
+.dropdown-item { padding-top: .45rem; padding-bottom: .45rem; }
+
+/* Organiser card on mobile – constrain name overflow */
+.min-w-0 { min-width: 0; }
+
+/* Danger zone card border */
+.card[style*="border-color:#dc3545"] .card-header {
+  border-bottom: 1px solid #f5c6cb;
+}
+

@@ -3,311 +3,362 @@
 {% block title %}Organisers — Admin{% endblock %}
 
 {% block content %}
-<div class="row mt-4">
-  <div class="col-12">
-    <div class="d-flex align-items-center justify-content-between mb-3">
-      <h2 class="mb-0">Organisers</h2>
-      <a href="{{ url_for('admin_dashboard') }}" class="btn btn-sm btn-outline-secondary">
-        &larr; Back to Dashboard
-      </a>
+<div data-testid="loading-organisers">
+
+  {# ── Page header ── #}
+  <div class="d-flex align-items-start align-items-sm-center justify-content-between flex-column flex-sm-row gap-2 mb-4">
+    <div>
+      <h1 class="h3 mb-1">Organisers</h1>
+      <p class="text-muted mb-0 small">Create and manage organiser workspaces</p>
     </div>
+    <button type="button" class="btn btn-primary"
+            data-bs-toggle="modal" data-bs-target="#createOrgModal"
+            data-testid="create-organiser-button">
+      + Create organiser
+    </button>
+  </div>
 
-    {% with messages = get_flashed_messages(with_categories=true) %}
-      {% for category, message in messages %}
-        <div class="alert alert-{{ 'danger' if category in ['danger', 'error'] else ('success' if category == 'success' else ('warning' if category == 'warning' else 'info')) }} alert-dismissible fade show" role="alert">
-          {{ message }}
-          <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
-        </div>
-      {% endfor %}
-    {% endwith %}
+  {# ── Flash messages ── #}
+  {% with messages = get_flashed_messages(with_categories=true) %}
+    {% for category, message in messages %}
+      <div class="alert alert-{{ 'danger' if category in ['danger', 'error'] else ('success' if category == 'success' else ('warning' if category == 'warning' else 'info')) }} alert-dismissible fade show" role="alert">
+        {{ message }}
+        <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+      </div>
+    {% endfor %}
+  {% endwith %}
 
-    {# ── Organiser list ── #}
-    <div class="card mb-4">
-      <div class="card-header fw-semibold">All Organisers</div>
-      <div class="card-body p-0">
-        <table class="table table-hover mb-0">
-          <thead class="table-light">
-            <tr>
-              <th>ID</th>
-              <th>Name</th>
-              <th>Slug</th>
-              <th>Status</th>
-              <th>Admin accounts</th>
-              <th>Created</th>
-              <th>Actions</th>
-            </tr>
-          </thead>
-          <tbody>
-            {% for org in organisers %}
-            <tr class="{{ 'table-primary' if org.id == current_organiser_id else ('table-secondary text-muted' if org.status == 'archived' else '') }}">
-              <td>{{ org.id }}</td>
-              <td>
-                {{ org.name }}
-                {% if org.id == current_organiser_id %}
-                  <span class="badge bg-primary ms-1">current session</span>
-                {% endif %}
-                {% if org.status == 'archived' %}
-                  <span class="badge bg-secondary ms-1">archived</span>
-                {% endif %}
-              </td>
-              <td><code>{{ org.slug }}</code></td>
-              <td>
-                {% if org.status == 'active' %}
-                  <span class="badge bg-success">active</span>
-                {% elif org.status == 'archived' %}
-                  <span class="badge bg-secondary">archived</span>
-                {% else %}
-                  <span class="badge bg-warning text-dark">{{ org.status }}</span>
-                {% endif %}
-              </td>
-              <td>
-                {% set org_admins = admin_users_by_org.get(org.id, []) %}
-                {% if org_admins %}
-                  {% for au in org_admins %}
-                    <span class="badge {{ 'bg-warning text-dark' if au.role == 'super_admin' else 'bg-info text-dark' }} me-1">
-                      {{ au.username }}
-                      <small>({{ au.role }})</small>
-                      {% if not au.is_active %}<em>inactive</em>{% endif %}
-                    </span>
-                  {% endfor %}
-                {% else %}
-                  <span class="text-muted small">none</span>
-                {% endif %}
-              </td>
-              <td class="text-nowrap">{{ org.created_at.strftime('%Y-%m-%d %H:%M') if org.created_at else '—' }}</td>
-              <td class="text-nowrap">
-                {# Switch context #}
-                {% if org.id != current_organiser_id %}
-                <form method="post" action="{{ url_for('switch_organiser') }}" class="d-inline">
+  {# ── Desktop / tablet table (md+) ── #}
+  <div class="card d-none d-md-block" data-testid="organisers-table">
+    <div class="card-body p-0">
+      <table class="table table-hover mb-0">
+        <thead class="table-light">
+          <tr>
+            <th>Name</th>
+            <th>Slug</th>
+            <th>Status</th>
+            <th>Admins</th>
+            <th>Created</th>
+            <th class="text-end pe-3">Actions</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for org in organisers %}
+          <tr data-testid="organiser-row-{{ org.slug }}"
+              class="{{ 'table-secondary text-muted' if org.status == 'archived' else '' }}">
+            <td class="fw-medium align-middle">
+              {{ org.name }}
+              {% if org.id == current_organiser_id %}
+                <span class="badge bg-primary ms-1" style="font-size:.7em;vertical-align:middle">current</span>
+              {% endif %}
+            </td>
+            <td class="align-middle"><code class="text-muted">{{ org.slug }}</code></td>
+            <td class="align-middle">
+              {% if org.status == 'active' %}
+                <span class="badge bg-success">active</span>
+              {% elif org.status == 'archived' %}
+                <span class="badge bg-secondary">archived</span>
+              {% else %}
+                <span class="badge bg-warning text-dark">{{ org.status }}</span>
+              {% endif %}
+            </td>
+            <td class="align-middle text-muted">
+              {% set org_admins = admin_users_by_org.get(org.id, []) %}
+              {{ org_admins|length }}
+            </td>
+            <td class="align-middle text-muted text-nowrap">{{ org.created_at.strftime('%Y-%m-%d') if org.created_at else '—' }}</td>
+            <td class="align-middle text-end text-nowrap pe-3">
+              <a href="{{ url_for('organiser_detail', org_id=org.id) }}"
+                 class="btn btn-sm btn-outline-primary me-1"
+                 data-testid="organiser-manage-{{ org.slug }}">Manage</a>
+
+              <div class="dropdown d-inline-block">
+                <button type="button"
+                        class="btn btn-sm btn-outline-secondary"
+                        data-bs-toggle="dropdown"
+                        aria-expanded="false"
+                        data-testid="organiser-menu-{{ org.slug }}"
+                        aria-label="More actions for {{ org.name }}">&#x22EF;</button>
+                <ul class="dropdown-menu dropdown-menu-end shadow-sm">
+                  {% if org.id != current_organiser_id %}
+                  <li>
+                    <form method="post" action="{{ url_for('switch_organiser') }}">
+                      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                      <input type="hidden" name="organiser_id" value="{{ org.id }}">
+                      <button type="submit" class="dropdown-item"
+                              data-testid="organiser-switch-{{ org.slug }}">
+                        Switch to organiser
+                      </button>
+                    </form>
+                  </li>
+                  <li><hr class="dropdown-divider"></li>
+                  {% endif %}
+                  <li>
+                    <a class="dropdown-item"
+                       href="{{ url_for('organiser_qr_view', org_id=org.id) }}"
+                       data-testid="organiser-view-qr-{{ org.slug }}">View QR</a>
+                  </li>
+                  <li>
+                    <a class="dropdown-item"
+                       href="{{ url_for('organiser_qr_download', org_id=org.id) }}"
+                       download="register-{{ org.slug }}.png"
+                       data-testid="organiser-download-qr-{{ org.slug }}">Download QR</a>
+                  </li>
+                  <li><hr class="dropdown-divider"></li>
+                  <li>
+                    <a class="dropdown-item"
+                       href="{{ url_for('organiser_detail', org_id=org.id) }}?edit=1"
+                       data-testid="organiser-edit-{{ org.slug }}">Edit organiser</a>
+                  </li>
+                  {% if org.slug != 'default' %}
+                  <li>
+                    <form method="post" action="{{ url_for('archive_organiser', org_id=org.id) }}">
+                      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                      <input type="hidden" name="next" value="list">
+                      <button type="submit" class="dropdown-item"
+                              data-testid="organiser-archive-{{ org.slug }}">
+                        {% if org.status == 'archived' %}Unarchive organiser{% else %}Archive organiser{% endif %}
+                      </button>
+                    </form>
+                  </li>
+                  <li>
+                    <button type="button" class="dropdown-item text-danger"
+                            data-bs-toggle="modal" data-bs-target="#deleteOrgModal"
+                            data-org-id="{{ org.id }}"
+                            data-org-name="{{ org.name }}"
+                            data-org-slug="{{ org.slug }}"
+                            data-testid="organiser-delete-{{ org.slug }}">
+                      Delete organiser
+                    </button>
+                  </li>
+                  {% endif %}
+                </ul>
+              </div>
+            </td>
+          </tr>
+          {% else %}
+          <tr>
+            <td colspan="6" class="text-center text-muted py-4">
+              No organisers yet. Create your first one.
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  {# ── Mobile cards (<md) ── #}
+  <div class="d-md-none vstack gap-3">
+    {% for org in organisers %}
+    <div class="card" data-testid="organiser-card-{{ org.slug }}">
+      <div class="card-body">
+        <div class="d-flex justify-content-between align-items-start gap-2">
+          <div class="min-w-0">
+            <div class="fw-semibold mb-1">
+              {{ org.name }}
+              {% if org.id == current_organiser_id %}
+                <span class="badge bg-primary ms-1" style="font-size:.7em;vertical-align:middle">current</span>
+              {% endif %}
+            </div>
+            <div class="text-muted small mb-2"><code>{{ org.slug }}</code></div>
+            <div class="d-flex flex-wrap gap-1">
+              {% if org.status == 'active' %}
+                <span class="badge bg-success">active</span>
+              {% elif org.status == 'archived' %}
+                <span class="badge bg-secondary">archived</span>
+              {% else %}
+                <span class="badge bg-warning text-dark">{{ org.status }}</span>
+              {% endif %}
+              {% set org_admins = admin_users_by_org.get(org.id, []) %}
+              <span class="badge bg-light text-dark border">
+                {{ org_admins|length }} admin{{ 's' if org_admins|length != 1 else '' }}
+              </span>
+            </div>
+          </div>
+          <div class="dropdown flex-shrink-0">
+            <button type="button"
+                    class="btn btn-sm btn-outline-secondary"
+                    data-bs-toggle="dropdown"
+                    aria-expanded="false"
+                    data-testid="organiser-card-menu-{{ org.slug }}"
+                    aria-label="More actions for {{ org.name }}">&#x22EF;</button>
+            <ul class="dropdown-menu dropdown-menu-end shadow-sm">
+              {% if org.id != current_organiser_id %}
+              <li>
+                <form method="post" action="{{ url_for('switch_organiser') }}">
                   <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                   <input type="hidden" name="organiser_id" value="{{ org.id }}">
-                  <button type="submit" class="btn btn-sm btn-outline-primary">Switch to</button>
+                  <button type="submit" class="dropdown-item"
+                          data-testid="organiser-switch-{{ org.slug }}">
+                    Switch to organiser
+                  </button>
                 </form>
-                {% endif %}
-
-                {# QR code buttons #}
-                <a href="{{ url_for('organiser_qr_view', org_id=org.id) }}"
-                   class="btn btn-sm btn-outline-info" title="View registration QR">View QR</a>
-                <a href="{{ url_for('organiser_qr_download', org_id=org.id) }}"
-                   class="btn btn-sm btn-info" title="Download registration QR as PNG">Download QR</a>
-
-                {# Edit button — opens modal #}
-                <button type="button" class="btn btn-sm btn-outline-warning"
-                        data-bs-toggle="modal" data-bs-target="#editOrgModal"
-                        data-org-id="{{ org.id }}"
-                        data-org-name="{{ org.name }}"
-                        data-org-slug="{{ org.slug }}"
-                        data-org-status="{{ org.status }}">
-                  Edit
-                </button>
-
-                {# Archive / Unarchive toggle #}
-                {% if org.slug != 'default' %}
-                <form method="post" action="{{ url_for('archive_organiser', org_id=org.id) }}" class="d-inline">
+              </li>
+              <li><hr class="dropdown-divider"></li>
+              {% endif %}
+              <li>
+                <a class="dropdown-item"
+                   href="{{ url_for('organiser_qr_view', org_id=org.id) }}"
+                   data-testid="organiser-view-qr-{{ org.slug }}">View QR</a>
+              </li>
+              <li>
+                <a class="dropdown-item"
+                   href="{{ url_for('organiser_qr_download', org_id=org.id) }}"
+                   download="register-{{ org.slug }}.png"
+                   data-testid="organiser-download-qr-{{ org.slug }}">Download QR</a>
+              </li>
+              <li><hr class="dropdown-divider"></li>
+              <li>
+                <a class="dropdown-item"
+                   href="{{ url_for('organiser_detail', org_id=org.id) }}?edit=1"
+                   data-testid="organiser-edit-{{ org.slug }}">Edit organiser</a>
+              </li>
+              {% if org.slug != 'default' %}
+              <li>
+                <form method="post" action="{{ url_for('archive_organiser', org_id=org.id) }}">
                   <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-                  {% if org.status == 'archived' %}
-                  <button type="submit" class="btn btn-sm btn-outline-success"
-                          onclick="return confirm('Restore organiser \'{{ org.name }}\' to active?')">
-                    Unarchive
+                  <input type="hidden" name="next" value="list">
+                  <button type="submit" class="dropdown-item"
+                          data-testid="organiser-archive-{{ org.slug }}">
+                    {% if org.status == 'archived' %}Unarchive organiser{% else %}Archive organiser{% endif %}
                   </button>
-                  {% else %}
-                  <button type="submit" class="btn btn-sm btn-outline-secondary"
-                          onclick="return confirm('Archive organiser \'{{ org.name }}\'? All data will be preserved.')">
-                    Archive
-                  </button>
-                  {% endif %}
                 </form>
-
-                {# Delete button — opens confirmation modal #}
-                <button type="button" class="btn btn-sm btn-outline-danger"
+              </li>
+              <li>
+                <button type="button" class="dropdown-item text-danger"
                         data-bs-toggle="modal" data-bs-target="#deleteOrgModal"
                         data-org-id="{{ org.id }}"
                         data-org-name="{{ org.name }}"
-                        data-org-slug="{{ org.slug }}">
-                  Delete
+                        data-org-slug="{{ org.slug }}"
+                        data-testid="organiser-delete-{{ org.slug }}">
+                  Delete organiser
                 </button>
-                {% endif %}
-              </td>
-            </tr>
-            {% else %}
-            <tr>
-              <td colspan="7" class="text-center text-muted py-3">No organisers found.</td>
-            </tr>
-            {% endfor %}
-          </tbody>
-        </table>
-      </div>
-    </div>
-
-    {# ── Create Organiser ── #}
-    <div class="card mb-4">
-      <div class="card-header fw-semibold">Create New Organiser</div>
-      <div class="card-body">
-        <p class="text-muted small mb-3">
-          Creating a new organiser gives it an isolated game context — its own players,
-          rounds, and picks. Players and rounds must be explicitly associated with the
-          new organiser; existing data remains under the <code>default</code> organiser.
-        </p>
-        <form method="post" action="{{ url_for('create_organiser') }}">
-          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-          <div class="row g-3">
-            <div class="col-md-5">
-              <label for="org-name" class="form-label fw-semibold">Name <span class="text-danger">*</span></label>
-              <input type="text" id="org-name" name="name" class="form-control"
-                     placeholder="e.g. West London League" required maxlength="100">
-            </div>
-            <div class="col-md-4">
-              <label for="org-slug" class="form-label fw-semibold">Slug <span class="text-danger">*</span></label>
-              <input type="text" id="org-slug" name="slug" class="form-control"
-                     placeholder="e.g. west-london" required maxlength="50"
-                     pattern="[a-z0-9_\-]+" title="Lowercase letters, digits, hyphens and underscores only">
-              <div class="form-text">URL-safe identifier. Lowercase, no spaces.</div>
-            </div>
-            <div class="col-md-3 d-flex align-items-end">
-              <button type="submit" class="btn btn-primary w-100">Create Organiser</button>
-            </div>
+              </li>
+              {% endif %}
+            </ul>
           </div>
-        </form>
+        </div>
+        <div class="mt-3">
+          <a href="{{ url_for('organiser_detail', org_id=org.id) }}"
+             class="btn btn-outline-primary w-100"
+             data-testid="organiser-card-manage-{{ org.slug }}">Manage</a>
+        </div>
       </div>
     </div>
-
-    {# ── Create Admin Account for an Organiser ── #}
-    <div class="card mb-4">
-      <div class="card-header fw-semibold">Create Admin Account</div>
-      <div class="card-body">
-        <p class="text-muted small mb-3">
-          Create a login for an organiser admin. They can log in at
-          <code>{{ url_for('admin_login', _external=True) }}</code> using their username and password.
-          Organiser admins can only see their own organiser's data.
-        </p>
-        <form method="post" action="#" id="create-admin-form">
-          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-          <div class="row g-3">
-            <div class="col-md-3">
-              <label for="ca-organiser" class="form-label fw-semibold">Organiser <span class="text-danger">*</span></label>
-              <select id="ca-organiser" name="organiser_id" class="form-select" required
-                      onchange="document.getElementById('create-admin-form').action='/admin/organisers/' + this.value + '/create-admin'">
-                <option value="">— select —</option>
-                {% for org in organisers %}
-                <option value="{{ org.id }}">{{ org.name }}{% if org.status == 'archived' %} (archived){% endif %}</option>
-                {% endfor %}
-              </select>
-            </div>
-            <div class="col-md-3">
-              <label for="ca-username" class="form-label fw-semibold">Username <span class="text-danger">*</span></label>
-              <input type="text" id="ca-username" name="new_username" class="form-control"
-                     placeholder="e.g. westlondon-admin" required maxlength="100"
-                     autocomplete="off">
-            </div>
-            <div class="col-md-3">
-              <label for="ca-password" class="form-label fw-semibold">Password <span class="text-danger">*</span></label>
-              <input type="password" id="ca-password" name="new_password" class="form-control"
-                     required minlength="12" autocomplete="new-password"
-                     placeholder="Min 12 characters">
-            </div>
-            <div class="col-md-3">
-              <label for="ca-confirm-password" class="form-label fw-semibold">Confirm Password <span class="text-danger">*</span></label>
-              <input type="password" id="ca-confirm-password" name="confirm_password" class="form-control"
-                     required minlength="12" autocomplete="new-password"
-                     placeholder="Re-enter password">
-            </div>
-            <div class="col-md-2">
-              <label for="ca-role" class="form-label fw-semibold">Role</label>
-              <select id="ca-role" name="new_role" class="form-select">
-                <option value="organiser_admin" selected>Organiser Admin</option>
-                <option value="super_admin">Super Admin</option>
-              </select>
-            </div>
-            <div class="col-md-1 d-flex align-items-end">
-              <button type="submit" class="btn btn-success w-100">Create</button>
-            </div>
-          </div>
-        </form>
-      </div>
-    </div>
-
+    {% else %}
+    <div class="text-center text-muted py-4">No organisers yet.</div>
+    {% endfor %}
   </div>
-</div>
 
-{# ═══════════════════════════════════════════════════════════════ #}
-{# Edit Organiser Modal (Part B)                                   #}
-{# ═══════════════════════════════════════════════════════════════ #}
-<div class="modal fade" id="editOrgModal" tabindex="-1" aria-labelledby="editOrgModalLabel" aria-hidden="true">
-  <div class="modal-dialog">
+</div>{# end loading-organisers #}
+
+
+{# ══════════════════════════════════════════════════════════════════
+   Create Organiser Modal
+══════════════════════════════════════════════════════════════════ #}
+<div class="modal fade" id="createOrgModal" tabindex="-1"
+     aria-labelledby="createOrgModalLabel" aria-hidden="true">
+  <div class="modal-dialog modal-dialog-centered">
     <div class="modal-content">
-      <form method="post" id="edit-org-form" action="#">
+      <form method="post" action="{{ url_for('create_organiser') }}"
+            id="create-org-form" novalidate>
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-        <div class="modal-header">
-          <h5 class="modal-title" id="editOrgModalLabel">Edit Organiser</h5>
-          <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+        <div class="modal-header border-0 pb-1">
+          <h5 class="modal-title fw-bold" id="createOrgModalLabel">Create organiser</h5>
+          <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
         </div>
-        <div class="modal-body">
+        <div class="modal-body pt-0">
+          <p class="text-muted small mb-4">
+            A new organiser workspace with its own players, rounds, and admin accounts.
+          </p>
           <div class="mb-3">
-            <label for="edit-org-name" class="form-label fw-semibold">Name <span class="text-danger">*</span></label>
-            <input type="text" id="edit-org-name" name="name" class="form-control"
-                   required maxlength="100">
+            <label for="new-org-name" class="form-label fw-semibold">
+              Name <span class="text-danger">*</span>
+            </label>
+            <input type="text" id="new-org-name" name="name"
+                   class="form-control"
+                   placeholder="e.g. West London League"
+                   required maxlength="100"
+                   autocomplete="off"
+                   style="font-size:1rem"
+                   data-testid="create-organiser-name-input">
+            <div class="invalid-feedback">Name is required.</div>
           </div>
-          <div class="mb-3">
-            <label for="edit-org-slug" class="form-label fw-semibold">Slug <span class="text-danger">*</span></label>
-            <input type="text" id="edit-org-slug" name="slug" class="form-control"
-                   required maxlength="50" pattern="[a-z0-9_\-]+"
-                   title="Lowercase letters, digits, hyphens and underscores only">
-            <div class="form-text">
-              Changing the slug updates future registration QR links. Existing links will stop working.
-            </div>
-          </div>
-          <div class="mb-3">
-            <label for="edit-org-status" class="form-label fw-semibold">Status</label>
-            <select id="edit-org-status" name="status" class="form-select">
-              <option value="active">active</option>
-              <option value="archived">archived</option>
-              <option value="suspended">suspended</option>
-            </select>
+          <div class="mb-1">
+            <label for="new-org-slug" class="form-label fw-semibold">
+              Slug <span class="text-danger">*</span>
+            </label>
+            <input type="text" id="new-org-slug" name="slug"
+                   class="form-control"
+                   placeholder="e.g. west-london"
+                   required maxlength="50"
+                   pattern="[a-z0-9_\-]+"
+                   title="Lowercase letters, digits, hyphens and underscores only"
+                   autocomplete="off"
+                   style="font-size:1rem"
+                   data-testid="create-organiser-slug-input">
+            <div class="form-text">Auto-generated from name. Lowercase, URL-safe identifier.</div>
+            <div class="invalid-feedback">Slug is required and must be lowercase URL-safe (letters, digits, hyphens, underscores).</div>
           </div>
         </div>
-        <div class="modal-footer">
-          <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
-          <button type="submit" class="btn btn-warning">Save Changes</button>
+        <div class="modal-footer border-0 pt-0">
+          <button type="button" class="btn btn-outline-secondary"
+                  data-bs-dismiss="modal">Cancel</button>
+          <button type="submit" class="btn btn-primary"
+                  data-testid="create-organiser-submit">
+            Create organiser
+          </button>
         </div>
       </form>
     </div>
   </div>
 </div>
 
-{# ═══════════════════════════════════════════════════════════════ #}
-{# Delete Organiser Modal (Part D)                                 #}
-{# ═══════════════════════════════════════════════════════════════ #}
-<div class="modal fade" id="deleteOrgModal" tabindex="-1" aria-labelledby="deleteOrgModalLabel" aria-hidden="true">
-  <div class="modal-dialog">
+
+{# ══════════════════════════════════════════════════════════════════
+   Delete Organiser Modal (triggered from overflow menu)
+══════════════════════════════════════════════════════════════════ #}
+<div class="modal fade" id="deleteOrgModal" tabindex="-1"
+     aria-labelledby="deleteOrgModalLabel" aria-hidden="true">
+  <div class="modal-dialog modal-dialog-centered">
     <div class="modal-content border-danger">
       <form method="post" id="delete-org-form" action="#">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-        <div class="modal-header bg-danger text-white">
-          <h5 class="modal-title" id="deleteOrgModalLabel">Delete Organiser</h5>
-          <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+        <input type="hidden" name="next" value="list">
+        <div class="modal-header bg-danger text-white border-0">
+          <h5 class="modal-title" id="deleteOrgModalLabel">Delete organiser</h5>
+          <button type="button" class="btn-close btn-close-white"
+                  data-bs-dismiss="modal"></button>
         </div>
         <div class="modal-body">
-          <div class="alert alert-danger">
-            <strong>This action is irreversible.</strong> Deletion is only allowed when the organiser
-            has <em>no players, no rounds, and no dependent picks</em>. If it has data, please
-            <strong>archive</strong> it instead.
-          </div>
-          <p>You are about to permanently delete organiser
+          <p class="fw-semibold text-danger mb-2">This action is irreversible.</p>
+          <p class="text-muted small mb-3">
+            Only allowed when the organiser has no players, rounds, or picks.
+            Archive it instead if it has data.
+          </p>
+          <p class="mb-3">
+            You are about to permanently delete
             <strong id="delete-org-name-display"></strong>.
           </p>
-          <div class="mb-3">
+          <div class="mb-1">
             <label for="delete-confirm-slug" class="form-label fw-semibold">
-              Type the organiser slug to confirm:
+              Type the slug to confirm:
               <code id="delete-org-slug-display" class="text-danger"></code>
             </label>
-            <input type="text" id="delete-confirm-slug" name="confirm_slug" class="form-control"
-                   required autocomplete="off" placeholder="type slug here">
+            <input type="text" id="delete-confirm-slug" name="confirm_slug"
+                   class="form-control" required autocomplete="off"
+                   placeholder="type the slug here"
+                   style="font-size:1rem"
+                   data-testid="delete-confirm-input">
           </div>
         </div>
         <div class="modal-footer">
-          <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel — keep organiser</button>
-          <button type="submit" class="btn btn-danger"
-                  onclick="return confirm('Final check: permanently delete this organiser?')">
+          <button type="button" class="btn btn-outline-secondary"
+                  data-bs-dismiss="modal">Cancel</button>
+          <button type="submit" class="btn btn-danger" id="delete-org-submit-btn"
+                  disabled
+                  data-testid="delete-confirm-submit">
             Delete permanently
           </button>
         </div>
@@ -317,29 +368,49 @@
 </div>
 
 <script>
-// Populate Edit modal from data attributes
-document.getElementById('editOrgModal').addEventListener('show.bs.modal', function (event) {
-  const btn = event.relatedTarget;
-  const orgId = btn.getAttribute('data-org-id');
-  const orgName = btn.getAttribute('data-org-name');
-  const orgSlug = btn.getAttribute('data-org-slug');
-  const orgStatus = btn.getAttribute('data-org-status');
-  document.getElementById('edit-org-form').action = '/admin/organisers/' + orgId + '/edit';
-  document.getElementById('edit-org-name').value = orgName;
-  document.getElementById('edit-org-slug').value = orgSlug;
-  document.getElementById('edit-org-status').value = orgStatus;
-});
+(function () {
+  // ── Auto-generate slug from name ──────────────────────────────
+  var nameInput = document.getElementById('new-org-name');
+  var slugInput = document.getElementById('new-org-slug');
 
-// Populate Delete modal from data attributes
-document.getElementById('deleteOrgModal').addEventListener('show.bs.modal', function (event) {
-  const btn = event.relatedTarget;
-  const orgId = btn.getAttribute('data-org-id');
-  const orgName = btn.getAttribute('data-org-name');
-  const orgSlug = btn.getAttribute('data-org-slug');
-  document.getElementById('delete-org-form').action = '/admin/organisers/' + orgId + '/delete';
-  document.getElementById('delete-org-name-display').textContent = orgName;
-  document.getElementById('delete-org-slug-display').textContent = orgSlug;
-  document.getElementById('delete-confirm-slug').value = '';
-});
+  nameInput.addEventListener('input', function () {
+    if (!slugInput.dataset.manualEdit) {
+      slugInput.value = nameInput.value
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, '-')
+        .replace(/^-+|-+$/g, '');
+    }
+  });
+  slugInput.addEventListener('input', function () {
+    slugInput.dataset.manualEdit = '1';
+  });
+  document.getElementById('createOrgModal').addEventListener('hidden.bs.modal', function () {
+    document.getElementById('create-org-form').reset();
+    delete slugInput.dataset.manualEdit;
+  });
+
+  // ── Delete modal: populate + enable/disable submit ────────────
+  var deleteModal = document.getElementById('deleteOrgModal');
+  var deleteForm  = document.getElementById('delete-org-form');
+  var deleteInput = document.getElementById('delete-confirm-slug');
+  var deleteBtn   = document.getElementById('delete-org-submit-btn');
+
+  deleteModal.addEventListener('show.bs.modal', function (event) {
+    var btn  = event.relatedTarget;
+    var id   = btn.getAttribute('data-org-id');
+    var name = btn.getAttribute('data-org-name');
+    var slug = btn.getAttribute('data-org-slug');
+    deleteForm.action = '/admin/organisers/' + id + '/delete';
+    document.getElementById('delete-org-name-display').textContent = name;
+    document.getElementById('delete-org-slug-display').textContent = slug;
+    deleteInput.value = '';
+    deleteBtn.disabled = true;
+    deleteModal.dataset.expectedSlug = slug;
+  });
+
+  deleteInput.addEventListener('input', function () {
+    deleteBtn.disabled = (deleteInput.value !== deleteModal.dataset.expectedSlug);
+  });
+}());
 </script>
 {% endblock %}
