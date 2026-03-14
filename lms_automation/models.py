@@ -291,7 +291,7 @@ class ReminderSchedule(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     player_id = db.Column(db.Integer, db.ForeignKey('players.id'), nullable=False)
     round_id = db.Column(db.Integer, db.ForeignKey('rounds.id'), nullable=False)
-    reminder_type = db.Column(db.String(20), nullable=False)  # '4_hour' or '2_hour'
+    reminder_type = db.Column(db.String(20), nullable=False)  # '24_hour', '4_hour', or '2_hour'
     scheduled_time = db.Column(db.DateTime, nullable=False)
     sent_at = db.Column(db.DateTime, nullable=True)
     is_sent = db.Column(db.Boolean, default=False)
@@ -308,7 +308,9 @@ class ReminderSchedule(db.Model):
     def create_reminders_for_round(round_id):
         """Create reminder schedules for all active players in a round.
         Anchors reminders to first_kickoff_at when available, otherwise end_date.
-        Generates 4-hour and 2-hour reminders before the anchor time.
+        Generates 24-hour, 4-hour, and 2-hour reminders before the anchor time.
+        The 24-hour reminder is skipped if the anchor time is already within 24 hours
+        (i.e. the round was created too late for a 24-hour heads-up).
         """
         round_obj = Round.query.get(round_id)
         if not round_obj:
@@ -332,16 +334,27 @@ class ReminderSchedule(db.Model):
         if not anchor_time:
             return False
 
+        now = datetime.utcnow()
         active_players = Player.query.filter_by(status='active').all()
 
         # Calculate reminder times relative to anchor
+        twenty_four_hour_reminder = anchor_time - timedelta(hours=24)
         four_hour_reminder = anchor_time - timedelta(hours=4)
         two_hour_reminder = anchor_time - timedelta(hours=2)
+
+        # Only schedule 24h reminder if it's still in the future
+        schedule_24h = twenty_four_hour_reminder > now
 
         reminders_created = 0
 
         for player in active_players:
             # Check if reminders already exist
+            existing_24h = ReminderSchedule.query.filter_by(
+                player_id=player.id,
+                round_id=round_id,
+                reminder_type='24_hour'
+            ).first()
+
             existing_4h = ReminderSchedule.query.filter_by(
                 player_id=player.id,
                 round_id=round_id,
@@ -353,6 +366,17 @@ class ReminderSchedule(db.Model):
                 round_id=round_id,
                 reminder_type='2_hour'
             ).first()
+
+            # Create 24-hour reminder only if it's still in the future (skip for late-created rounds)
+            if not existing_24h and schedule_24h:
+                reminder_24h = ReminderSchedule(
+                    player_id=player.id,
+                    round_id=round_id,
+                    reminder_type='24_hour',
+                    scheduled_time=twenty_four_hour_reminder
+                )
+                db.session.add(reminder_24h)
+                reminders_created += 1
 
             # Create 4-hour reminder (create even if scheduled time is in the past so it shows as due)
             if not existing_4h:

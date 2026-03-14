@@ -1284,6 +1284,19 @@ class LMSScheduler:
 
                 # Schedule reminders (same logic as send_new_round_announcements)
                 if round_obj.first_kickoff_at:
+                    _now = datetime.utcnow()
+
+                    # 24-hour reminder — only schedule if still in the future
+                    _reminder_24h_time = round_obj.first_kickoff_at - timedelta(hours=24)
+                    if _reminder_24h_time > _now:
+                        db.session.add(ReminderSchedule(
+                            player_id=player.id,
+                            round_id=round_obj.id,
+                            reminder_type='24_hour',
+                            scheduled_time=_reminder_24h_time,
+                            is_sent=False
+                        ))
+
                     reminder_4h = ReminderSchedule(
                         player_id=player.id,
                         round_id=round_obj.id,
@@ -1575,7 +1588,10 @@ class LMSScheduler:
                     # Prepare message
                     pick_url = f"{os.environ.get('BASE_URL', 'http://localhost:5000')}/pick/{pick_token.token}"
 
-                    if reminder.reminder_type == '4_hour':
+                    if reminder.reminder_type == '24_hour':
+                        message = f"📅 Round {round_obj.round_number} picks close in 24 hours! Don't forget to submit your pick."
+                        button_text = "⚽ Make Your Pick"
+                    elif reminder.reminder_type == '4_hour':
                         message = f"⚽ Round {round_obj.round_number} picks close in 4 hours!"
                         button_text = "⚽ Make Your Pick"
                     else:  # 2_hour
@@ -2649,6 +2665,19 @@ class LMSScheduler:
 
             # Schedule reminders unconditionally — delivery outcome is async
             if round_obj.first_kickoff_at:
+                _now = datetime.utcnow()
+
+                # 24-hour reminder — only schedule if still in the future
+                _reminder_24h_time = round_obj.first_kickoff_at - timedelta(hours=24)
+                if _reminder_24h_time > _now:
+                    db.session.add(ReminderSchedule(
+                        player_id=player.id,
+                        round_id=round_obj.id,
+                        reminder_type='24_hour',
+                        scheduled_time=_reminder_24h_time,
+                        is_sent=False,
+                    ))
+
                 reminder_4h = ReminderSchedule(
                     player_id=player.id,
                     round_id=round_obj.id,

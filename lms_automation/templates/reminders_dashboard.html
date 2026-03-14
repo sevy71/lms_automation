@@ -98,6 +98,10 @@
     box-shadow: 0 4px 8px rgba(0,0,0,0.1);
 }
 
+.reminder-24_hour {
+    border-left-color: #6f42c1;
+}
+
 .reminder-4_hour {
     border-left-color: #17a2b8;
 }
@@ -175,8 +179,8 @@ function renderDueReminders(reminders) {
                             <small class="text-muted d-block">Round ${reminder.round_number}</small>
                         </div>
                         <div class="text-end">
-                            <span class="badge bg-${reminder.reminder_type === '4_hour' ? 'info' : 'danger'}">
-                                ${reminder.reminder_type === '4_hour' ? '4 Hour' : '2 Hour'} Reminder
+                            <span class="badge bg-${reminder.reminder_type === '24_hour' ? 'secondary' : reminder.reminder_type === '4_hour' ? 'info' : 'danger'}">
+                                ${reminder.reminder_type === '24_hour' ? '24 Hour' : reminder.reminder_type === '4_hour' ? '4 Hour' : '2 Hour'} Reminder
                             </span>
                             ${isOverdue ? '<br><small class="text-danger">OVERDUE</small>' : ''}
                         </div>

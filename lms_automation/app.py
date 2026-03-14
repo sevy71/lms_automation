@@ -4724,7 +4724,9 @@ class WhatsAppReminder:
         dashboard_url = f"{base_url}/dashboard/{pick_token.token}"
         
         # Customize message based on reminder type
-        if reminder_type == '4_hour':
+        if reminder_type == '24_hour':
+            urgency = "📅 24-Hour Reminder"
+        elif reminder_type == '4_hour':
             urgency = "⏰ Reminder"
         elif reminder_type == '2_hour':
             urgency = "⏰ Reminder"
