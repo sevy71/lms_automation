@@ -1,10 +1,10 @@
 """
 Onboarding Blueprint — public organiser self-service flow.
 
-GET  /get-started              → organiser creation form
-POST /create-organiser         → create organiser workspace, redirect to dashboard
-GET  /organiser/<slug>/dashboard → organiser dashboard
-GET  /organiser/<slug>/qr.png  → invite QR code PNG (for dashboard embed)
+GET  /get-started               → organiser creation form
+POST /create-organiser          → create organiser + admin account, auto-login, redirect
+GET  /organiser/<slug>/dashboard → organiser dashboard (requires organiser_admin session)
+GET  /organiser/<slug>/qr.png   → invite QR code PNG
 """
 from __future__ import annotations
 
@@ -18,11 +18,12 @@ from flask import (
     redirect,
     render_template,
     request,
+    session,
     url_for,
 )
 
 from lms_automation.extensions import db
-from lms_automation.models import Organiser, Round
+from lms_automation.models import AdminUser, Organiser, Round
 
 onboarding_bp = Blueprint("onboarding", __name__)
 
@@ -40,7 +41,7 @@ def _make_slug(name: str) -> str:
 
 
 def _unique_slug(base: str) -> str:
-    """Return *base* if it is unused, otherwise append an incrementing counter."""
+    """Return *base* if unused, otherwise append an incrementing counter."""
     slug = base
     counter = 2
     while Organiser.query.filter_by(slug=slug).first():
@@ -59,6 +60,38 @@ def _registration_url(organiser_slug: str) -> str:
     return f"{base}/register?organiser={organiser_slug}"
 
 
+def _set_organiser_session(admin_user: AdminUser) -> None:
+    """Populate the Flask session for a newly authenticated organiser_admin.
+
+    Mirrors the structure of _set_admin_session() in app.py so that the same
+    session keys are used throughout the codebase.
+    """
+    session.clear()
+    session["admin_logged_in"] = True
+    session.permanent = True
+    session["admin_user_id"] = admin_user.id
+    session["admin_role"] = admin_user.role           # 'organiser_admin'
+    session["organiser_id"] = admin_user.organiser_id
+    session["organiser_slug"] = admin_user.organiser.slug if admin_user.organiser else ""
+    session["organiser_name"] = admin_user.organiser.name if admin_user.organiser else ""
+
+
+def _require_organiser_auth(slug: str) -> Organiser:
+    """Verify the session is an organiser_admin who owns *slug*.
+
+    Returns the Organiser on success.
+    Redirects to login if unauthenticated; aborts 403 if wrong role or org.
+    """
+    if not session.get("admin_logged_in"):
+        return redirect(url_for("admin_login", next=request.url))  # type: ignore[return-value]
+    if session.get("admin_role") != "organiser_admin":
+        abort(403)
+    org = Organiser.query.filter_by(slug=slug).first_or_404()
+    if session.get("organiser_id") != org.id:
+        abort(403)
+    return org
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
@@ -71,9 +104,12 @@ def get_started():
 @onboarding_bp.route("/create-organiser", methods=["POST"])
 def create_organiser():
     name = (request.form.get("name") or "").strip()
+    email = (request.form.get("email") or "").strip().lower()
+    password = request.form.get("password") or ""
 
+    # ── Validate input ──────────────────────────────────────────────────────
     if not name:
-        return render_template("get_started.html", error="Organisation name is required.")
+        return render_template("get_started.html", error="Competition name is required.")
 
     base_slug = _make_slug(name)
     if not base_slug:
@@ -82,23 +118,53 @@ def create_organiser():
             error="Could not generate a valid slug from that name. Please use letters or numbers.",
         )
 
-    slug = _unique_slug(base_slug)
+    if not email or "@" not in email:
+        return render_template("get_started.html", error="A valid email address is required.")
 
+    if len(password) < 12:
+        return render_template("get_started.html", error="Password must be at least 12 characters.")
+
+    # Check email (used as username) is not already registered
+    if AdminUser.query.filter_by(username=email).first():
+        return render_template(
+            "get_started.html",
+            error="An account with that email already exists. Please log in instead.",
+        )
+
+    # ── Create organiser ────────────────────────────────────────────────────
+    slug = _unique_slug(base_slug)
     new_org = Organiser(name=name, slug=slug, status="active")
     db.session.add(new_org)
+    db.session.flush()  # get new_org.id without committing yet
+
+    # ── Create organiser admin account ──────────────────────────────────────
+    admin_user = AdminUser(
+        username=email,
+        organiser_id=new_org.id,
+        role="organiser_admin",
+        is_active=True,
+    )
+    admin_user.set_password(password)
+    db.session.add(admin_user)
     db.session.commit()
+
+    # ── Auto-login ──────────────────────────────────────────────────────────
+    _set_organiser_session(admin_user)
 
     return redirect(url_for("onboarding.organiser_dashboard", slug=slug))
 
 
 @onboarding_bp.route("/organiser/<slug>/dashboard")
 def organiser_dashboard(slug: str):
-    org = Organiser.query.filter_by(slug=slug).first_or_404()
+    result = _require_organiser_auth(slug)
+    # _require_organiser_auth returns a redirect response when unauthenticated
+    if not isinstance(result, Organiser):
+        return result
+    org = result
 
     total_players = org.players.count()
     active_players = org.players.filter_by(status="active").count()
 
-    # Show the active round, or the next pending one if none is active
     current_round = (
         org.rounds.filter_by(status="active")
         .order_by(Round.round_number.desc())

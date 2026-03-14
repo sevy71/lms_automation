@@ -691,11 +691,13 @@ def _set_admin_session(admin_user):
     session['admin_user_id'] = admin_user.id
     session['admin_role'] = admin_user.role
     session['organiser_id'] = admin_user.organiser_id
-    # Cache display name to avoid extra query on every request
+    # Cache display name / slug to avoid extra queries on every request
     try:
         session['organiser_name'] = admin_user.organiser.name if admin_user.organiser else ''
+        session['organiser_slug'] = admin_user.organiser.slug if admin_user.organiser else ''
     except Exception:
         session['organiser_name'] = ''
+        session['organiser_slug'] = ''
 
 
 # ---------------------------------------------------------------------------
@@ -726,6 +728,9 @@ def admin_login():
                 parsed = urllib.parse.urlparse(raw_next)
                 if raw_next and not parsed.netloc and not parsed.scheme:
                     next_page = raw_next
+                elif admin_user.role == 'organiser_admin' and admin_user.organiser:
+                    next_page = url_for('onboarding.organiser_dashboard',
+                                        slug=admin_user.organiser.slug)
                 else:
                     next_page = url_for('admin_dashboard')
                 return redirect(next_page)

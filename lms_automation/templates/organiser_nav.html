@@ -1,0 +1,23 @@
+<nav class="navbar navbar-expand-lg navbar-dark bg-dark">
+    <div class="container">
+        <a class="navbar-brand" href="{{ url_for('onboarding.organiser_dashboard', slug=session.get('organiser_slug', '')) }}">
+            {{ session.get('organiser_name', 'My Competition') }}
+        </a>
+        <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#organiserNav" aria-controls="organiserNav" aria-expanded="false" aria-label="Toggle navigation">
+            <span class="navbar-toggler-icon"></span>
+        </button>
+        <div class="collapse navbar-collapse" id="organiserNav">
+            <div class="navbar-nav ms-auto">
+                <a class="nav-link" href="{{ url_for('onboarding.organiser_dashboard', slug=session.get('organiser_slug', '')) }}">
+                    <i class="fas fa-home me-1"></i>Dashboard
+                </a>
+                <a class="nav-link" href="{{ url_for('onboarding.organiser_dashboard', slug=session.get('organiser_slug', '')) }}#invite">
+                    <i class="fas fa-user-plus me-1"></i>Invite Players
+                </a>
+                <a class="nav-link text-danger" href="{{ url_for('admin_logout') }}">
+                    <i class="fas fa-sign-out-alt me-1"></i>Logout
+                </a>
+            </div>
+        </div>
+    </div>
+</nav>
