@@ -134,6 +134,7 @@ Good luck! May your team win! 🏆
         Returns:
             bool: True if successful
         """
+        base_url = os.environ.get('BASE_URL', 'http://localhost:5000').rstrip('/')
         message = f"""
 😔 <b>Elimination Notice</b>
 
@@ -144,6 +145,15 @@ Unfortunately, {team_picked} did not win in Round {round_number}.
 You have been eliminated from the Last Man Standing competition.
 
 Thank you for playing! Better luck next time! 🍀
+
+———
+
+Want to run your own Last Man Standing competition?
+
+It takes under 30 seconds to set up and invite your friends.
+
+Start your league:
+{base_url}/get-started
 """
         return self.send_message(chat_id, message)
 
