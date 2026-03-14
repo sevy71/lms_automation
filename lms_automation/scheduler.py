@@ -321,6 +321,18 @@ class LMSScheduler:
             )
             logger.info("Notification delivery job configured (60-second interval)")
 
+            # Prune old timeline records once per day per retention policy.
+            # Controlled via env vars: RUN_TIMELINE_CHECKPOINT_RETENTION_DAYS (default 30),
+            # RUN_TIMELINE_AUDIT_RETENTION_DAYS (default 0=never), RUN_TIMELINE_RUN_RETENTION_DAYS (default 0=never)
+            self.scheduler.add_job(
+                func=self._run_timeline_retention,
+                trigger=IntervalTrigger(hours=24),
+                id='timeline_retention',
+                name='Prune old timeline records per retention policy',
+                replace_existing=True,
+            )
+            logger.info("Timeline retention job configured (24-hour interval)")
+
             self.scheduler.start()
             logger.info("Scheduler started with all jobs configured")
 
@@ -768,6 +780,9 @@ class LMSScheduler:
         """
         with self.app.app_context():
             self._ensure_db_session()  # Clean up stale connections
+            from lms_automation.services.timeline_context import TimelineContext
+            _tl = TimelineContext('process_eliminations', trigger_type='scheduler', mode='auto')
+            _tl.__enter__()
             try:
                 logger.info("=" * 60)
                 logger.info("=== ELIMINATION PROCESSING JOB START ===")
@@ -890,6 +905,18 @@ class LMSScheduler:
 
                     # ======== ALL GUARDS PASSED - Proceed with elimination processing ========
                     logger.info(f"  ALL GUARDS PASSED: Proceeding with elimination processing")
+                    _tl.checkpoint(f'before_eliminations_r{round_obj.round_number}')
+                    _tl.decision(
+                        title=f'Process eliminations for Round {round_obj.round_number}',
+                        rule_matched='all_guards_passed',
+                        reasoning=(
+                            f'All {len(completed_fixtures)} relevant fixtures completed, '
+                            f'{picks_count}/{eligible_count} picks present, deadline_passed={deadline_passed}'
+                        ),
+                        confidence='high',
+                        intended_action='evaluate_picks_mark_eliminated',
+                        expected_impact=f'Up to {picks_count} picks evaluated, round marked completed',
+                    )
 
                     # Ensure all completed fixtures have had their picks evaluated.
                     # This handles the race condition where sync_fixtures marks fixtures as 'completed'
@@ -1015,6 +1042,17 @@ class LMSScheduler:
                         f"(picks_total={len(picks)}, winners={winners_count}, eliminated={eliminated_count}, "
                         f"fixtures_completed={len(completed_fixtures)}, phase={phase_status})"
                     )
+                    _tl.action(
+                        action_type='round_completed',
+                        outcome='applied',
+                        actual_impact=(
+                            f'round_id={round_obj.id} r{round_obj.round_number}: '
+                            f'winners={winners_count} eliminated={eliminated_count}'
+                        ),
+                        reversible=True,
+                        players_delta=eliminated_count,
+                        rounds_delta=1,
+                    )
 
                     # SAFEGUARD: Ensure no picks have is_winner=False AND is_eliminated=False
                     # This is an invariant violation - if you lost, you MUST be eliminated
@@ -1050,6 +1088,7 @@ class LMSScheduler:
                     f"winner={winner_count_db}"
                 )
                 logger.info("=" * 60)
+                _tl.__exit__(None, None, None)
 
             except Exception as e:
                 logger.error("=" * 60)
@@ -1059,6 +1098,7 @@ class LMSScheduler:
                 logger.error(f"Traceback:\n{traceback.format_exc()}")
                 logger.error("=" * 60)
                 db.session.rollback()
+                _tl.__exit__(type(e), e, e.__traceback__)
 
     def _evaluate_game_state_after_round(self, completed_round) -> str:
         """
@@ -1752,6 +1792,9 @@ class LMSScheduler:
         """
         with self.app.app_context():
             self._ensure_db_session()  # Clean up stale connections
+            from lms_automation.services.timeline_context import TimelineContext
+            _tl = TimelineContext('apply_missed_picks', trigger_type='scheduler', mode='auto')
+            _tl.__enter__()
             try:
                 logger.info("=" * 60)
                 logger.info("=== AUTO-PICK JOB START ===")
@@ -1854,6 +1897,19 @@ class LMSScheduler:
                         logger.info(f"  All eligible players have picks. Nothing to auto-pick.")
                         continue
 
+                    _tl.checkpoint(f'before_autopick_r{round_obj.round_number}')
+                    _tl.decision(
+                        title=f'Apply auto-picks for Round {round_obj.round_number}',
+                        rule_matched='deadline_passed_picks_missing',
+                        reasoning=(
+                            f'Deadline passed for round {round_obj.round_number}, '
+                            f'{missing_pick_count} player(s) have not submitted picks'
+                        ),
+                        confidence='high',
+                        intended_action='insert_auto_pick_for_each_missing_player',
+                        expected_impact=f'{missing_pick_count} auto-pick(s) to be created',
+                    )
+
                     # Log details of players needing auto-picks
                     logger.info(f"  Players needing auto-pick:")
                     for p in missing_pick_players:
@@ -1888,6 +1944,17 @@ class LMSScheduler:
 
                     total_auto_picks_applied += round_auto_picks
                     logger.info(f"  Round {round_obj.round_number} summary: {round_auto_picks} auto-pick(s) created")
+                    if round_auto_picks > 0:
+                        _tl.action(
+                            action_type='auto_picks_applied',
+                            outcome='applied',
+                            actual_impact=(
+                                f'round_id={round_obj.id} r{round_obj.round_number}: '
+                                f'{round_auto_picks} auto-pick(s) created'
+                            ),
+                            reversible=True,
+                            players_delta=round_auto_picks,
+                        )
 
                     # After applying auto-picks, check if all picks are now in and mark as picks_locked
                     # This signals to process_eliminations that autopick has completed
@@ -1911,6 +1978,7 @@ class LMSScheduler:
                 logger.info(f"=== AUTO-PICK JOB COMPLETE ===")
                 logger.info(f"autopicks_created_count = {total_auto_picks_applied}")
                 logger.info("=" * 60)
+                _tl.__exit__(None, None, None)
 
             except Exception as e:
                 logger.error("=" * 60)
@@ -1920,6 +1988,7 @@ class LMSScheduler:
                 logger.error(f"Traceback:\n{traceback.format_exc()}")
                 logger.error("=" * 60)
                 db.session.rollback()
+                _tl.__exit__(type(e), e, e.__traceback__)
 
     def round_progression_orchestrator(self):
         """
@@ -1935,6 +2004,9 @@ class LMSScheduler:
         """
         with self.app.app_context():
             self._ensure_db_session()  # Clean up stale connections
+            from lms_automation.services.timeline_context import TimelineContext
+            _tl = TimelineContext('round_progression_orchestrator', trigger_type='scheduler', mode='auto')
+            _tl.__enter__()
             try:
                 logger.info("=" * 60)
                 logger.info("=== ROUND ORCHESTRATOR JOB START ===")
@@ -1971,11 +2043,30 @@ class LMSScheduler:
                         continue
 
                     # ACTIVATION: Round has fixtures AND tokens_generated marker
+                    _tl.checkpoint(f'before_activate_r{round_obj.round_number}')
+                    _tl.decision(
+                        title=f'Activate Round {round_obj.round_number}',
+                        rule_matched='fixtures_exist_and_tokens_generated',
+                        reasoning=(
+                            f'{len(fixtures)} fixtures exist, tokens_generated marker present, '
+                            f'{len(eligible_players)} eligible players'
+                        ),
+                        confidence='high',
+                        intended_action='set_round_status_active',
+                        expected_impact='Round becomes active; players can submit picks',
+                    )
                     round_obj.status = 'active'
                     logger.info(
                         f"Round {round_obj.round_number}: ACTIVATED "
                         f"({len(fixtures)} fixtures, {len(eligible_players)} eligible players, "
                         f"tokens_generated=True)"
+                    )
+                    _tl.action(
+                        action_type='round_activated',
+                        outcome='applied',
+                        actual_impact=f'round_id={round_obj.id} r{round_obj.round_number} -> active',
+                        reversible=True,
+                        rounds_delta=1,
                     )
 
                 # Step 2: Check active rounds for completion readiness
@@ -2003,10 +2094,12 @@ class LMSScheduler:
                 db.session.commit()
                 logger.info("=== ROUND ORCHESTRATOR JOB COMPLETE ===")
                 logger.info("=" * 60)
+                _tl.__exit__(None, None, None)
 
             except Exception as e:
                 logger.error(f"Error in round orchestrator: {e}")
                 db.session.rollback()
+                _tl.__exit__(type(e), e, e.__traceback__)
 
     def check_all_picks_submitted(self):
         """
@@ -2151,6 +2244,17 @@ class LMSScheduler:
                 deliver_pending_notifications()
             except Exception as e:
                 logger.error("deliver_notifications job failed: %s", e)
+
+    def _run_timeline_retention(self):
+        """APScheduler job: prune old run-timeline records per retention policy."""
+        with self.app.app_context():
+            try:
+                from lms_automation.services.run_timeline import prune_old_data
+                counts = prune_old_data()
+                if any(counts.values()):
+                    logger.info("Timeline retention pruned: %s", counts)
+            except Exception as e:
+                logger.error("timeline_retention job failed: %s", e)
 
     def _send_picks_published_notification(self, round_obj):
         """Delegates to services.telegram_dispatch."""
