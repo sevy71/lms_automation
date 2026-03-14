@@ -18,6 +18,143 @@
         </div>
     </div>
 
+    <!-- Competition Control Panel -->
+    <div class="col-12 mb-4">
+        <div class="card shadow-sm border-0">
+            <div class="card-header bg-dark text-white d-flex align-items-center gap-2">
+                <i class="fas fa-gauge-high"></i>
+                <span class="fw-semibold">Competition Control Panel</span>
+            </div>
+            <div class="card-body py-3">
+                <div class="row g-3">
+
+                    <!-- Game Status -->
+                    <div class="col-12 col-sm-6 col-lg-3">
+                        <div class="bg-light rounded p-3 h-100">
+                            <div class="text-muted small fw-semibold text-uppercase mb-2">
+                                <i class="fas fa-circle-info me-1"></i>Game Status
+                            </div>
+                            {% if cp.current_round %}
+                                <div class="fw-bold fs-5 mb-1">
+                                    Round {{ cp.current_round.round_number }}
+                                    {% if cp.cycle_number %}
+                                        <span class="text-muted fs-6 fw-normal">· Cycle {{ cp.cycle_number }}</span>
+                                    {% endif %}
+                                </div>
+                            {% else %}
+                                <div class="fw-bold fs-5 text-muted mb-1">No round yet</div>
+                            {% endif %}
+                            <div class="small mt-2">
+                                <span class="text-success fw-semibold">{{ cp.active_players }}</span>
+                                <span class="text-muted"> active</span>
+                                <span class="mx-1 text-muted">·</span>
+                                <span class="text-danger fw-semibold">{{ cp.eliminated_players }}</span>
+                                <span class="text-muted"> eliminated</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Next Deadline -->
+                    <div class="col-12 col-sm-6 col-lg-3">
+                        <div class="bg-light rounded p-3 h-100">
+                            <div class="text-muted small fw-semibold text-uppercase mb-2">
+                                <i class="fas fa-clock me-1"></i>Next Deadline
+                            </div>
+                            {% if cp.deadline_dt %}
+                                <div class="fw-bold mb-1">
+                                    {{ cp.deadline_dt.strftime('%a %-d %b, %H:%M') }}
+                                </div>
+                                <div class="small text-muted">
+                                    Time remaining:
+                                    <span id="cp-countdown" class="fw-semibold text-primary" data-deadline="{{ cp.deadline_dt.isoformat() }}">—</span>
+                                </div>
+                            {% else %}
+                                <div class="text-muted small">No active deadline</div>
+                            {% endif %}
+                        </div>
+                    </div>
+
+                    <!-- Automation Health -->
+                    <div class="col-12 col-sm-6 col-lg-3">
+                        <div class="bg-light rounded p-3 h-100">
+                            <div class="text-muted small fw-semibold text-uppercase mb-2">
+                                <i class="fas fa-robot me-1"></i>Automation
+                            </div>
+                            {% if cp.automation_status == 'running' %}
+                                <span class="badge bg-success mb-2">Running</span>
+                            {% elif cp.automation_status == 'warning' %}
+                                <span class="badge bg-warning text-dark mb-2">Warning</span>
+                            {% else %}
+                                <span class="badge bg-secondary mb-2">Unknown</span>
+                            {% endif %}
+                            <div class="small mt-1">
+                                Reminders:
+                                <span class="{% if cp.reminders_24h %}text-success{% else %}text-muted{% endif %} fw-semibold">
+                                    24h {% if cp.reminders_24h %}✓{% else %}–{% endif %}
+                                </span>
+                                <span class="{% if cp.reminders_4h %}text-success{% else %}text-muted{% endif %} fw-semibold mx-1">
+                                    4h {% if cp.reminders_4h %}✓{% else %}–{% endif %}
+                                </span>
+                                <span class="{% if cp.reminders_2h %}text-success{% else %}text-muted{% endif %} fw-semibold">
+                                    2h {% if cp.reminders_2h %}✓{% else %}–{% endif %}
+                                </span>
+                            </div>
+                            {% if cp.last_run_ago %}
+                                <div class="small text-muted mt-1">Last run: {{ cp.last_run_ago }}</div>
+                            {% endif %}
+                        </div>
+                    </div>
+
+                    <!-- Round Snapshot -->
+                    <div class="col-12 col-sm-6 col-lg-3">
+                        <div class="bg-light rounded p-3 h-100">
+                            <div class="text-muted small fw-semibold text-uppercase mb-2">
+                                <i class="fas fa-chart-bar me-1"></i>Last Round Snapshot
+                            </div>
+                            {% if cp.round_snapshot %}
+                                <div class="small mb-1">
+                                    <span class="text-muted">Round {{ cp.round_snapshot.round_number }}</span>
+                                </div>
+                                <div class="small">
+                                    <span class="text-muted">Most picked:</span>
+                                    <span class="fw-semibold">{{ cp.round_snapshot.most_picked_team or '—' }}</span>
+                                </div>
+                                <div class="small">
+                                    <span class="text-muted">Biggest eliminator:</span>
+                                    <span class="fw-semibold">{{ cp.round_snapshot.biggest_eliminator or '—' }}</span>
+                                </div>
+                            {% else %}
+                                <div class="text-muted small">No round results yet.</div>
+                            {% endif %}
+                        </div>
+                    </div>
+
+                    <!-- Quick Actions -->
+                    <div class="col-12">
+                        <div class="border-top pt-3 d-flex flex-wrap gap-2 align-items-center">
+                            <span class="text-muted small fw-semibold text-uppercase me-1">Quick actions:</span>
+                            <a href="/picks-grid" class="btn btn-sm btn-outline-primary">
+                                <i class="fas fa-table me-1"></i>View Picks
+                            </a>
+                            <a href="/admin_dashboard#players" class="btn btn-sm btn-outline-danger">
+                                <i class="fas fa-user-slash me-1"></i>View Eliminations
+                            </a>
+                            {% if cp.last_completed_round %}
+                            <a href="/api/round-summary/{{ cp.last_completed_round.id }}" target="_blank" class="btn btn-sm btn-outline-secondary">
+                                <i class="fas fa-file-alt me-1"></i>Post Round Summary
+                            </a>
+                            {% endif %}
+                            <a href="#invite" class="btn btn-sm btn-outline-success">
+                                <i class="fas fa-user-plus me-1"></i>Invite Players
+                            </a>
+                        </div>
+                    </div>
+
+                </div>
+            </div>
+        </div>
+    </div>
+
     <!-- Stats row -->
     <div class="col-12 col-sm-6 col-md-4 mb-3">
         <div class="card border-0 bg-light h-100">
@@ -161,6 +298,22 @@
 
 {% block scripts %}
 <script>
+(function () {
+    var el = document.getElementById('cp-countdown');
+    if (el) {
+        var deadline = new Date(el.dataset.deadline + 'Z');
+        function update() {
+            var diff = deadline - Date.now();
+            if (diff <= 0) { el.textContent = 'Deadline passed'; return; }
+            var h = Math.floor(diff / 3600000);
+            var m = Math.floor((diff % 3600000) / 60000);
+            el.textContent = h > 0 ? h + 'h ' + m + 'm' : m + 'm';
+        }
+        update();
+        setInterval(update, 30000);
+    }
+})();
+
 (function () {
     var btn = document.getElementById('copy-btn');
     var feedback = document.getElementById('copy-feedback');

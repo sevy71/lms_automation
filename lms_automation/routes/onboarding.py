@@ -24,6 +24,7 @@ from flask import (
 
 from lms_automation.extensions import db
 from lms_automation.models import AdminUser, Organiser, Round
+from lms_automation.services.control_panel import get_control_panel_data
 
 onboarding_bp = Blueprint("onboarding", __name__)
 
@@ -163,19 +164,8 @@ def organiser_dashboard(slug: str):
     org = result
 
     total_players = org.players.count()
-    active_players = org.players.filter_by(status="active").count()
 
-    current_round = (
-        org.rounds.filter_by(status="active")
-        .order_by(Round.round_number.desc())
-        .first()
-    )
-    if not current_round:
-        current_round = (
-            org.rounds.filter_by(status="pending")
-            .order_by(Round.round_number.asc())
-            .first()
-        )
+    cp = get_control_panel_data(org)
 
     reg_url = _registration_url(slug)
     qr_url = url_for("onboarding.organiser_qr_png", slug=slug)
@@ -184,10 +174,11 @@ def organiser_dashboard(slug: str):
         "organiser_dashboard.html",
         org=org,
         total_players=total_players,
-        active_players=active_players,
-        current_round=current_round,
+        active_players=cp["active_players"],
+        current_round=cp["current_round"],
         reg_url=reg_url,
         qr_url=qr_url,
+        cp=cp,
     )
 
 
