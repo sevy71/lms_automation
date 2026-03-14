@@ -5683,6 +5683,9 @@ app.register_blueprint(admin_ops_bp)
 from lms_automation.routes.run_timeline import run_timeline_bp  # noqa: E402
 app.register_blueprint(run_timeline_bp)
 
+from lms_automation.routes.round_summary import round_summary_bp  # noqa: E402
+app.register_blueprint(round_summary_bp)
+
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)

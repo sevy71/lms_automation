@@ -134,7 +134,74 @@
 </div>
 
 
-{# ── 3. MANUAL FALLBACK ──────────────────────────────────────────────── #}
+{# ── 3. ROUND SUMMARY ─────────────────────────────────────────────────── #}
+<div class="mb-3" data-testid="section-round-summary">
+  <button class="dash-section-header btn btn-link text-decoration-none"
+          type="button"
+          data-bs-toggle="collapse"
+          data-bs-target="#roundSummarySection"
+          aria-expanded="false"
+          aria-controls="roundSummarySection"
+          data-testid="section-round-summary-toggle">
+    <span>
+      <i class="fas fa-clipboard-list me-2 text-muted"></i>Round Summary
+    </span>
+    <i class="fas fa-chevron-down text-muted small chevron"></i>
+  </button>
+
+  <div class="collapse dash-section-body" id="roundSummarySection">
+    <div class="row g-2 align-items-end mb-3">
+      <div class="col-auto">
+        <label for="summaryRoundSelect" class="form-label mb-0 small">Round</label>
+        <select id="summaryRoundSelect" class="form-select form-select-sm" style="min-width:130px">
+          <option value="">Select round…</option>
+        </select>
+      </div>
+      <div class="col-auto">
+        <button class="btn btn-sm btn-outline-primary" id="loadRoundSummaryBtn">
+          <i class="fas fa-sync-alt me-1"></i>Load Summary
+        </button>
+      </div>
+    </div>
+
+    <div id="roundSummaryResult" class="d-none">
+      <div class="row g-3 mb-3">
+        <div class="col-6 col-sm-3 text-center">
+          <div class="fs-4 fw-bold text-danger" id="rsEliminated">—</div>
+          <div class="small text-muted">Eliminated</div>
+        </div>
+        <div class="col-6 col-sm-3 text-center">
+          <div class="fs-4 fw-bold text-success" id="rsRemaining">—</div>
+          <div class="small text-muted">Remaining</div>
+        </div>
+        <div class="col-6 col-sm-3 text-center">
+          <div class="fs-6 fw-semibold" id="rsMostPicked">—</div>
+          <div class="small text-muted">Most Picked</div>
+        </div>
+        <div class="col-6 col-sm-3 text-center">
+          <div class="fs-6 fw-semibold text-danger" id="rsBiggestElim">—</div>
+          <div class="small text-muted">Biggest Eliminator</div>
+        </div>
+      </div>
+
+      <div class="position-relative">
+        <label class="form-label small text-muted mb-1">Copy-ready text (WhatsApp / Telegram)</label>
+        <textarea id="roundSummaryText" class="form-control font-monospace small"
+                  rows="8" readonly style="resize:none; background:#f8f9fa;"></textarea>
+        <button class="btn btn-sm btn-outline-secondary mt-2" id="copySummaryBtn"
+                title="Copy to clipboard">
+          <i class="fas fa-copy me-1"></i>Copy
+        </button>
+        <span id="copySummaryFeedback" class="ms-2 small text-success d-none">Copied!</span>
+      </div>
+    </div>
+
+    <div id="roundSummaryError" class="text-danger small d-none"></div>
+  </div>
+</div>
+
+
+{# ── 4. MANUAL FALLBACK ──────────────────────────────────────────────── #}
 <div class="mb-3">
   <button class="dash-section-header btn btn-link text-decoration-none"
           type="button"
@@ -2547,6 +2614,78 @@ document.addEventListener('DOMContentLoaded', function () {
     document.querySelector('[data-bs-target="#tlAuditTab"]')?.addEventListener('shown.bs.tab', loadAuditWithFilters);
   });
 
+}());
+</script>
+
+<script>
+// ── Round Summary ────────────────────────────────────────────────────────
+(function () {
+  const select  = document.getElementById('summaryRoundSelect');
+  const loadBtn = document.getElementById('loadRoundSummaryBtn');
+  const result  = document.getElementById('roundSummaryResult');
+  const errDiv  = document.getElementById('roundSummaryError');
+  const textArea = document.getElementById('roundSummaryText');
+  const copyBtn  = document.getElementById('copySummaryBtn');
+  const copyFb   = document.getElementById('copySummaryFeedback');
+
+  // Populate round dropdown when the section is first opened
+  document.querySelector('[data-bs-target="#roundSummarySection"]')
+    ?.addEventListener('click', function () {
+      if (select.options.length > 1) return;  // already loaded
+      fetch('/api/rounds')
+        .then(r => r.json())
+        .then(rounds => {
+          (rounds || [])
+            .filter(r => r.status === 'completed')
+            .sort((a, b) => b.round_number - a.round_number)
+            .forEach(r => {
+              const opt = document.createElement('option');
+              opt.value = r.id;
+              opt.textContent = `Round ${r.round_number}`;
+              select.appendChild(opt);
+            });
+        })
+        .catch(() => {});
+    });
+
+  loadBtn?.addEventListener('click', async function () {
+    const roundId = select.value;
+    if (!roundId) { alert('Please select a round first.'); return; }
+
+    result.classList.add('d-none');
+    errDiv.classList.add('d-none');
+
+    try {
+      const res  = await fetch(`/api/round-summary/${roundId}`);
+      const data = await res.json();
+
+      if (!data.success) {
+        errDiv.textContent = data.error || 'Failed to load summary.';
+        errDiv.classList.remove('d-none');
+        return;
+      }
+
+      document.getElementById('rsEliminated').textContent  = data.eliminated_this_round;
+      document.getElementById('rsRemaining').textContent   = data.players_remaining;
+      document.getElementById('rsMostPicked').textContent  =
+        `${data.most_picked_team} (${data.most_picked_count})`;
+      document.getElementById('rsBiggestElim').textContent =
+        `${data.biggest_eliminator} (${data.eliminator_count})`;
+      textArea.value = data.formatted_text;
+
+      result.classList.remove('d-none');
+    } catch (e) {
+      errDiv.textContent = 'Error fetching summary.';
+      errDiv.classList.remove('d-none');
+    }
+  });
+
+  copyBtn?.addEventListener('click', function () {
+    navigator.clipboard.writeText(textArea.value).then(() => {
+      copyFb.classList.remove('d-none');
+      setTimeout(() => copyFb.classList.add('d-none'), 2000);
+    });
+  });
 }());
 </script>
 
