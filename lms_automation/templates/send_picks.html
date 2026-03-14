@@ -13,9 +13,14 @@
     <div class="col-12">
         <div class="card">
             <div class="card-header">
-                <h5 class="card-title mb-0">Round {{ round.round_number }} - Active Players</h5>
+                <h5 class="card-title mb-0">Round {{ round.round_number }} - Pending Players</h5>
             </div>
             <div class="card-body p-2 p-md-3">
+                {% if nothing_to_send %}
+                    <div class="alert alert-info mb-0">
+                        All active players have already submitted their pick for Round {{ round.round_number }}. No messages sent.
+                    </div>
+                {% else %}
                 <div class="mb-3">
                     <span class="badge bg-success">Sent: {{ sent_count }}</span>
                     <span class="badge bg-warning text-dark">Missing Telegram ID: {{ skipped_missing }}</span>
@@ -42,7 +47,7 @@
                             </div>
                         {% endfor %}
                     </div>
-                    
+
                     <!-- Table layout for medium screens and up -->
                     <div class="d-none d-md-block">
                         <div class="table-responsive">
@@ -67,7 +72,8 @@
                         </div>
                     </div>
                 {% else %}
-                    <p class="text-muted">No active players in this round.</p>
+                    <p class="text-muted">No pending players to message for this round.</p>
+                {% endif %}
                 {% endif %}
             </div>
         </div>

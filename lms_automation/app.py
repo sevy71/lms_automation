@@ -2265,11 +2265,38 @@ def send_picks():
     # Use canonical eligibility to respect cycle-based eliminations
     active_players = get_eligible_players_for_round(current_round)
 
+    # Exclude players who have already submitted a pick for this round
+    submitted_player_ids = {
+        row.player_id
+        for row in Pick.query.filter_by(round_id=current_round.id).all()
+    }
+    pending_players = [p for p in active_players if p.id not in submitted_player_ids]
+
+    app.logger.info(
+        "Send pick links — round_id=%s active=%s already_submitted=%s pending=%s",
+        current_round.id,
+        len(active_players),
+        len(submitted_player_ids),
+        len(pending_players),
+    )
+
+    if not pending_players:
+        app.logger.info("Send pick links — no pending players, nothing to send")
+        return render_template(
+            'send_picks.html',
+            players=[],
+            round=current_round,
+            sent_count=0,
+            skipped_missing=0,
+            failed_count=0,
+            nothing_to_send=True,
+        )
+
     sent_count = 0
     skipped_missing = 0
     failed_count = 0
 
-    for player in active_players:
+    for player in pending_players:
         # Generate or refresh token; it will auto-expire at the round deadline if set
         pick_token = PickToken.create_for_player_round(player.id, current_round.id)
         db.session.commit()  # Commit to get the token
@@ -2356,11 +2383,12 @@ def send_picks():
 
     return render_template(
         'send_picks.html',
-        players=active_players,
+        players=pending_players,
         round=current_round,
         sent_count=sent_count,
         skipped_missing=skipped_missing,
-        failed_count=failed_count
+        failed_count=failed_count,
+        nothing_to_send=False,
     )
 
 @app.route('/api/players', methods=['GET', 'POST'])
@@ -5651,6 +5679,9 @@ def abort_if_organiser_mismatch(record, label='record'):
 # ---------------------------------------------------------------------------
 from lms_automation.routes.admin_ops import admin_ops_bp  # noqa: E402
 app.register_blueprint(admin_ops_bp)
+
+from lms_automation.routes.run_timeline import run_timeline_bp  # noqa: E402
+app.register_blueprint(run_timeline_bp)
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
