@@ -1,43 +1,61 @@
 {% extends "base.html" %}
 
-{% block title %}Welcome - Last Man Standing{% endblock %}
+{% block title %}Last Man Standing — Run Your Own Competition{% endblock %}
 
 {% block content %}
-<div class="row justify-content-center">
-    <div class="col-12 col-lg-8 text-center">
-        <div class="card shadow">
-            <div class="card-body py-4 py-md-5">
-                <h1 class="card-title display-5 display-md-4 mb-4">Welcome to Last Man Standing!</h1>
-                <p class="card-text lead mb-4">
-                    The ultimate football prediction competition where only one survives.
-                </p>
-                <div class="row mt-4 mt-md-5">
-                    <div class="col-12 col-md-6 mb-3">
-                        <div class="card bg-primary text-white h-100">
-                            <div class="card-body">
-                                <h5 class="card-title">How It Works</h5>
-                                <p class="card-text">Pick one team to win. If they win you go through. If they lose or draw you're out!</p>
-                            </div>
-                        </div>
-                    </div>
-                    <div class="col-12 col-md-6 mb-3">
-                        <div class="card bg-success text-white h-100">
-                            <div class="card-body">
-                                <h5 class="card-title">The Challenge</h5>
-                                <p class="card-text">You can only pick each team once throughout the competition.</p>
-                            </div>
-                        </div>
-                    </div>
+<div class="row justify-content-center mt-3 mt-md-5">
+    <div class="col-12 col-lg-9 col-xl-8">
+
+        <!-- Hero -->
+        <div class="text-center mb-5">
+            <h1 class="display-5 fw-bold mb-3">Run your own Last Man Standing competition</h1>
+            <p class="lead text-muted mb-4">
+                Set up your competition in under 30 seconds. Players join, pick, and get eliminated automatically.
+            </p>
+            <a href="{{ url_for('onboarding.get_started') }}" class="btn btn-primary btn-lg px-5 py-3 shadow-sm">
+                <i class="fas fa-rocket me-2"></i>Get Started
+            </a>
+        </div>
+
+        <!-- Feature cards -->
+        <div class="row g-3 mb-5">
+            <div class="col-12 col-sm-6 col-md-3">
+                <div class="card h-100 border-0 bg-light text-center p-3">
+                    <div class="mb-2 fs-2 text-primary"><i class="fas fa-paper-plane"></i></div>
+                    <h6 class="fw-semibold mb-1">Players submit picks automatically</h6>
+                    <small class="text-muted">Via a simple link — no app needed</small>
                 </div>
-                <div class="mt-4">
-                    <div class="d-grid d-sm-flex justify-content-sm-center">
-                        <a href="{{ url_for('admin_dashboard') }}" class="btn btn-lg btn-outline-primary px-4">
-                            <i class="fas fa-cog me-2"></i>Admin Dashboard
-                        </a>
-                    </div>
+            </div>
+            <div class="col-12 col-sm-6 col-md-3">
+                <div class="card h-100 border-0 bg-light text-center p-3">
+                    <div class="mb-2 fs-2 text-success"><i class="fas fa-check-circle"></i></div>
+                    <h6 class="fw-semibold mb-1">Results are processed automatically</h6>
+                    <small class="text-muted">Scores pulled, outcomes applied</small>
+                </div>
+            </div>
+            <div class="col-12 col-sm-6 col-md-3">
+                <div class="card h-100 border-0 bg-light text-center p-3">
+                    <div class="mb-2 fs-2 text-danger"><i class="fas fa-user-times"></i></div>
+                    <h6 class="fw-semibold mb-1">Eliminations tracked automatically</h6>
+                    <small class="text-muted">Wrong pick? Out. No manual work.</small>
+                </div>
+            </div>
+            <div class="col-12 col-sm-6 col-md-3">
+                <div class="card h-100 border-0 bg-light text-center p-3">
+                    <div class="mb-2 fs-2 text-warning"><i class="fas fa-pound-sign"></i></div>
+                    <h6 class="fw-semibold mb-1">You only collect the entry fees</h6>
+                    <small class="text-muted">Everything else is handled for you</small>
                 </div>
             </div>
         </div>
+
+        <!-- CTA footer -->
+        <div class="text-center">
+            <a href="{{ url_for('onboarding.get_started') }}" class="btn btn-outline-primary btn-lg px-4">
+                Create your competition now
+            </a>
+        </div>
+
     </div>
 </div>
 {% endblock %}

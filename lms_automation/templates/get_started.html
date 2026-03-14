@@ -1,0 +1,100 @@
+{% extends "base.html" %}
+
+{% block title %}Get Started — Last Man Standing{% endblock %}
+
+{% block content %}
+<div class="row justify-content-center mt-4 mt-md-5">
+    <div class="col-12 col-sm-10 col-md-8 col-lg-6">
+
+        <div class="text-center mb-4">
+            <h1 class="h2 fw-bold mb-1">Create your competition</h1>
+            <p class="text-muted">Takes under 30 seconds.</p>
+        </div>
+
+        {% if error %}
+        <div class="alert alert-danger d-flex align-items-center" role="alert">
+            <i class="fas fa-exclamation-circle me-2"></i>
+            {{ error }}
+        </div>
+        {% endif %}
+
+        <div class="card shadow-sm">
+            <div class="card-body p-4">
+                <form method="POST" action="{{ url_for('onboarding.create_organiser') }}" novalidate>
+                    <div class="mb-4">
+                        <label for="name" class="form-label fw-semibold">
+                            Competition name <span class="text-danger">*</span>
+                        </label>
+                        <input
+                            type="text"
+                            class="form-control form-control-lg"
+                            id="name"
+                            name="name"
+                            placeholder="e.g. Tony's LMS League"
+                            autocomplete="off"
+                            required
+                            autofocus
+                            value="{{ request.form.get('name', '') }}"
+                        >
+                        <div class="form-text mt-1">
+                            This is the name players will see when they join.
+                        </div>
+                    </div>
+
+                    <div class="mb-4">
+                        <label class="form-label fw-semibold text-muted small">Preview URL</label>
+                        <div class="input-group">
+                            <span class="input-group-text text-muted small">/register?organiser=</span>
+                            <input
+                                type="text"
+                                class="form-control text-muted small"
+                                id="slug-preview"
+                                readonly
+                                placeholder="your-competition-slug"
+                                tabindex="-1"
+                            >
+                        </div>
+                        <div class="form-text">Auto-generated from your competition name.</div>
+                    </div>
+
+                    <div class="d-grid">
+                        <button type="submit" class="btn btn-primary btn-lg">
+                            <i class="fas fa-rocket me-2"></i>Create my competition
+                        </button>
+                    </div>
+                </form>
+            </div>
+        </div>
+
+        <p class="text-center text-muted mt-3 small">
+            Already have a competition? <a href="{{ url_for('admin_login') }}">Admin login</a>
+        </p>
+
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function () {
+    var nameInput = document.getElementById('name');
+    var slugPreview = document.getElementById('slug-preview');
+
+    function toSlug(value) {
+        return value
+            .toLowerCase()
+            .replace(/[^a-z0-9]+/g, '-')
+            .replace(/^-+|-+$/g, '');
+    }
+
+    nameInput.addEventListener('input', function () {
+        slugPreview.value = toSlug(nameInput.value);
+    });
+
+    // Initialise on page load (POST-back with a value)
+    if (nameInput.value) {
+        slugPreview.value = toSlug(nameInput.value);
+    }
+})();
+</script>
+{% endblock %}

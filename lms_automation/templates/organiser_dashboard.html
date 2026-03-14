@@ -1,0 +1,180 @@
+{% extends "base.html" %}
+
+{% block title %}{{ org.name }} — Dashboard{% endblock %}
+
+{% block content %}
+<div class="row mt-3 mt-md-4">
+
+    <!-- Header -->
+    <div class="col-12 mb-4">
+        <div class="d-flex align-items-center justify-content-between flex-wrap gap-2">
+            <div>
+                <h1 class="h3 fw-bold mb-0">{{ org.name }}</h1>
+                <small class="text-muted">Competition dashboard</small>
+            </div>
+            <span class="badge bg-success fs-6">Active</span>
+        </div>
+    </div>
+
+    <!-- Stats row -->
+    <div class="col-12 col-sm-6 col-md-4 mb-3">
+        <div class="card border-0 bg-light h-100">
+            <div class="card-body">
+                <div class="d-flex align-items-center gap-3">
+                    <div class="fs-2 text-primary"><i class="fas fa-users"></i></div>
+                    <div>
+                        <div class="fs-4 fw-bold">{{ total_players }}</div>
+                        <div class="text-muted small">Total players</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="col-12 col-sm-6 col-md-4 mb-3">
+        <div class="card border-0 bg-light h-100">
+            <div class="card-body">
+                <div class="d-flex align-items-center gap-3">
+                    <div class="fs-2 text-success"><i class="fas fa-user-check"></i></div>
+                    <div>
+                        <div class="fs-4 fw-bold">{{ active_players }}</div>
+                        <div class="text-muted small">Still active</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="col-12 col-sm-6 col-md-4 mb-3">
+        <div class="card border-0 bg-light h-100">
+            <div class="card-body">
+                <div class="d-flex align-items-center gap-3">
+                    <div class="fs-2 text-warning"><i class="fas fa-calendar-alt"></i></div>
+                    <div>
+                        {% if current_round %}
+                            <div class="fs-4 fw-bold">Round {{ current_round.round_number }}</div>
+                            <div class="text-muted small">
+                                {% if current_round.status == 'active' %}
+                                    In progress
+                                    {% if current_round.first_kickoff_at %}
+                                        — deadline {{ current_round.first_kickoff_at.strftime('%a %-d %b, %H:%M') }}
+                                    {% endif %}
+                                {% else %}
+                                    Coming up
+                                {% endif %}
+                            </div>
+                        {% else %}
+                            <div class="fs-4 fw-bold text-muted">—</div>
+                            <div class="text-muted small">No rounds yet</div>
+                        {% endif %}
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Invite players panel -->
+    <div class="col-12 mt-2">
+        <div class="card shadow-sm">
+            <div class="card-header bg-primary text-white d-flex align-items-center gap-2">
+                <i class="fas fa-user-plus"></i>
+                <span class="fw-semibold">Invite players</span>
+            </div>
+            <div class="card-body">
+                <p class="text-muted mb-3">
+                    Share this link or QR code with your players. They can register and join your competition directly.
+                </p>
+
+                <div class="row g-4 align-items-start">
+                    <!-- Link + copy -->
+                    <div class="col-12 col-md-7">
+                        <label class="form-label fw-semibold small text-uppercase text-muted">Player invite link</label>
+                        <div class="input-group mb-2">
+                            <input
+                                type="text"
+                                class="form-control"
+                                id="invite-link"
+                                value="{{ reg_url }}"
+                                readonly
+                            >
+                            <button class="btn btn-outline-secondary" type="button" id="copy-btn" title="Copy to clipboard">
+                                <i class="fas fa-copy"></i>
+                            </button>
+                        </div>
+                        <div id="copy-feedback" class="text-success small" style="min-height:1.2em;"></div>
+
+                        <div class="mt-3 d-flex gap-2 flex-wrap">
+                            <a
+                                href="https://wa.me/?text={{ ('Join my Last Man Standing competition: ' ~ reg_url) | urlencode }}"
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                class="btn btn-sm btn-success"
+                            >
+                                <i class="fab fa-whatsapp me-1"></i>Share on WhatsApp
+                            </a>
+                            <a href="{{ reg_url }}" target="_blank" rel="noopener noreferrer" class="btn btn-sm btn-outline-primary">
+                                <i class="fas fa-external-link-alt me-1"></i>Preview registration page
+                            </a>
+                        </div>
+                    </div>
+
+                    <!-- QR code -->
+                    <div class="col-12 col-md-5 text-center text-md-start">
+                        <label class="form-label fw-semibold small text-uppercase text-muted">QR code</label>
+                        <div>
+                            <img
+                                src="{{ qr_url }}"
+                                alt="QR code for {{ reg_url }}"
+                                class="img-fluid border rounded"
+                                style="max-width: 180px;"
+                                onerror="this.closest('.col-12').querySelector('.qr-error').classList.remove('d-none'); this.remove();"
+                            >
+                            <p class="qr-error d-none text-muted small mt-1">QR code unavailable.</p>
+                        </div>
+                        <div class="mt-2">
+                            <a href="{{ qr_url }}" download="invite-qr-{{ org.slug }}.png" class="btn btn-sm btn-outline-secondary">
+                                <i class="fas fa-download me-1"></i>Download QR
+                            </a>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Next steps hint -->
+    <div class="col-12 mt-3">
+        <div class="alert alert-info d-flex gap-2 align-items-start mb-0">
+            <i class="fas fa-info-circle mt-1"></i>
+            <div>
+                <strong>Next steps:</strong> Share the invite link above with your players, then
+                <a href="{{ url_for('admin_login') }}" class="alert-link">log in to your admin dashboard</a>
+                to manage rounds, view picks, and process results.
+            </div>
+        </div>
+    </div>
+
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function () {
+    var btn = document.getElementById('copy-btn');
+    var feedback = document.getElementById('copy-feedback');
+    var link = document.getElementById('invite-link');
+
+    btn.addEventListener('click', function () {
+        navigator.clipboard.writeText(link.value).then(function () {
+            feedback.textContent = 'Copied!';
+            setTimeout(function () { feedback.textContent = ''; }, 2000);
+        }).catch(function () {
+            link.select();
+            document.execCommand('copy');
+            feedback.textContent = 'Copied!';
+            setTimeout(function () { feedback.textContent = ''; }, 2000);
+        });
+    });
+})();
+</script>
+{% endblock %}
