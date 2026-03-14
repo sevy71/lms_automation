@@ -441,6 +441,152 @@ class NotificationOutbox(db.Model):
 
 
 # ---------------------------------------------------------------------------
+# Run Timeline — Automation runs, decisions, actions, checkpoints, audit
+# ---------------------------------------------------------------------------
+
+class AutomationRun(db.Model):
+    """
+    One execution of the automation engine (scheduler job or manual trigger).
+
+    Every significant automated or manual run should create a record here so
+    admins can audit what happened and, when needed, roll back or replay.
+    """
+    __tablename__ = 'automation_runs'
+
+    id = db.Column(db.Integer, primary_key=True)
+    run_id = db.Column(db.String(36), nullable=False, unique=True, index=True)  # UUID
+    organiser_id = db.Column(db.Integer, db.ForeignKey('organisers.id'),
+                             nullable=True, index=True)
+    started_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    completed_at = db.Column(db.DateTime, nullable=True)
+    trigger_type = db.Column(db.String(20), nullable=False, default='scheduler')  # scheduler/manual/api
+    mode = db.Column(db.String(10), nullable=False, default='auto')  # auto/manual
+    # running / success / warn / failed / rolled-back
+    status = db.Column(db.String(20), nullable=False, default='running', index=True)
+    total_actions = db.Column(db.Integer, nullable=False, default=0)
+    affected_players = db.Column(db.Integer, nullable=False, default=0)
+    affected_rounds = db.Column(db.Integer, nullable=False, default=0)
+    affected_reminders = db.Column(db.Integer, nullable=False, default=0)
+    error_info = db.Column(db.Text, nullable=True)
+
+    decisions = db.relationship('RunDecision', backref='run', lazy='dynamic',
+                                cascade='all, delete-orphan')
+    actions = db.relationship('RunAction', backref='run', lazy='dynamic',
+                              cascade='all, delete-orphan')
+    checkpoints = db.relationship('RunCheckpoint', backref='run', lazy='dynamic')
+
+    def __repr__(self):
+        return f'<AutomationRun {self.run_id} status={self.status}>'
+
+
+class RunDecision(db.Model):
+    """
+    A single decision recorded before a critical action is applied.
+
+    Captures the rule that matched, reasoning, confidence, and expected impact
+    so admins understand *why* the automation did what it did.
+    """
+    __tablename__ = 'run_decisions'
+
+    id = db.Column(db.Integer, primary_key=True)
+    run_id_fk = db.Column(db.Integer, db.ForeignKey('automation_runs.id'),
+                          nullable=False, index=True)
+    step_number = db.Column(db.Integer, nullable=False)
+    title = db.Column(db.String(200), nullable=False)
+    rule_matched = db.Column(db.String(200), nullable=True)
+    reasoning = db.Column(db.Text, nullable=True)
+    confidence = db.Column(db.String(20), nullable=True)  # high / medium / low
+    intended_action = db.Column(db.String(200), nullable=True)
+    expected_impact = db.Column(db.Text, nullable=True)
+    state = db.Column(db.String(20), nullable=False, default='applied')  # applied / skipped
+    decided_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+
+    actions = db.relationship('RunAction', backref='decision', lazy='dynamic')
+
+    def __repr__(self):
+        return f'<RunDecision step={self.step_number} state={self.state}>'
+
+
+class RunAction(db.Model):
+    """
+    The persisted outcome of applying (or skipping) a decision.
+
+    Written after the operation completes so it reflects actual impact.
+    """
+    __tablename__ = 'run_actions'
+
+    id = db.Column(db.Integer, primary_key=True)
+    run_id_fk = db.Column(db.Integer, db.ForeignKey('automation_runs.id'),
+                          nullable=False, index=True)
+    decision_id = db.Column(db.Integer, db.ForeignKey('run_decisions.id'),
+                            nullable=True, index=True)
+    action_type = db.Column(db.String(100), nullable=False)
+    # applied / skipped / failed / reverted
+    outcome = db.Column(db.String(20), nullable=False, default='applied')
+    actual_impact = db.Column(db.Text, nullable=True)
+    actor = db.Column(db.String(100), nullable=False, default='system')
+    reversible = db.Column(db.Boolean, nullable=False, default=True)
+    reversal_metadata = db.Column(db.Text, nullable=True)  # JSON blob
+    executed_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+
+    def __repr__(self):
+        return f'<RunAction type={self.action_type} outcome={self.outcome}>'
+
+
+class RunCheckpoint(db.Model):
+    """
+    Point-in-time snapshot of critical game state.
+
+    Created before each critical transition (round completion, eliminations,
+    bulk reminders, auto-pick application) and at run start/end.
+
+    The snapshot JSON stores enough state to restore the game safely:
+      - round statuses and special_note markers
+      - player statuses (active/eliminated/winner)
+      - picks for current rounds (is_winner, is_eliminated, team_picked)
+      - pick token validity flags
+      - relevant config flags
+    """
+    __tablename__ = 'run_checkpoints'
+
+    id = db.Column(db.Integer, primary_key=True)
+    checkpoint_id = db.Column(db.String(36), nullable=False, unique=True, index=True)
+    run_id_fk = db.Column(db.Integer, db.ForeignKey('automation_runs.id'),
+                          nullable=True, index=True)
+    organiser_id = db.Column(db.Integer, db.ForeignKey('organisers.id'),
+                             nullable=True, index=True)
+    label = db.Column(db.String(200), nullable=False)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    snapshot = db.Column(db.Text, nullable=False)  # JSON state snapshot
+
+    def __repr__(self):
+        return f'<RunCheckpoint {self.checkpoint_id} label={self.label!r}>'
+
+
+class RunAuditEvent(db.Model):
+    """
+    Immutable append-only audit log for run timeline events.
+
+    Rollbacks and replays are written here as new events — history is never
+    mutated.  Indexed by run_id (string UUID) so events survive if their
+    parent AutomationRun row is ever archived.
+    """
+    __tablename__ = 'run_audit_events'
+
+    id = db.Column(db.Integer, primary_key=True)
+    run_id = db.Column(db.String(36), nullable=True, index=True)  # UUID string ref
+    organiser_id = db.Column(db.Integer, db.ForeignKey('organisers.id'),
+                             nullable=True, index=True)
+    event_type = db.Column(db.String(100), nullable=False)
+    actor = db.Column(db.String(100), nullable=False, default='system')
+    details = db.Column(db.Text, nullable=True)  # JSON
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+
+    def __repr__(self):
+        return f'<RunAuditEvent type={self.event_type} run={self.run_id}>'
+
+
+# ---------------------------------------------------------------------------
 # Season helpers (required by lms_automation.app)
 # ---------------------------------------------------------------------------
 

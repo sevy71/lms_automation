@@ -15,7 +15,7 @@ from __future__ import annotations
 import logging
 import traceback
 
-from flask import Blueprint, request, jsonify, current_app
+from flask import Blueprint, request, jsonify, current_app, session
 
 from lms_automation.models import db, Round, Fixture, Pick, Player
 from lms_automation.team_utils import normalize_team_name
@@ -27,6 +27,7 @@ from lms_automation.services.round_lifecycle import (
 )
 from lms_automation.routes.utils import admin_required
 from lms_automation.services.audit import log_admin_action
+from lms_automation.services.timeline_context import TimelineContext
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +71,16 @@ def manual_process_results():
     logger.info("=" * 60)
     logger.info("=== MANUAL PROCESS RESULTS START ===")
     logger.info("=" * 60)
+
+    actor = f"admin:{session.get('admin_user_id', 'unknown')}"
+    _tl = TimelineContext(
+        'manual_process_results',
+        trigger_type='manual',
+        mode='manual',
+        organiser_id=session.get('organiser_id'),
+        actor=actor,
+    )
+    _tl.__enter__()
 
     try:
         update_fixtures = request.args.get("update_fixtures", "0") in ("1", "true", "True")
@@ -281,6 +292,28 @@ def manual_process_results():
             round_result["status"] = "completed"
             add_marker(round_obj, "results_sent")
 
+            _tl.checkpoint(f'before_elim_manual_r{round_obj.round_number}')
+            _tl.decision(
+                title=f'Manual process results Round {round_obj.round_number}',
+                rule_matched='admin_triggered_manual_processing',
+                reasoning=f'{len(round_result["eliminations"])} eliminated, {len(round_result["winners"])} winners',
+                confidence='high',
+                intended_action='mark_round_completed_update_players',
+                expected_impact=f'{len(round_result["eliminations"])} player(s) eliminated',
+                actor=actor,
+            )
+            _tl.action(
+                action_type='round_completed_manual',
+                outcome='applied',
+                actual_impact=(
+                    f'round_id={round_obj.id} r{round_obj.round_number}: '
+                    f'eliminated={len(round_result["eliminations"])} winners={len(round_result["winners"])}'
+                ),
+                actor=actor,
+                reversible=True,
+                players_delta=len(round_result["eliminations"]),
+                rounds_delta=1,
+            )
             result["rounds_processed"].append(round_result)
             logger.info(
                 "Round %s: COMPLETED (winners=%s, eliminated=%s)",
@@ -325,12 +358,14 @@ def manual_process_results():
             fixture_updates=result["summary"]["fixture_updates"],
             last_game_state=result["summary"]["last_game_state"],
         )
+        _tl.__exit__(None, None, None)
         return jsonify(result)
 
     except Exception as e:
         logger.error("Error in manual_process_results: %s\n%s", e, traceback.format_exc())
         log_admin_action("process_results", "failure", error=str(e))
         db.session.rollback()
+        _tl.__exit__(type(e), e, e.__traceback__)
         return jsonify({"success": False, "error": str(e)}), 500
 
 
@@ -352,15 +387,27 @@ def finalize_round():
 
     Request body: {"round_id": <int>}
     """
+    actor = f"admin:{session.get('admin_user_id', 'unknown')}"
+    _tl = TimelineContext(
+        'finalize_round',
+        trigger_type='manual',
+        mode='manual',
+        organiser_id=session.get('organiser_id'),
+        actor=actor,
+    )
+    _tl.__enter__()
+
     try:
         data = request.get_json(silent=True) or {}
         round_id = data.get("round_id")
 
         if not round_id:
+            _tl.__exit__(None, None, None)
             return jsonify({"success": False, "error": "round_id is required"}), 400
 
         round_obj = Round.query.get(round_id)
         if not round_obj:
+            _tl.__exit__(None, None, None)
             return jsonify({"success": False, "error": f"Round {round_id} not found"}), 404
 
         logger.info(
@@ -452,11 +499,32 @@ def finalize_round():
                     "team_picked": pick.team_picked,
                 })
 
+        _tl.checkpoint(f'before_finalize_r{round_obj.round_number}')
+        _tl.decision(
+            title=f'Finalize Round {round_obj.round_number}',
+            rule_matched='admin_triggered_finalize',
+            reasoning=f'{len(eliminations)} to eliminate, {len(survivors)} survivors',
+            confidence='high',
+            intended_action='mark_completed_evaluate_game_state',
+            expected_impact=f'{len(eliminations)} player(s) eliminated',
+        )
         round_obj.status = "completed"
         if not already_finalized:
             add_marker(round_obj, "results_sent")
 
         db.session.commit()
+        _tl.action(
+            action_type='round_finalized',
+            outcome='applied',
+            actual_impact=(
+                f'round_id={round_obj.id} r{round_obj.round_number}: '
+                f'eliminated={len(eliminations)} survivors={len(survivors)}'
+            ),
+            actor=actor,
+            reversible=True,
+            players_delta=len(eliminations),
+            rounds_delta=1,
+        )
 
         outcome = evaluate_game_state_after_round(
             round_obj, announce_callback=_get_announce_callback()
@@ -470,6 +538,7 @@ def finalize_round():
             eliminations=len(eliminations),
             survivors=len(survivors),
         )
+        _tl.__exit__(None, None, None)
 
         new_round_created = False
         new_cycle_number = round_obj.cycle_number or 1
@@ -508,6 +577,7 @@ def finalize_round():
         logger.error("Error in finalize_round: %s\n%s", e, traceback.format_exc())
         log_admin_action("finalize_round", "failure", error=str(e))
         db.session.rollback()
+        _tl.__exit__(type(e), e, e.__traceback__)
         return jsonify({"success": False, "error": str(e)}), 500
 
 

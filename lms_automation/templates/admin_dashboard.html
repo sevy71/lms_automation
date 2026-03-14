@@ -65,6 +65,16 @@
       </span>
     </div>
 
+    {# View Timeline — primary entry point #}
+    <button class="btn btn-outline-primary btn-sm"
+            data-bs-toggle="offcanvas"
+            data-bs-target="#runTimelinePanel"
+            aria-controls="runTimelinePanel"
+            data-testid="view-run-timeline-button"
+            title="View Run Timeline">
+      <i class="fas fa-history me-1"></i><span class="d-none d-sm-inline">View Timeline</span>
+    </button>
+
     {# Header utility actions #}
     <button class="btn btn-outline-secondary btn-sm" data-bs-toggle="modal"
             data-bs-target="#changePasswordModal" title="Change Password">
@@ -183,6 +193,16 @@
           </button>
         </div>
       {% endif %}
+
+      <div class="col-6 col-sm-4 col-lg-2">
+        <button class="btn btn-outline-secondary w-100 fallback-btn"
+                data-bs-toggle="offcanvas"
+                data-bs-target="#runTimelinePanel"
+                aria-controls="runTimelinePanel"
+                data-testid="open-run-timeline-link">
+          <i class="fas fa-history"></i>Open Run Timeline
+        </button>
+      </div>
 
     </div>
   </div>
@@ -1842,4 +1862,692 @@ document.addEventListener('DOMContentLoaded', function () {
 
 }); // end DOMContentLoaded
 </script>
+
+
+{# ═══════════════════════════════════════════════════════════════════════
+   RUN TIMELINE — Bootstrap Offcanvas panel (right-side on desktop,
+   full-screen on mobile).  All data is fetched on open.
+   ═══════════════════════════════════════════════════════════════════════ #}
+
+<div class="offcanvas offcanvas-end timeline-offcanvas"
+     tabindex="-1"
+     id="runTimelinePanel"
+     aria-labelledby="runTimelinePanelLabel"
+     data-testid="run-timeline-panel">
+
+  <div class="offcanvas-header border-bottom">
+    <div>
+      <h5 class="offcanvas-title mb-1" id="runTimelinePanelLabel">
+        <i class="fas fa-history me-2 text-primary"></i>Run Timeline
+      </h5>
+      <div data-testid="run-timeline-header" class="d-flex align-items-center gap-2 small">
+        <span id="tlModeBadge" class="badge bg-secondary">
+          {% if game_state_info.manual_mode %}Manual Mode{% else %}Automation ON{% endif %}
+        </span>
+        <span class="text-muted" id="tlLastRunTs">—</span>
+      </div>
+    </div>
+    <button type="button" class="btn-close" data-bs-dismiss="offcanvas" aria-label="Close"></button>
+  </div>
+
+  <div class="offcanvas-body p-0">
+
+    {# Tabs #}
+    <ul class="nav nav-tabs px-3 pt-2 border-bottom" id="timelineTabs" role="tablist">
+      <li class="nav-item" role="presentation">
+        <button class="nav-link active" data-bs-toggle="tab" data-bs-target="#tlRunsTab"
+                type="button" role="tab">Runs</button>
+      </li>
+      <li class="nav-item" role="presentation">
+        <button class="nav-link" data-bs-toggle="tab" data-bs-target="#tlCheckpointsTab"
+                type="button" role="tab">Checkpoints</button>
+      </li>
+      <li class="nav-item" role="presentation">
+        <button class="nav-link" data-bs-toggle="tab" data-bs-target="#tlAuditTab"
+                type="button" role="tab">Audit Log</button>
+      </li>
+    </ul>
+
+    <div class="tab-content overflow-auto" style="height:calc(100vh - 190px)">
+
+      {# ── Runs tab ────────────────────────────────────────────── #}
+      <div class="tab-pane fade show active p-3" id="tlRunsTab" role="tabpanel">
+
+        {# Latest run summary card #}
+        <div class="card mb-3 border-0 bg-light" data-testid="latest-run-summary" id="tlLatestRunCard">
+          <div class="card-body p-3">
+            <div class="text-muted small mb-1">Latest Run</div>
+            <div id="tlLatestRunContent" class="text-muted small">Loading…</div>
+          </div>
+        </div>
+
+        {# Decision steps for the latest run #}
+        <div id="tlDecisionSteps" class="mb-3"></div>
+
+        {# Rollback quick actions #}
+        <div class="d-flex flex-wrap gap-2 mb-3">
+          <button class="btn btn-outline-warning btn-sm"
+                  data-testid="rollback-last-action-button"
+                  id="tlRollbackLastActionBtn">
+            <i class="fas fa-undo me-1"></i>Rollback Last Action
+          </button>
+          <button class="btn btn-outline-danger btn-sm"
+                  data-testid="rollback-last-run-button"
+                  id="tlRollbackLastRunBtn">
+            <i class="fas fa-history me-1"></i>Rollback Last Run
+          </button>
+        </div>
+
+        {# All runs list #}
+        <h6 class="text-muted small text-uppercase mb-2">All Recent Runs</h6>
+        <div id="tlRunsList">
+          <div class="text-muted small">Loading…</div>
+        </div>
+
+      </div>{# end Runs tab #}
+
+
+      {# ── Checkpoints tab ─────────────────────────────────────── #}
+      <div class="tab-pane fade p-3" id="tlCheckpointsTab" role="tabpanel">
+
+        <div class="d-flex justify-content-between align-items-center mb-3">
+          <h6 class="mb-0 text-muted small text-uppercase">Saved Checkpoints</h6>
+          <button class="btn btn-outline-secondary btn-sm" id="tlCreateCheckpointBtn">
+            <i class="fas fa-plus me-1"></i>Save Now
+          </button>
+        </div>
+
+        <div id="tlCheckpointsList">
+          <div class="text-muted small">Loading…</div>
+        </div>
+
+      </div>{# end Checkpoints tab #}
+
+
+      {# ── Audit Log tab ───────────────────────────────────────── #}
+      <div class="tab-pane fade p-3" id="tlAuditTab" role="tabpanel">
+
+        <div class="d-flex gap-2 mb-3 flex-wrap">
+          <input type="text" class="form-control form-control-sm" id="tlAuditFilterRun"
+                 placeholder="Filter by Run ID" style="max-width:160px">
+          <select class="form-select form-select-sm" id="tlAuditFilterType" style="max-width:160px">
+            <option value="">All event types</option>
+            <option value="run_started">run_started</option>
+            <option value="run_completed">run_completed</option>
+            <option value="checkpoint_created">checkpoint_created</option>
+            <option value="rollback_applied">rollback_applied</option>
+            <option value="replay_dry_run">replay_dry_run</option>
+            <option value="replay_applied">replay_applied</option>
+          </select>
+          <button class="btn btn-outline-secondary btn-sm" id="tlAuditRefreshBtn">
+            <i class="fas fa-sync"></i>
+          </button>
+        </div>
+
+        <div id="tlAuditLog" data-testid="timeline-audit-log">
+          <div class="text-muted small">Loading…</div>
+        </div>
+
+      </div>{# end Audit tab #}
+
+    </div>{# end tab-content #}
+
+  </div>{# end offcanvas-body #}
+</div>{# end offcanvas #}
+
+
+{# ── Rollback confirmation modal ──────────────────────────────────────── #}
+<div class="modal fade" id="tlRollbackModal" tabindex="-1" aria-labelledby="tlRollbackModalLabel">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title" id="tlRollbackModalLabel">
+          <i class="fas fa-exclamation-triangle me-2 text-warning"></i>Confirm Rollback
+        </h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body">
+        <p id="tlRollbackDescription" class="mb-2"></p>
+        <div id="tlRollbackImpactPreview" class="alert alert-warning small d-none"></div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+        <button type="button" class="btn btn-danger" id="tlRollbackConfirmBtn"
+                data-testid="confirm-rollback-submit">
+          <i class="fas fa-undo me-1"></i>Confirm Rollback
+        </button>
+      </div>
+    </div>
+  </div>
+</div>
+
+
+{# ── Replay confirmation modal ────────────────────────────────────────── #}
+<div class="modal fade" id="tlReplayModal" tabindex="-1" aria-labelledby="tlReplayModalLabel">
+  <div class="modal-dialog modal-lg">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title" id="tlReplayModalLabel">
+          <i class="fas fa-redo me-2 text-primary"></i>Replay from Checkpoint
+        </h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body">
+        <p id="tlReplayDescription" class="mb-2"></p>
+        <div id="tlReplayPreviewResult" class="d-none">
+          <h6 class="small text-uppercase text-muted">Dry-Run Preview</h6>
+          <pre id="tlReplayPreviewContent" class="bg-light p-2 rounded small"
+               style="white-space:pre-wrap;max-height:200px;overflow-y:auto"></pre>
+        </div>
+      </div>
+      <div class="modal-footer flex-wrap gap-2">
+        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+        <button type="button" class="btn btn-outline-primary" id="tlReplayDryRunBtn">
+          <i class="fas fa-eye me-1"></i>Dry Run Preview
+        </button>
+        <button type="button" class="btn btn-primary" id="tlReplayApplyBtn"
+                data-testid="confirm-replay-submit">
+          <i class="fas fa-play me-1"></i>Apply Replay
+        </button>
+      </div>
+    </div>
+  </div>
+</div>
+
+
+<style>
+/* ── Run Timeline Offcanvas ──────────────────────────────────────────────── */
+.timeline-offcanvas {
+  width: 520px;
+  max-width: 100vw;
+}
+@media (max-width: 576px) {
+  .timeline-offcanvas {
+    width: 100vw;
+  }
+}
+
+/* Status colour helpers */
+.tl-status-success  { color: var(--bs-success); }
+.tl-status-warn     { color: var(--bs-warning); }
+.tl-status-failed   { color: var(--bs-danger);  }
+.tl-status-running  { color: var(--bs-info);    }
+.tl-status-rolled-back { color: var(--bs-secondary); }
+
+.tl-confidence-high   { color: var(--bs-success); }
+.tl-confidence-medium { color: var(--bs-warning); }
+.tl-confidence-low    { color: var(--bs-danger);  }
+
+.tl-decision-card {
+  border-left: 3px solid var(--bs-border-color);
+  padding: 8px 12px;
+  margin-bottom: 8px;
+  border-radius: 0 4px 4px 0;
+  background: var(--bs-light);
+  font-size: .85rem;
+}
+.tl-decision-card.applied  { border-left-color: var(--bs-success); }
+.tl-decision-card.skipped  { border-left-color: var(--bs-secondary); }
+
+.tl-checkpoint-item {
+  border: 1px solid var(--bs-border-color);
+  border-radius: 6px;
+  padding: 10px 12px;
+  margin-bottom: 8px;
+  font-size: .85rem;
+}
+
+.tl-audit-row {
+  border-bottom: 1px solid var(--bs-border-color);
+  padding: 6px 0;
+  font-size: .82rem;
+}
+.tl-audit-row:last-child { border-bottom: none; }
+
+/* Ensure touch targets are at least 44px */
+.timeline-offcanvas .btn { min-height: 44px; }
+.timeline-offcanvas .nav-link { min-height: 44px; display:flex; align-items:center; }
+</style>
+
+
+<script>
+/* ── Run Timeline Panel JavaScript ───────────────────────────────────── */
+(function () {
+  'use strict';
+
+  // ── State ──────────────────────────────────────────────────────────────
+  let _csrfToken = null;
+  let _currentRunId = null;
+  let _activeCheckpointId = null;
+  let _activeRollbackType = null; // 'last-action' | 'last-run' | 'checkpoint'
+
+  function getCsrf() {
+    if (_csrfToken) return _csrfToken;
+    _csrfToken = document.querySelector('meta[name="csrf-token"]')?.content || '';
+    return _csrfToken;
+  }
+
+  async function apiGet(path) {
+    const r = await fetch(path, { credentials: 'same-origin' });
+    return r.json();
+  }
+
+  async function apiPost(path, body) {
+    const r = await fetch(path, {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-CSRF-Token': getCsrf(),
+      },
+      body: JSON.stringify(body || {}),
+    });
+    return r.json();
+  }
+
+  // ── Colour helpers ─────────────────────────────────────────────────────
+  const STATUS_CLASS = {
+    success: 'success', warn: 'warning', failed: 'danger',
+    running: 'info', 'rolled-back': 'secondary',
+  };
+  const CONF_CLASS = { high: 'success', medium: 'warning', low: 'danger' };
+
+  function statusBadge(s) {
+    const cls = STATUS_CLASS[s] || 'secondary';
+    return `<span class="badge bg-${cls}">${s || '—'}</span>`;
+  }
+
+  function fmtTs(iso) {
+    if (!iso) return '—';
+    return new Date(iso).toLocaleString(undefined, {
+      dateStyle: 'short', timeStyle: 'short',
+    });
+  }
+
+  // ── Render: Latest run summary ─────────────────────────────────────────
+  function renderLatestRun(runs) {
+    const el = document.getElementById('tlLatestRunContent');
+    if (!runs || !runs.length) {
+      el.innerHTML = '<em>No runs recorded yet.</em>';
+      document.getElementById('tlLastRunTs').textContent = '—';
+      return;
+    }
+    const r = runs[0];
+    _currentRunId = r.run_id;
+    document.getElementById('tlLastRunTs').textContent = 'Last run: ' + fmtTs(r.completed_at || r.started_at);
+    el.innerHTML = `
+      <div class="d-flex flex-wrap gap-2 mb-1">
+        <span class="text-muted">ID:</span> <code class="small">${r.run_id.slice(0, 8)}…</code>
+        ${statusBadge(r.status)}
+        <span class="badge bg-secondary">${r.trigger_type}</span>
+        <span class="badge bg-secondary">${r.mode}</span>
+      </div>
+      <div class="d-flex flex-wrap gap-3 small text-muted">
+        <span><i class="fas fa-bolt me-1"></i>${r.total_actions} actions</span>
+        <span><i class="fas fa-users me-1"></i>${r.affected_players} players</span>
+        <span><i class="fas fa-layer-group me-1"></i>${r.affected_rounds} rounds</span>
+        <span><i class="fas fa-bell me-1"></i>${r.affected_reminders} reminders</span>
+      </div>
+      ${r.error_info ? `<div class="text-danger small mt-1"><i class="fas fa-exclamation-circle me-1"></i>${r.error_info}</div>` : ''}
+    `;
+    loadDecisionSteps(r.run_id);
+  }
+
+  // ── Render: Decision steps ─────────────────────────────────────────────
+  async function loadDecisionSteps(runId) {
+    const el = document.getElementById('tlDecisionSteps');
+    el.innerHTML = '<div class="text-muted small">Loading decisions…</div>';
+    try {
+      const data = await apiGet(`/api/admin/timeline/runs/${runId}`);
+      if (!data.success) { el.innerHTML = ''; return; }
+      const decisions = data.run.decisions || [];
+      if (!decisions.length) { el.innerHTML = ''; return; }
+      el.innerHTML = '<h6 class="text-muted small text-uppercase mb-2">Decision Steps</h6>' +
+        decisions.map((d, i) => `
+          <div class="tl-decision-card ${d.state}" data-testid="decision-step-${i}">
+            <div class="d-flex justify-content-between align-items-start">
+              <strong class="small">Step ${d.step_number}: ${d.title}</strong>
+              <span class="badge ${d.state === 'applied' ? 'bg-success' : 'bg-secondary'} ms-1">${d.state}</span>
+            </div>
+            ${d.rule_matched ? `<div class="text-muted mt-1"><i class="fas fa-gavel me-1"></i>${d.rule_matched}</div>` : ''}
+            ${d.reasoning ? `<div class="mt-1">${d.reasoning}</div>` : ''}
+            <div class="d-flex gap-2 mt-1 flex-wrap">
+              ${d.confidence ? `<span class="small tl-confidence-${d.confidence}"><i class="fas fa-tachometer-alt me-1"></i>${d.confidence} confidence</span>` : ''}
+              ${d.expected_impact ? `<span class="small text-muted">${d.expected_impact}</span>` : ''}
+              <span class="small text-muted">${fmtTs(d.decided_at)}</span>
+            </div>
+          </div>
+        `).join('');
+    } catch (e) {
+      el.innerHTML = '';
+    }
+  }
+
+  // ── Render: All runs list ──────────────────────────────────────────────
+  function renderRunsList(runs) {
+    const el = document.getElementById('tlRunsList');
+    if (!runs || !runs.length) {
+      el.innerHTML = '<div class="text-muted small">No runs yet.</div>';
+      return;
+    }
+    el.innerHTML = runs.map(r => `
+      <div class="border rounded p-2 mb-2 small">
+        <div class="d-flex justify-content-between align-items-center">
+          <div>
+            <code class="small">${r.run_id.slice(0, 8)}…</code>
+            ${statusBadge(r.status)}
+            <span class="badge bg-secondary">${r.trigger_type}</span>
+          </div>
+          <span class="text-muted">${fmtTs(r.completed_at || r.started_at)}</span>
+        </div>
+        <div class="text-muted mt-1">
+          ${r.total_actions} actions · ${r.affected_players} players · ${r.affected_rounds} rounds
+        </div>
+      </div>
+    `).join('');
+  }
+
+  // ── Render: Checkpoints ────────────────────────────────────────────────
+  function renderCheckpoints(checkpoints) {
+    const el = document.getElementById('tlCheckpointsList');
+    if (!checkpoints || !checkpoints.length) {
+      el.innerHTML = '<div class="text-muted small">No checkpoints yet. Run the automation or save manually.</div>';
+      return;
+    }
+    el.innerHTML = checkpoints.map(cp => `
+      <div class="tl-checkpoint-item" data-testid="checkpoint-item-${cp.checkpoint_id}">
+        <div class="d-flex justify-content-between align-items-start mb-1">
+          <div>
+            <strong class="small">${cp.label}</strong><br>
+            <code class="small text-muted">${cp.checkpoint_id.slice(0, 8)}…</code>
+          </div>
+          <span class="text-muted small">${fmtTs(cp.created_at)}</span>
+        </div>
+        <div class="text-muted small mb-2">${cp.snapshot_summary}</div>
+        <div class="d-flex flex-wrap gap-2">
+          <button class="btn btn-outline-warning btn-sm tl-cp-rollback"
+                  data-id="${cp.checkpoint_id}"
+                  data-label="${cp.label}"
+                  data-testid="rollback-checkpoint-button-${cp.checkpoint_id}"
+                  style="min-height:44px">
+            <i class="fas fa-undo me-1"></i>Rollback
+          </button>
+          <button class="btn btn-outline-info btn-sm tl-cp-dry-run"
+                  data-id="${cp.checkpoint_id}"
+                  data-label="${cp.label}"
+                  data-testid="replay-dry-run-button-${cp.checkpoint_id}"
+                  style="min-height:44px">
+            <i class="fas fa-eye me-1"></i>Dry Run
+          </button>
+          <button class="btn btn-outline-primary btn-sm tl-cp-apply"
+                  data-id="${cp.checkpoint_id}"
+                  data-label="${cp.label}"
+                  data-testid="replay-apply-button-${cp.checkpoint_id}"
+                  style="min-height:44px">
+            <i class="fas fa-play me-1"></i>Apply Replay
+          </button>
+        </div>
+      </div>
+    `).join('');
+  }
+
+  // ── Render: Audit log ──────────────────────────────────────────────────
+  function renderAuditLog(events) {
+    const el = document.getElementById('tlAuditLog');
+    if (!events || !events.length) {
+      el.innerHTML = '<div class="text-muted small">No events recorded yet.</div>';
+      return;
+    }
+    const TYPE_ICON = {
+      run_started: 'fa-play text-info',
+      run_completed: 'fa-check text-success',
+      checkpoint_created: 'fa-camera text-primary',
+      rollback_applied: 'fa-undo text-warning',
+      rollback_failed: 'fa-times text-danger',
+      replay_dry_run: 'fa-eye text-info',
+      replay_applied: 'fa-redo text-primary',
+      replay_failed: 'fa-times text-danger',
+    };
+    el.innerHTML = events.map(e => {
+      const icon = TYPE_ICON[e.event_type] || 'fa-circle text-secondary';
+      return `
+        <div class="tl-audit-row">
+          <div class="d-flex justify-content-between align-items-start">
+            <span><i class="fas ${icon} me-2"></i><strong>${e.event_type}</strong>
+              <span class="text-muted ms-1">by ${e.actor}</span></span>
+            <span class="text-muted">${fmtTs(e.created_at)}</span>
+          </div>
+          ${e.run_id ? `<div class="text-muted small">Run: <code>${e.run_id.slice(0,8)}…</code></div>` : ''}
+        </div>
+      `;
+    }).join('');
+  }
+
+  // ── Load all panel data ────────────────────────────────────────────────
+  async function loadTimeline() {
+    try {
+      const [runsData, cpData, auditData] = await Promise.all([
+        apiGet('/api/admin/timeline/runs?limit=20'),
+        apiGet('/api/admin/timeline/checkpoints?limit=20'),
+        apiGet('/api/admin/timeline/audit?limit=50'),
+      ]);
+      if (runsData.success) {
+        renderLatestRun(runsData.runs);
+        renderRunsList(runsData.runs);
+      }
+      if (cpData.success) renderCheckpoints(cpData.checkpoints);
+      if (auditData.success) renderAuditLog(auditData.events);
+    } catch (e) {
+      console.error('Timeline load error', e);
+    }
+  }
+
+  // ── Rollback flow ──────────────────────────────────────────────────────
+  function openRollbackModal(description, type, checkpointId) {
+    _activeRollbackType = type;
+    _activeCheckpointId = checkpointId || null;
+    document.getElementById('tlRollbackDescription').textContent = description;
+    document.getElementById('tlRollbackImpactPreview').classList.add('d-none');
+    const modal = new bootstrap.Modal(document.getElementById('tlRollbackModal'));
+    modal.show();
+  }
+
+  async function executeRollback() {
+    const btn = document.getElementById('tlRollbackConfirmBtn');
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>Rolling back…';
+    try {
+      let result;
+      if (_activeRollbackType === 'last-action') {
+        result = await apiPost('/api/admin/timeline/rollback/last-action');
+      } else if (_activeRollbackType === 'last-run') {
+        result = await apiPost('/api/admin/timeline/rollback/last-run');
+      } else {
+        result = await apiPost(`/api/admin/timeline/rollback/checkpoint/${_activeCheckpointId}`);
+      }
+      bootstrap.Modal.getInstance(document.getElementById('tlRollbackModal')).hide();
+      if (result.success) {
+        const imp = result.impact || {};
+        showToast('success', `Rollback applied: ${imp.players_reverted||0} players, ${imp.rounds_reverted||0} rounds, ${imp.picks_reverted||0} picks reverted.`);
+        loadTimeline();
+      } else {
+        showToast('danger', result.error || 'Rollback failed');
+      }
+    } finally {
+      btn.disabled = false;
+      btn.innerHTML = '<i class="fas fa-undo me-1"></i>Confirm Rollback';
+    }
+  }
+
+  // ── Replay flow ────────────────────────────────────────────────────────
+  function openReplayModal(checkpointId, label) {
+    _activeCheckpointId = checkpointId;
+    document.getElementById('tlReplayDescription').textContent =
+      `Replay from checkpoint "${label}" (${checkpointId.slice(0,8)}…)`;
+    document.getElementById('tlReplayPreviewResult').classList.add('d-none');
+    document.getElementById('tlReplayPreviewContent').textContent = '';
+    const modal = new bootstrap.Modal(document.getElementById('tlReplayModal'));
+    modal.show();
+  }
+
+  async function executeDryRun() {
+    const btn = document.getElementById('tlReplayDryRunBtn');
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>Running preview…';
+    try {
+      const result = await apiPost(`/api/admin/timeline/replay/dry-run/${_activeCheckpointId}`);
+      if (result.success) {
+        const prev = result.preview || {};
+        document.getElementById('tlReplayPreviewContent').textContent =
+          JSON.stringify(prev, null, 2);
+        document.getElementById('tlReplayPreviewResult').classList.remove('d-none');
+      } else {
+        showToast('danger', result.error || 'Dry run failed');
+      }
+    } finally {
+      btn.disabled = false;
+      btn.innerHTML = '<i class="fas fa-eye me-1"></i>Dry Run Preview';
+    }
+  }
+
+  async function executeReplayApply() {
+    const btn = document.getElementById('tlReplayApplyBtn');
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>Applying…';
+    try {
+      const result = await apiPost(`/api/admin/timeline/replay/apply/${_activeCheckpointId}`);
+      bootstrap.Modal.getInstance(document.getElementById('tlReplayModal')).hide();
+      if (result.success) {
+        showToast('success', `Replay applied. New run: ${(result.new_run_id||'').slice(0,8)}…`);
+        loadTimeline();
+      } else {
+        showToast('danger', result.error || 'Replay failed');
+      }
+    } finally {
+      btn.disabled = false;
+      btn.innerHTML = '<i class="fas fa-play me-1"></i>Apply Replay';
+    }
+  }
+
+  // ── Toast helper (reuse existing or create simple one) ─────────────────
+  function showToast(type, message) {
+    // Try to reuse any existing toast container on the page
+    let container = document.getElementById('tlToastContainer');
+    if (!container) {
+      container = document.createElement('div');
+      container.id = 'tlToastContainer';
+      container.className = 'toast-container position-fixed bottom-0 end-0 p-3';
+      container.style.zIndex = '1100';
+      document.body.appendChild(container);
+    }
+    const id = 'tl-toast-' + Date.now();
+    container.insertAdjacentHTML('beforeend', `
+      <div id="${id}" class="toast align-items-center text-bg-${type} border-0" role="alert">
+        <div class="d-flex">
+          <div class="toast-body">${message}</div>
+          <button type="button" class="btn-close btn-close-white me-2 m-auto" data-bs-dismiss="toast"></button>
+        </div>
+      </div>
+    `);
+    const t = new bootstrap.Toast(document.getElementById(id), { delay: 5000 });
+    t.show();
+  }
+
+  // ── Audit log filter + refresh ──────────────────────────────────────────
+  async function loadAuditWithFilters() {
+    const runId = document.getElementById('tlAuditFilterRun')?.value.trim() || '';
+    const type = document.getElementById('tlAuditFilterType')?.value || '';
+    let url = '/api/admin/timeline/audit?limit=50';
+    if (runId) url += '&run_id=' + encodeURIComponent(runId);
+    if (type) url += '&event_type=' + encodeURIComponent(type);
+    try {
+      const data = await apiGet(url);
+      if (data.success) renderAuditLog(data.events);
+    } catch (e) { console.error('Audit filter error', e); }
+  }
+
+  // ── Create manual checkpoint ────────────────────────────────────────────
+  async function createManualCheckpoint() {
+    const btn = document.getElementById('tlCreateCheckpointBtn');
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>';
+    try {
+      const label = 'Manual checkpoint — ' + new Date().toLocaleString();
+      const result = await apiPost('/api/admin/timeline/checkpoints', { label });
+      if (result.success) {
+        showToast('success', 'Checkpoint saved: ' + label);
+        const cpData = await apiGet('/api/admin/timeline/checkpoints?limit=20');
+        if (cpData.success) renderCheckpoints(cpData.checkpoints);
+      } else {
+        showToast('danger', result.error || 'Failed to save checkpoint');
+      }
+    } finally {
+      btn.disabled = false;
+      btn.innerHTML = '<i class="fas fa-plus me-1"></i>Save Now';
+    }
+  }
+
+  // ── Wire up event listeners ─────────────────────────────────────────────
+  document.addEventListener('DOMContentLoaded', function () {
+    const panel = document.getElementById('runTimelinePanel');
+    if (!panel) return;
+
+    // Load data when panel opens
+    panel.addEventListener('show.bs.offcanvas', loadTimeline);
+
+    // Rollback quick action buttons
+    document.getElementById('tlRollbackLastActionBtn')?.addEventListener('click', () => {
+      openRollbackModal(
+        'Roll back the most recent reversible action. This will restore the last checkpoint before it.',
+        'last-action'
+      );
+    });
+    document.getElementById('tlRollbackLastRunBtn')?.addEventListener('click', () => {
+      openRollbackModal(
+        'Roll back the entire last run. Game state will be restored to the start-of-run checkpoint.',
+        'last-run'
+      );
+    });
+
+    // Checkpoint action delegation
+    document.getElementById('tlCheckpointsList')?.addEventListener('click', function (e) {
+      const rollbackBtn = e.target.closest('.tl-cp-rollback');
+      const dryRunBtn   = e.target.closest('.tl-cp-dry-run');
+      const applyBtn    = e.target.closest('.tl-cp-apply');
+      if (rollbackBtn) {
+        openRollbackModal(
+          `Restore game state to checkpoint "${rollbackBtn.dataset.label}" (${rollbackBtn.dataset.id.slice(0,8)}…).`,
+          'checkpoint',
+          rollbackBtn.dataset.id
+        );
+      } else if (dryRunBtn) {
+        openReplayModal(dryRunBtn.dataset.id, dryRunBtn.dataset.label);
+        // Auto-trigger dry run immediately
+        setTimeout(() => executeDryRun(), 300);
+      } else if (applyBtn) {
+        openReplayModal(applyBtn.dataset.id, applyBtn.dataset.label);
+      }
+    });
+
+    // Rollback confirmation
+    document.getElementById('tlRollbackConfirmBtn')?.addEventListener('click', executeRollback);
+
+    // Replay modal actions
+    document.getElementById('tlReplayDryRunBtn')?.addEventListener('click', executeDryRun);
+    document.getElementById('tlReplayApplyBtn')?.addEventListener('click', executeReplayApply);
+
+    // Audit filters
+    document.getElementById('tlAuditRefreshBtn')?.addEventListener('click', loadAuditWithFilters);
+    document.getElementById('tlAuditFilterType')?.addEventListener('change', loadAuditWithFilters);
+
+    // Create manual checkpoint
+    document.getElementById('tlCreateCheckpointBtn')?.addEventListener('click', createManualCheckpoint);
+
+    // Reload audit when switching to audit tab
+    document.querySelector('[data-bs-target="#tlAuditTab"]')?.addEventListener('shown.bs.tab', loadAuditWithFilters);
+  });
+
+}());
+</script>
+
 {% endblock %}
