@@ -11,7 +11,8 @@ States:
 - active       : Round accepting picks; players can submit/edit picks
 - picks_locked : deadline_passed AND (all picks in OR autopick applied); no more edits
                  (tracked via special_note containing 'picks_locked')
-- completed    : All fixtures finished AND eliminations processed
+- completed    : All RELEVANT fixtures finished AND eliminations processed
+                 (relevant = involves a team that at least one player picked)
 
 PHASE MARKERS (in special_note):
 --------------------------------
@@ -765,12 +766,14 @@ class LMSScheduler:
         STATE MACHINE GUARDS (NON-NEGOTIABLE):
         A round is ONLY marked completed when ALL of these are true:
           a) fixtures exist for that round
-          b) all fixtures are completed (status='completed')
+          b) all RELEVANT fixtures are completed — a fixture is "relevant" only if
+             at least one player picked either of its teams.  Fixtures where no
+             player made a selection do NOT block round completion.
           c) picks exist for every eligible player OR deadline passed AND autopick has run
           d) all picks have been evaluated (is_winner is not None)
 
         This job:
-        1. Checks if all fixtures in active rounds are completed
+        1. Checks if all RELEVANT fixtures in active rounds are completed
         2. Validates picks exist for eligible players (or deadline passed)
         3. For each completed round, marks picks with is_winner=False as eliminated
         4. Updates player.status to 'eliminated' for eliminated picks
@@ -848,11 +851,25 @@ class LMSScheduler:
                             logger.info(f"    - {pf.home_team} vs {pf.away_team} (status={pf.status})")
                         continue
 
-                    if pending_fixtures:
-                        logger.info(
-                            f"  Round {round_obj.round_number}: {len(pending_fixtures)} pending fixture(s) "
-                            f"but none involve picked teams - proceeding with round completion"
+                    # Task-5 completion-check log — always emitted so future issues are easy to trace.
+                    relevant_fixtures_total = len([
+                        f for f in fixtures
+                        if normalize_team_name(f.home_team) in picked_teams
+                        or normalize_team_name(f.away_team) in picked_teams
+                    ])
+                    relevant_fixtures_completed = len([
+                        f for f in completed_fixtures
+                        if normalize_team_name(f.home_team) in picked_teams
+                        or normalize_team_name(f.away_team) in picked_teams
+                    ])
+                    logger.info(
+                        f"  Round {round_obj.round_number} completion check: "
+                        f"{relevant_fixtures_completed}/{relevant_fixtures_total} relevant fixtures completed"
+                        + (
+                            f" ({len(pending_fixtures)} non-relevant fixture(s) still pending)"
+                            if pending_fixtures else ""
                         )
+                    )
 
                     # ======== GUARD 3: Check picks exist for eligible players ========
                     eligible_players = self._get_eligible_players_for_round(round_obj)

@@ -5696,6 +5696,47 @@ app.register_blueprint(round_summary_bp)
 from lms_automation.routes.onboarding import onboarding_bp  # noqa: E402
 app.register_blueprint(onboarding_bp)
 
+# ---------------------------------------------------------------------------
+# Auto-start the background scheduler when loaded by Gunicorn / Railway.
+#
+# Why here and not in run_web.py / run_scheduler.py:
+#   Gunicorn calls `lms_automation.app:app` directly — run_web.py is bypassed
+#   entirely.  Placing the startup here ensures the scheduler runs regardless
+#   of which entry-point boots the WSGI app.
+#
+# Guards:
+#   START_SCHEDULER   — set to "false" to disable (tests, CI, or when you
+#                       still want to run run_scheduler.py as a separate
+#                       process in development).  Defaults to "true".
+#   TESTING           — standard Flask/pytest signal; scheduler stays off.
+#   WERKZEUG_RUN_MAIN — Flask's reloader forks a child process and sets this
+#                       var.  We start the scheduler only in the child (the
+#                       actual HTTP server), never in the watcher parent.
+# ---------------------------------------------------------------------------
+def _auto_start_scheduler():
+    """Start the background scheduler once when the WSGI module is loaded."""
+    from lms_automation.scheduler import scheduler as _sched  # local import avoids circular-import risk at module parse time
+    _sched.init_app(app)
+    with app.app_context():
+        if not _sched.scheduler.running:
+            _sched.start()
+            app.logger.info("Background scheduler auto-started from app module")
+
+
+_should_start_scheduler = (
+    os.environ.get('START_SCHEDULER', 'true').lower() == 'true'
+    and os.environ.get('TESTING', 'false').lower() != 'true'
+)
+# Under Flask's debug reloader the parent watcher process also imports this
+# module; only the child (WERKZEUG_RUN_MAIN=true) should start the scheduler.
+_is_reloader_parent = (
+    app.debug
+    and os.environ.get('WERKZEUG_RUN_MAIN') != 'true'
+)
+if _should_start_scheduler and not _is_reloader_parent:
+    _auto_start_scheduler()
+
+
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
