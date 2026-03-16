@@ -2141,7 +2141,10 @@ class LMSScheduler:
                 #   • Find the most recently completed round.
                 #   • If there are still active players, create the next round.
                 # ------------------------------------------------------------------
-                from lms_automation.services.round_lifecycle import create_next_round
+                from lms_automation.services.round_lifecycle import (
+                    create_next_round,
+                    populate_fixtures_for_round,
+                )
 
                 organiser_ids_with_rounds = [
                     row[0]
@@ -2255,13 +2258,53 @@ class LMSScheduler:
                         ).first()
 
                         if not existing_round:
-                            # create_next_round hit an exception and rolled back — nothing
-                            # to recover here; the next orchestrator tick will retry.
+                            # create_next_round failed with an exception (rollback) AND
+                            # the round genuinely does not exist in the DB.
+                            # Recreate it directly here rather than deferring.
                             logger.error(
-                                "RECOVERY: Round %s (Cycle %s) could not be created for "
-                                "organiser=%s — create_next_round failed silently. "
-                                "Will retry on next tick.",
+                                "RECOVERY ERROR: create_next_round returned None but "
+                                "Round %s (Cycle %s) not found in DB for organiser=%s. "
+                                "Recreating round manually.",
                                 next_round_number, cycle_number, org_id,
+                            )
+                            next_matchday = min((last_completed.pl_matchday or 1) + 1, 38)
+                            recovered_round = Round(
+                                round_number=next_round_number,
+                                pl_matchday=next_matchday,
+                                cycle_number=cycle_number,
+                                organiser_id=org_id,
+                                status='pending',
+                            )
+                            db.session.add(recovered_round)
+                            db.session.flush()  # allocate primary key before fixture insert
+
+                            # Best-effort fixture population — non-fatal if API is down.
+                            try:
+                                fixtures_created = populate_fixtures_for_round(recovered_round)
+                            except Exception as _fx_err:
+                                logger.warning(
+                                    "RECOVERY: Round %s (id=%s) recreated but fixture "
+                                    "population failed: %s",
+                                    next_round_number, recovered_round.id, _fx_err,
+                                )
+                                fixtures_created = 0
+
+                            logger.warning(
+                                "RECOVERY: Manually recreated Round %s "
+                                "(Cycle %s, id=%s, matchday=%s, fixtures=%s) "
+                                "for organiser=%s.",
+                                next_round_number, cycle_number, recovered_round.id,
+                                next_matchday, fixtures_created, org_id,
+                            )
+                            _tl.action(
+                                action_type='recovery_round_recreated',
+                                outcome='applied',
+                                actual_impact=(
+                                    f'organiser={org_id}: round_id={recovered_round.id} '
+                                    f'r{next_round_number} cycle={cycle_number} -> pending'
+                                ),
+                                reversible=True,
+                                rounds_delta=1,
                             )
                         elif existing_round.status in ('active', 'pending'):
                             # Round is healthy but invisible due to missing organiser_id.
