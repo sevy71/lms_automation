@@ -2635,13 +2635,16 @@ document.addEventListener('DOMContentLoaded', function () {
       fetch('/api/rounds')
         .then(r => r.json())
         .then(rounds => {
-          (rounds || [])
-            .filter(r => r.status === 'completed')
-            .sort((a, b) => b.round_number - a.round_number)
+          const completed = (rounds || []).filter(r => r.status === 'completed');
+          const multiCycle = completed.some(r => (r.cycle_number || 1) > 1);
+          completed
+            .sort((a, b) => (b.cycle_number || 1) - (a.cycle_number || 1) || b.round_number - a.round_number)
             .forEach(r => {
               const opt = document.createElement('option');
               opt.value = r.id;
-              opt.textContent = `Round ${r.round_number}`;
+              opt.textContent = multiCycle
+                ? `Cycle ${r.cycle_number || 1} – Round ${r.round_number}`
+                : `Round ${r.round_number}`;
               select.appendChild(opt);
             });
         })
