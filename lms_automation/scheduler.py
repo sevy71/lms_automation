@@ -2030,7 +2030,10 @@ class LMSScheduler:
         This job runs every 5 minutes and:
         1. Activates pending rounds that have 'tokens_generated' marker
         2. Checks if active rounds are ready to be processed
-        3. Ensures the automation pipeline doesn't stall
+        3. Self-healing recovery: if no active/pending rounds exist for an
+           organiser but active players remain, creates the missing next round.
+           This unblocks the competition if the scheduler was offline when a
+           round completed and evaluate_game_state_after_round was never called.
 
         PHASE REQUIREMENT: Round activation requires 'tokens_generated' marker,
         ensuring tokens exist for all eligible players before the round goes active.
@@ -2122,6 +2125,124 @@ class LMSScheduler:
                         logger.info(
                             f"Round {round_obj.round_number}: All fixtures completed, "
                             f"waiting for elimination processing"
+                        )
+
+                # ------------------------------------------------------------------
+                # Step 3: Self-healing recovery.
+                #
+                # If the scheduler was offline when a round completed, the normal
+                # path (process_eliminations → evaluate_game_state_after_round →
+                # create_next_round) never ran.  The result is a competition stuck
+                # with status='completed' on the last round and no active or pending
+                # round to continue from.
+                #
+                # For each organiser that owns at least one round:
+                #   • Skip if an active or pending round already exists.
+                #   • Find the most recently completed round.
+                #   • If there are still active players, create the next round.
+                # ------------------------------------------------------------------
+                from lms_automation.services.round_lifecycle import create_next_round
+
+                organiser_ids_with_rounds = [
+                    row[0]
+                    for row in db.session.query(Round.organiser_id)
+                    .filter(Round.organiser_id.isnot(None))
+                    .distinct()
+                    .all()
+                ]
+
+                for org_id in organiser_ids_with_rounds:
+                    has_open_round = Round.query.filter(
+                        Round.organiser_id == org_id,
+                        Round.status.in_(['active', 'pending'])
+                    ).first() is not None
+
+                    if has_open_round:
+                        continue
+
+                    last_completed = Round.query.filter_by(
+                        organiser_id=org_id,
+                        status='completed'
+                    ).order_by(Round.id.desc()).first()
+
+                    if not last_completed:
+                        continue
+
+                    active_count = Player.query.filter_by(
+                        organiser_id=org_id,
+                        status='active'
+                    ).count()
+
+                    logger.warning(
+                        "RECOVERY CHECK: organiser=%s has no active/pending rounds. "
+                        "Last completed: Round %s (Cycle %s, id=%s). Active players: %s",
+                        org_id,
+                        last_completed.round_number,
+                        last_completed.cycle_number,
+                        last_completed.id,
+                        active_count,
+                    )
+
+                    if active_count == 0:
+                        logger.info(
+                            "RECOVERY: organiser=%s — 0 active players, "
+                            "competition concluded or awaiting rollover. Skipping.",
+                            org_id,
+                        )
+                        continue
+
+                    # Determine the next round number and cycle.
+                    next_round_number = last_completed.round_number + 1
+                    cycle_number = last_completed.cycle_number or 1
+                    if last_completed.round_number == 20:
+                        # End-of-cycle boundary — roll into the next cycle.
+                        next_round_number = 1
+                        cycle_number += 1
+
+                    _tl.decision(
+                        title=f'Recovery: create missing Round {next_round_number} for organiser {org_id}',
+                        rule_matched='no_open_rounds_but_active_players',
+                        reasoning=(
+                            f'organiser={org_id}: no active/pending rounds after '
+                            f'Round {last_completed.round_number} (id={last_completed.id}) '
+                            f'completed; active_players={active_count}'
+                        ),
+                        confidence='high',
+                        intended_action='create_next_round',
+                        expected_impact=f'Round {next_round_number} (Cycle {cycle_number}) created as pending',
+                    )
+
+                    logger.warning(
+                        "RECOVERY: Creating Round %s (Cycle %s) for organiser=%s to resume competition.",
+                        next_round_number, cycle_number, org_id,
+                    )
+
+                    new_round = create_next_round(last_completed, next_round_number, cycle_number)
+                    if new_round:
+                        # create_next_round does not propagate organiser_id; fix that here.
+                        # The outer db.session.commit() below will persist this update.
+                        if new_round.organiser_id is None:
+                            new_round.organiser_id = org_id
+                        logger.warning(
+                            "RECOVERY: Round %s (Cycle %s, id=%s) created for organiser=%s. "
+                            "Competition resumes.",
+                            next_round_number, cycle_number, new_round.id, org_id,
+                        )
+                        _tl.action(
+                            action_type='recovery_round_created',
+                            outcome='applied',
+                            actual_impact=(
+                                f'organiser={org_id}: round_id={new_round.id} '
+                                f'r{next_round_number} cycle={cycle_number} -> pending'
+                            ),
+                            reversible=True,
+                            rounds_delta=1,
+                        )
+                    else:
+                        logger.warning(
+                            "RECOVERY: Round %s (Cycle %s) already exists for organiser=%s "
+                            "— no action needed.",
+                            next_round_number, cycle_number, org_id,
                         )
 
                 db.session.commit()
