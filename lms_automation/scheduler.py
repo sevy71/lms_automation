@@ -2239,11 +2239,71 @@ class LMSScheduler:
                             rounds_delta=1,
                         )
                     else:
-                        logger.warning(
-                            "RECOVERY: Round %s (Cycle %s) already exists for organiser=%s "
-                            "— no action needed.",
-                            next_round_number, cycle_number, org_id,
-                        )
+                        # create_next_round returned None — the round row already exists.
+                        # Two sub-cases:
+                        #   a) Round is pending/active but has organiser_id=None, so the
+                        #      organiser-scoped has_open_round query above couldn't see it.
+                        #   b) Round exists with an unexpected status (e.g. 'completed' due
+                        #      to state corruption) and needs to be re-activated.
+                        existing_round = Round.query.filter(
+                            Round.cycle_number == cycle_number,
+                            Round.round_number == next_round_number,
+                            db.or_(
+                                Round.organiser_id == org_id,
+                                Round.organiser_id.is_(None),
+                            ),
+                        ).first()
+
+                        if not existing_round:
+                            # create_next_round hit an exception and rolled back — nothing
+                            # to recover here; the next orchestrator tick will retry.
+                            logger.error(
+                                "RECOVERY: Round %s (Cycle %s) could not be created for "
+                                "organiser=%s — create_next_round failed silently. "
+                                "Will retry on next tick.",
+                                next_round_number, cycle_number, org_id,
+                            )
+                        elif existing_round.status in ('active', 'pending'):
+                            # Round is healthy but invisible due to missing organiser_id.
+                            # Patch it so future organiser-scoped queries can see it.
+                            if existing_round.organiser_id is None:
+                                existing_round.organiser_id = org_id
+                                logger.warning(
+                                    "RECOVERY: Round %s (Cycle %s, id=%s) was %s but had "
+                                    "organiser_id=None. Patched organiser=%s — "
+                                    "orchestrator will activate on next tick.",
+                                    next_round_number, cycle_number, existing_round.id,
+                                    existing_round.status, org_id,
+                                )
+                            else:
+                                logger.warning(
+                                    "RECOVERY: Round %s (Cycle %s, id=%s) already %s for "
+                                    "organiser=%s — no action needed.",
+                                    next_round_number, cycle_number, existing_round.id,
+                                    existing_round.status, org_id,
+                                )
+                        else:
+                            # Round exists but has an unexpected status — activate it directly.
+                            old_status = existing_round.status
+                            existing_round.status = 'active'
+                            if existing_round.organiser_id is None:
+                                existing_round.organiser_id = org_id
+                            logger.warning(
+                                "RECOVERY: Round %s existed but was inactive "
+                                "(id=%s, status='%s'). Activating round.",
+                                next_round_number, existing_round.id, old_status,
+                            )
+                            _tl.action(
+                                action_type='recovery_round_activated',
+                                outcome='applied',
+                                actual_impact=(
+                                    f'organiser={org_id}: round_id={existing_round.id} '
+                                    f'r{next_round_number} cycle={cycle_number} '
+                                    f'{old_status} -> active'
+                                ),
+                                reversible=True,
+                                rounds_delta=1,
+                            )
 
                 db.session.commit()
                 logger.info("=== ROUND ORCHESTRATOR JOB COMPLETE ===")
