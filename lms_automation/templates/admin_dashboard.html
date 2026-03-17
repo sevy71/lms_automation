@@ -1715,9 +1715,24 @@ document.addEventListener('DOMContentLoaded', function () {
       });
       listDiv.querySelectorAll('.delete-round-btn').forEach(b => {
         b.addEventListener('click', function () {
-          if (!confirm(`Delete Round ${this.dataset.roundNum}? This cannot be undone.`)) return;
-          fetch(`/api/rounds/${this.dataset.roundId}`, { method: 'DELETE' })
-            .then(r => r.json()).then(d => { if (d.success) location.reload(); else alert('Error: ' + d.error); });
+          const roundId = this.dataset.roundId;
+          const roundNum = this.dataset.roundNum;
+          if (!confirm(`Delete Round ${roundNum}? This cannot be undone.`)) return;
+          fetch(`/api/rounds/${roundId}`, { method: 'DELETE' })
+            .then(r => r.json())
+            .then(d => {
+              if (d.success) {
+                location.reload();
+              } else if (d.picks_count) {
+                if (confirm(`This round has ${d.picks_count} existing pick(s). Are you sure you want to delete it? This will remove all picks.\n\nClick OK to confirm force delete, or Cancel to abort.`)) {
+                  fetch(`/api/rounds/${roundId}?force=true`, { method: 'DELETE' })
+                    .then(r => r.json())
+                    .then(d2 => { if (d2.success) location.reload(); else alert('Error: ' + d2.error); });
+                }
+              } else {
+                alert('Error: ' + d.error);
+              }
+            });
         });
       });
     }).catch(() => { listDiv.innerHTML = '<p class="text-danger">Error loading rounds.</p>'; });

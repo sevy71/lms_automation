@@ -2968,35 +2968,49 @@ def handle_round_by_id(round_id):
     elif request.method == 'DELETE':
         try:
             round_number = round_obj.round_number
-            
+            force = request.args.get('force', 'false').lower() == 'true'
+
             # Check if round has any picks
             picks_count = Pick.query.filter_by(round_id=round_id).count()
-            if picks_count > 0:
-                return jsonify({'success': False, 'error': f'Cannot delete round with {picks_count} existing picks'}), 400
-            
+            if picks_count > 0 and not force:
+                return jsonify({
+                    'success': False,
+                    'error': f'Round has existing picks. Use force delete to proceed.',
+                    'picks_count': picks_count
+                }), 400
+
             # Delete all related data in correct order (foreign key constraints)
-            
-            # 1. Delete pick tokens first
+
+            # 1. Delete picks if force deleting
+            picks_deleted = 0
+            if picks_count > 0:
+                picks_deleted = Pick.query.filter_by(round_id=round_id).delete()
+                app.logger.warning(
+                    f"FORCE DELETE: Round {round_id} deleted with {picks_deleted} picks removed"
+                )
+
+            # 2. Delete pick tokens
             tokens_deleted = PickToken.query.filter_by(round_id=round_id).delete()
-            
-            # 2. Delete all fixtures 
+
+            # 3. Delete all fixtures
             fixtures_deleted = Fixture.query.filter_by(round_id=round_id).delete()
-            
-            # 3. Delete the round itself
+
+            # 4. Delete the round itself
             db.session.delete(round_obj)
-            
+
             # Commit all deletions
             db.session.commit()
-            
+
             return jsonify({
                 'success': True,
                 'message': f'Round {round_number} deleted successfully',
                 'details': {
+                    'picks_deleted': picks_deleted,
                     'fixtures_deleted': fixtures_deleted,
                     'tokens_deleted': tokens_deleted
                 }
             })
-            
+
         except Exception as e:
             db.session.rollback()
             return jsonify({'success': False, 'error': str(e)}), 500
