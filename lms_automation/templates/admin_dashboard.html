@@ -1624,26 +1624,15 @@ document.addEventListener('DOMContentLoaded', function () {
       if (infoDiv) infoDiv.innerHTML = '';
     }
 
-    matchdaySelect.innerHTML = '<option value="">Loading matchdays…</option>';
-    try {
-      const r = await fetch('/api/matchdays');
-      const d = await r.json();
-      if (d.success) {
-        matchdaySelect.innerHTML = '<option value="">Select a matchday…</option>';
-        d.matchdays.forEach(m => {
-          const opt = document.createElement('option');
-          opt.value = m.matchday;
-          opt.textContent = `Matchday ${m.matchday} (${m.fixture_count} fixtures)`;
-          matchdaySelect.appendChild(opt);
-        });
-        if (gameState?.next_round_defaults?.pl_matchday) {
-          matchdaySelect.value = gameState.next_round_defaults.pl_matchday;
-        }
-      } else {
-        matchdaySelect.innerHTML = '<option value="">Error loading matchdays</option>';
-      }
-    } catch (e) {
-      matchdaySelect.innerHTML = '<option value="">Error loading matchdays</option>';
+    matchdaySelect.innerHTML = '<option value="">Select a matchday…</option>';
+    Array.from({ length: 38 }, (_, i) => i + 1).forEach(md => {
+      const opt = document.createElement('option');
+      opt.value = md;
+      opt.textContent = `Matchday ${md}`;
+      matchdaySelect.appendChild(opt);
+    });
+    if (gameState?.next_round_defaults?.pl_matchday) {
+      matchdaySelect.value = gameState.next_round_defaults.pl_matchday;
     }
   });
 

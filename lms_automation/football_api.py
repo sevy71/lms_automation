@@ -2,7 +2,7 @@ import logging
 import os
 import time
 import requests
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, List, Optional
 from lms_automation.team_utils import normalize_team_name
 
@@ -103,6 +103,51 @@ class FootballDataAPI:
             logger.error("Error getting matchdays: %s", e)
             return list(range(1, 39))  # Default to 1-38
 
+    def get_current_matchday(self) -> Optional[int]:
+        """Fetch the current matchday from the competition endpoint."""
+        try:
+            url = f"{self.base_url}/competitions/{self.premier_league_id}"
+            time.sleep(0.1)
+            response = requests.get(url, headers=self.headers, timeout=10)
+            if response.status_code == 200:
+                data = response.json()
+                return data.get('currentSeason', {}).get('currentMatchday')
+            logger.warning("get_current_matchday: API returned %s", response.status_code)
+            return None
+        except Exception as e:
+            logger.error("Error fetching current matchday: %s", e)
+            return None
+
+    def get_fixtures_for_current_or_next_matchday(self, season: str = None):
+        """
+        Fetch fixtures for the current matchday, falling back to the next matchday
+        that has TIMED (upcoming) fixtures.
+
+        Returns:
+            Tuple of (fixtures_data dict, matchday int)
+        """
+        if season is None:
+            season = self._default_season()
+
+        current_matchday = self.get_current_matchday() or 1
+        now = datetime.now(timezone.utc)
+
+        for matchday in range(current_matchday, 39):
+            fixtures_data = self.get_premier_league_fixtures(matchday=matchday, season=season)
+            matches = fixtures_data.get('matches', [])
+            timed = [
+                m for m in matches
+                if m.get('status') == 'TIMED'
+                and m.get('utcDate')
+                and datetime.fromisoformat(m['utcDate'].replace('Z', '+00:00')) > now
+            ]
+            if timed:
+                logger.info("get_fixtures_for_current_or_next_matchday: using matchday %s (%s TIMED fixtures)", matchday, len(timed))
+                return fixtures_data, matchday
+
+        logger.warning("get_fixtures_for_current_or_next_matchday: no TIMED fixtures found from matchday %s onward", current_matchday)
+        return {'matches': []}, current_matchday
+
     def format_fixtures_for_db(self, fixtures_data: Dict, target_matchday: int) -> List[Dict]:
         """
         Format fixtures data for database insertion
@@ -116,20 +161,30 @@ class FootballDataAPI:
         """
         formatted_fixtures = []
         
+        now = datetime.now(timezone.utc)
+
         for match in fixtures_data.get('matches', []):
             if match.get('matchday') != target_matchday:
                 continue
-                
-            # Parse match date
-            match_date = None
-            match_time = None
-            if match.get('utcDate'):
-                try:
-                    dt = datetime.fromisoformat(match['utcDate'].replace('Z', '+00:00'))
-                    match_date = dt.date()
-                    match_time = dt.time()
-                except ValueError:
-                    pass
+
+            # Only include TIMED (confirmed upcoming) fixtures
+            if match.get('status') != 'TIMED':
+                continue
+
+            # Skip fixtures that are not in the future
+            utc_date = match.get('utcDate')
+            if not utc_date:
+                continue
+            try:
+                match_dt = datetime.fromisoformat(utc_date.replace('Z', '+00:00'))
+                if match_dt <= now:
+                    continue
+            except ValueError:
+                continue
+
+            # Parse match date (reuse already-parsed match_dt)
+            match_date = match_dt.date()
+            match_time = match_dt.time()
             
             # Extract team names and normalize to canonical form
             # This ensures "AFC Bournemouth" -> "Bournemouth", etc.

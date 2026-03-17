@@ -1906,7 +1906,24 @@ class LMSScheduler:
 
                     if not deadline_passed:
                         time_until = deadline - now
-                        logger.info(f"  Deadline not reached. Time remaining: {time_until}")
+                        logger.info(
+                            f"AUTO-PICK SKIP: Round {round_obj.round_number} deadline not reached "
+                            f"(deadline {deadline.strftime('%Y-%m-%d %H:%M:%S')} UTC, "
+                            f"time remaining {time_until})"
+                        )
+                        continue
+
+                    # Additional guard: if kickoff itself is in the past the fixture data
+                    # is likely stale (e.g. API returned last week's matchday).  Do NOT
+                    # apply auto-picks — the organiser must correct fixtures first.
+                    if kickoff <= now:
+                        logger.warning(
+                            f"AUTO-PICK WARNING: Round {round_obj.round_number} kickoff "
+                            f"{kickoff.strftime('%Y-%m-%d %H:%M:%S')} UTC is in the past "
+                            f"(now={now.strftime('%Y-%m-%d %H:%M:%S')} UTC) — "
+                            f"skipping auto-picks to prevent stale-data assignment. "
+                            f"Organiser should review fixtures for this round."
+                        )
                         continue
 
                     # Get eligible players (status='active', not eliminated in prior rounds)
@@ -2063,6 +2080,34 @@ class LMSScheduler:
                     if not fixtures:
                         logger.info(f"Round {round_obj.round_number}: No fixtures yet, staying pending")
                         continue
+
+                    # Re-validate: require minimum fixture count (supports partial rounds
+                    # like FA Cup weekends, but reject obviously wrong matchday data).
+                    if len(fixtures) < 6:
+                        logger.warning(
+                            f"ORCHESTRATOR SKIP: Round {round_obj.round_number} has only "
+                            f"{len(fixtures)} fixture(s) — minimum 6 required before activation. "
+                            f"Organiser should review or re-fetch fixtures."
+                        )
+                        continue
+
+                    # Re-validate: first_kickoff_at must be in the future.
+                    # If it is in the past the stored fixtures are stale (wrong matchday
+                    # was accepted, or fixtures belong to a previous round).
+                    _activation_kickoff = round_obj.first_kickoff_at
+                    if _activation_kickoff is not None:
+                        if _activation_kickoff.tzinfo is not None:
+                            _activation_kickoff = _activation_kickoff.replace(tzinfo=None)
+                        _now_check = datetime.utcnow()
+                        if _activation_kickoff <= _now_check:
+                            logger.warning(
+                                f"ORCHESTRATOR SKIP: Round {round_obj.round_number} "
+                                f"first_kickoff_at {_activation_kickoff.strftime('%Y-%m-%d %H:%M:%S')} UTC "
+                                f"is in the past (now={_now_check.strftime('%Y-%m-%d %H:%M:%S')} UTC) — "
+                                f"fixture data appears stale. Round will not be activated until "
+                                f"organiser corrects the fixtures."
+                            )
+                            continue
 
                     # Check if tokens_generated marker exists
                     if not self._has_marker(round_obj, 'tokens_generated'):

@@ -23,8 +23,8 @@ Contract:
 from __future__ import annotations
 
 import logging
-from datetime import datetime
-from typing import Callable, Optional
+from datetime import datetime, timedelta
+from typing import Callable, List, Dict, Any, Optional, Tuple
 
 from lms_automation.models import db, Round, Fixture, Pick, Player, PickToken
 from lms_automation.football_api import FootballDataAPI
@@ -351,6 +351,102 @@ def create_next_round(
         return None
 
 
+# ---------------------------------------------------------------------------
+# Fixture validation
+# ---------------------------------------------------------------------------
+
+def validate_fixtures(
+    formatted_fixtures: List[Dict[str, Any]],
+    now_utc: Optional[datetime] = None,
+) -> Tuple[bool, str]:
+    """
+    Validate a list of formatted fixture dicts before DB insertion.
+
+    Rules:
+      - Reject if no fixtures.
+      - Reject if fewer than 6 fixtures (likely wrong matchday from API).
+      - Accept 6–10 fixtures (supports partial rounds, e.g. FA Cup weekends).
+      - Reject if any duplicate team names detected.
+      - Reject if the earliest kickoff is in the past (stale API data).
+      - Reject if fixtures span more than 5 days (unrealistic for one matchday).
+
+    Parameters:
+      formatted_fixtures — list of dicts with keys: home_team, away_team,
+                           date (datetime.date), time (datetime.time), etc.
+      now_utc            — comparison timestamp; defaults to datetime.utcnow().
+
+    Returns:
+      (is_valid, reason) — reason is a human-readable string logged on both
+                           success and failure.
+    """
+    if now_utc is None:
+        now_utc = datetime.utcnow()
+
+    if not formatted_fixtures:
+        return False, "no fixtures returned from API"
+
+    count = len(formatted_fixtures)
+
+    if count < 6:
+        labels = [
+            f"{fx.get('home_team', '?')} vs {fx.get('away_team', '?')}"
+            for fx in formatted_fixtures
+        ]
+        return False, (
+            f"too few fixtures ({count}/6 minimum) — likely incorrect matchday data. "
+            f"Got: {labels}"
+        )
+
+    # Duplicate team check
+    all_teams = []
+    for fx in formatted_fixtures:
+        all_teams.append(fx.get("home_team") or "")
+        all_teams.append(fx.get("away_team") or "")
+    seen: set = set()
+    duplicates: set = set()
+    for team in all_teams:
+        if team and team in seen:
+            duplicates.add(team)
+        seen.add(team)
+    if duplicates:
+        return False, f"duplicate teams detected: {sorted(duplicates)}"
+
+    # Collect kickoff datetimes for time-based checks
+    kickoffs = []
+    for fx in formatted_fixtures:
+        if fx.get("date") and fx.get("time"):
+            kickoffs.append(datetime.combine(fx["date"], fx["time"]))
+
+    if kickoffs:
+        earliest = min(kickoffs)
+        latest = max(kickoffs)
+
+        # Reject stale data: first kickoff already in the past
+        if earliest <= now_utc:
+            return False, (
+                f"first kickoff {earliest.strftime('%Y-%m-%d %H:%M')} UTC is already in "
+                f"the past (now={now_utc.strftime('%Y-%m-%d %H:%M')} UTC) — "
+                f"likely stale API data from a previous matchday"
+            )
+
+        # Reject unrealistic date spread
+        spread_days = (latest - earliest).days
+        if spread_days > 5:
+            return False, (
+                f"fixtures span {spread_days} days "
+                f"({earliest.date()} → {latest.date()}) — "
+                f"exceeds 5-day maximum for a single matchday"
+            )
+
+        return True, (
+            f"{count} fixture(s) accepted, "
+            f"first kickoff {earliest.strftime('%Y-%m-%d %H:%M')} UTC"
+        )
+
+    # All fixtures lack date/time — still valid structure, just no timing data
+    return True, f"{count} fixture(s) accepted (no kickoff times available yet)"
+
+
 def populate_fixtures_for_round(round_obj: Round, api: Optional[FootballDataAPI] = None) -> int:
     """
     Fetch and insert fixtures for *round_obj* from the Football API.
@@ -379,8 +475,28 @@ def populate_fixtures_for_round(round_obj: Round, api: Optional[FootballDataAPI]
         formatted = api.format_fixtures_for_db(fixtures_data, round_obj.pl_matchday)
 
         if not formatted:
+            logger.warning(
+                "FIXTURE VALIDATION FAILED for Round %s (matchday=%s): no fixtures returned from API",
+                round_obj.id,
+                round_obj.pl_matchday,
+            )
+            round_obj.status = "fixture_error"
             return 0
 
+        now_utc = datetime.utcnow()
+        is_valid, reason = validate_fixtures(formatted, now_utc)
+
+        if not is_valid:
+            logger.warning(
+                "FIXTURE VALIDATION FAILED for Round %s (matchday=%s): %s",
+                round_obj.id,
+                round_obj.pl_matchday,
+                reason,
+            )
+            round_obj.status = "fixture_error"
+            return 0
+
+        # Validation passed — insert fixtures and record first kickoff
         earliest_kickoff = None
         count = 0
         for fx in formatted:
@@ -406,6 +522,12 @@ def populate_fixtures_for_round(round_obj: Round, api: Optional[FootballDataAPI]
         if earliest_kickoff:
             round_obj.first_kickoff_at = earliest_kickoff
 
+        logger.info(
+            "Round %s (matchday=%s): %s",
+            round_obj.id,
+            round_obj.pl_matchday,
+            reason,
+        )
         return count
 
     except Exception as e:
